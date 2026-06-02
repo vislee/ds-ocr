@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+ds_ocr
+
+# macOS
+.DS_Store
+
+# Model files (too large for git)
+*.safetensors
+models/
+
+# IDE
+.vscode/
+.idea/
+
+# Monbot internal
+.monbot/
