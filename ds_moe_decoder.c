@@ -177,14 +177,17 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
                                 layer->wv_weight_bf16,
                                 hidden, q_dim, kv_dim);
 
-    /* Per-head Q/K RMSNorm (DeepSeek-V2 style) */
-    ds_rms_norm_per_head(q, layer->q_norm_weight, 1, n_heads, head_dim, cfg->dec_rms_norm_eps);
-    ds_rms_norm_per_head(k, layer->k_norm_weight, 1, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
+    /* Per-head Q/K RMSNorm (DeepSeek-V2 V1 style; V2/OCR-2 does not use these) */
+    if (layer->q_norm_weight)
+        ds_rms_norm_per_head(q, layer->q_norm_weight, 1, n_heads, head_dim, cfg->dec_rms_norm_eps);
+    if (layer->k_norm_weight)
+        ds_rms_norm_per_head(k, layer->k_norm_weight, 1, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
 
-    /* RoPE */
+    /* RoPE (applied to both Q and K) */
     float *cos_vals = ctx->rope_cache_cos + pos * head_dim;
     float *sin_vals = ctx->rope_cache_sin + pos * head_dim;
     ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);
+    ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);
 
     /* Store K, V in KV cache */
     int cache_offset = ctx->kv_cache_len;
@@ -254,9 +257,11 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         ds_linear_nobias_bf16(K, x_norm, layer->wk_weight_bf16, seq_len, hidden, kv_dim);
         ds_linear_nobias_bf16(V, x_norm, layer->wv_weight_bf16, seq_len, hidden, kv_dim);
 
-        /* Per-head RMSNorm */
-        ds_rms_norm_per_head(Q, layer->q_norm_weight, seq_len, n_heads, head_dim, cfg->dec_rms_norm_eps);
-        ds_rms_norm_per_head(K, layer->k_norm_weight, seq_len, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
+        /* Per-head RMSNorm (optional: V2/OCR-2 does not use these) */
+        if (layer->q_norm_weight)
+            ds_rms_norm_per_head(Q, layer->q_norm_weight, seq_len, n_heads, head_dim, cfg->dec_rms_norm_eps);
+        if (layer->k_norm_weight)
+            ds_rms_norm_per_head(K, layer->k_norm_weight, seq_len, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
 
         /* Compute RoPE for each position */
         int *positions = (int *)malloc(seq_len * sizeof(int));
@@ -266,6 +271,7 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         float *sin_buf = (float *)malloc(seq_len * head_dim * sizeof(float));
         ds_compute_rope_neox(cos_buf, sin_buf, positions, seq_len, head_dim, cfg->dec_rope_theta);
         ds_apply_rope_neox(Q, cos_buf, sin_buf, seq_len, n_heads, head_dim);
+        ds_apply_rope_neox(K, cos_buf, sin_buf, seq_len, n_kv_heads, head_dim);
         free(positions); free(cos_buf); free(sin_buf);
 
         /* Store K, V in cache */

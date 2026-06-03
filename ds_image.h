@@ -23,6 +23,10 @@ ds_image_t *ds_image_load(const char *path);
 /* Resize image to target dimensions using bilinear interpolation */
 ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_height);
 
+/* Pad image to target size maintaining aspect ratio (like PIL ImageOps.pad).
+ * Fills unused area with pad_color (128=gray). */
+ds_image_t *ds_image_pad(const ds_image_t *img, int target_size, unsigned char pad_color);
+
 /* Convert image to float32 tensor normalized to [0, 1]
  * Output: [3, height, width] in NCHW format (channel-first) */
 float *ds_image_to_float_chw(const ds_image_t *img);

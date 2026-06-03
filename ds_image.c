@@ -86,6 +86,46 @@ ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_
     return resized;
 }
 
+/* Pad image to target size maintaining aspect ratio (like PIL ImageOps.pad).
+ * Fills with pad_color (e.g. 128 for gray). Resizes largest dimension to fit. */
+ds_image_t *ds_image_pad(const ds_image_t *img, int target_size, unsigned char pad_color) {
+    if (!img || !img->pixels) return NULL;
+
+    /* Calculate scale to fit within target_size × target_size */
+    float scale = (float)target_size / (img->width > img->height ? img->width : img->height);
+    int new_w = (int)(img->width * scale + 0.5f);
+    int new_h = (int)(img->height * scale + 0.5f);
+    if (new_w > target_size) new_w = target_size;
+    if (new_h > target_size) new_h = target_size;
+
+    /* First resize to fit */
+    ds_image_t *resized = ds_image_resize(img, new_w, new_h);
+    if (!resized) return NULL;
+
+    /* Allocate target and fill with pad color */
+    unsigned char *out = (unsigned char *)malloc(target_size * target_size * 3);
+    if (!out) { ds_image_free(resized); return NULL; }
+    memset(out, pad_color, target_size * target_size * 3);
+
+    /* Center the resized image */
+    int offset_x = (target_size - new_w) / 2;
+    int offset_y = (target_size - new_h) / 2;
+    for (int y = 0; y < new_h; y++) {
+        memcpy(out + ((offset_y + y) * target_size + offset_x) * 3,
+               resized->pixels + y * new_w * 3,
+               new_w * 3);
+    }
+    ds_image_free(resized);
+
+    ds_image_t *padded = (ds_image_t *)calloc(1, sizeof(ds_image_t));
+    if (!padded) { free(out); return NULL; }
+    padded->pixels = out;
+    padded->width = target_size;
+    padded->height = target_size;
+    padded->channels = 3;
+    return padded;
+}
+
 float *ds_image_to_float_chw(const ds_image_t *img) {
     if (!img || !img->pixels) return NULL;
 
@@ -93,13 +133,14 @@ float *ds_image_to_float_chw(const ds_image_t *img) {
     float *out = (float *)malloc(3 * n * sizeof(float));
     if (!out) return NULL;
 
-    /* Convert HWC (interleaved RGB) to CHW (planar), normalize to [0, 1] */
+    /* Convert HWC (interleaved RGB) to CHW (planar), normalize to [-1, 1]
+     * Using mean=0.5, std=0.5: (pixel/255 - 0.5) / 0.5 = pixel/255*2 - 1 */
     for (int y = 0; y < img->height; y++) {
         for (int x = 0; x < img->width; x++) {
             int hwc_idx = (y * img->width + x) * 3;
             int chw_idx = y * img->width + x;
             for (int c = 0; c < 3; c++) {
-                out[c * n + chw_idx] = (float)img->pixels[hwc_idx + c] / 255.0f;
+                out[c * n + chw_idx] = (float)img->pixels[hwc_idx + c] / 255.0f * 2.0f - 1.0f;
             }
         }
     }

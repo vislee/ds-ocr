@@ -341,54 +341,170 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
  * DeepEncoder V2 Forward Pass (Qwen2-0.5B based)
  * ======================================================================== */
 
+/* Apply RoPE to Q/K vectors for encoder (Qwen2 style) */
+static void enc_apply_rope(float *q, float *k, int seq_len, int n_q_heads,
+                            int n_kv_heads, int head_dim, float rope_theta) {
+    /* Apply RoPE in split-half (NeoX/Llama) style:
+     * x1 = x[:half], x2 = x[half:]
+     * rotated = cat(-x2, x1)
+     * result = x * cos + rotated * sin
+     */
+    int half = head_dim / 2;
+    for (int pos = 0; pos < seq_len; pos++) {
+        /* Q heads */
+        for (int h = 0; h < n_q_heads; h++) {
+            float *qh = q + pos * n_q_heads * head_dim + h * head_dim;
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+                float angle = pos * freq;
+                float cos_t = cosf(angle);
+                float sin_t = sinf(angle);
+                float x1 = qh[i];
+                float x2 = qh[half + i];
+                qh[i]        = x1 * cos_t - x2 * sin_t;
+                qh[half + i] = x2 * cos_t + x1 * sin_t;
+            }
+        }
+        /* K heads */
+        for (int h = 0; h < n_kv_heads; h++) {
+            float *kh = k + pos * n_kv_heads * head_dim + h * head_dim;
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+                float angle = pos * freq;
+                float cos_t = cosf(angle);
+                float sin_t = sinf(angle);
+                float x1 = kh[i];
+                float x2 = kh[half + i];
+                kh[i]        = x1 * cos_t - x2 * sin_t;
+                kh[half + i] = x2 * cos_t + x1 * sin_t;
+            }
+        }
+    }
+}
+
+/* GQA attention with mixed mask (bidirectional for visual, causal for flow) */
+static void enc_gqa_mixed_attention(float *out, const float *Q, const float *K,
+                                     const float *V, int visual_len, int total_len,
+                                     int n_q_heads, int n_kv_heads, int head_dim) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int kv_group_size = n_q_heads / n_kv_heads;
+
+    for (int h = 0; h < n_q_heads; h++) {
+        int kv_h = h / kv_group_size; /* which KV head this Q head uses */
+
+        for (int qi = 0; qi < total_len; qi++) {
+            const float *q_vec = Q + qi * n_q_heads * head_dim + h * head_dim;
+
+            /* Compute attention scores with online softmax */
+            float max_score = -1e30f;
+            float sum_exp = 0.0f;
+            float *acc = (float *)calloc(head_dim, sizeof(float));
+
+            for (int ki = 0; ki < total_len; ki++) {
+                /* Mixed attention mask:
+                 * - Visual tokens (qi < visual_len): attend to all visual tokens (bidirectional)
+                 * - Causal tokens (qi >= visual_len): attend to all visual + causal up to qi
+                 */
+                int visible;
+                if (qi < visual_len) {
+                    /* Visual token: only attend to other visual tokens */
+                    visible = (ki < visual_len);
+                } else {
+                    /* Causal token: attend to all visual + causal tokens up to current pos */
+                    visible = (ki < visual_len) || (ki <= qi);
+                }
+                if (!visible) continue;
+
+                const float *k_vec = K + ki * n_kv_heads * head_dim + kv_h * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; d++)
+                    score += q_vec[d] * k_vec[d];
+                score *= scale;
+
+                /* Online softmax update */
+                if (score > max_score) {
+                    float exp_diff = expf(max_score - score);
+                    for (int d = 0; d < head_dim; d++)
+                        acc[d] *= exp_diff;
+                    sum_exp = sum_exp * exp_diff + 1.0f;
+                    max_score = score;
+                } else {
+                    float exp_score = expf(score - max_score);
+                    sum_exp += exp_score;
+                    const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++)
+                        acc[d] += exp_score * v_vec[d];
+                    continue;
+                }
+                /* Add current V when max_score was updated */
+                const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
+                for (int d = 0; d < head_dim; d++)
+                    acc[d] += v_vec[d];
+            }
+
+            /* Normalize */
+            float inv_sum = 1.0f / (sum_exp + 1e-9f);
+            float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
+            for (int d = 0; d < head_dim; d++)
+                out_vec[d] = acc[d] * inv_sum;
+
+            free(acc);
+        }
+    }
+}
+
 static void enc_v2_layer_forward(float *out, const float *x,
                                   ds_ctx_t *ctx, int layer_idx,
                                   int visual_len, int total_len) {
     ds_deep_encoder_t *enc = &ctx->encoder;
     ds_config_t *cfg = &ctx->config;
     int hidden = cfg->enc_hidden;
-    int n_heads = cfg->enc_heads;
+    int n_q_heads = cfg->enc_heads;
+    int n_kv_heads = cfg->enc_kv_heads;
     int head_dim = cfg->enc_head_dim;
     int intermediate = cfg->enc_intermediate;
-    float scale = 1.0f / sqrtf((float)head_dim);
+    int kv_dim = n_kv_heads * head_dim;
 
     float *ln1_w = enc->layers[layer_idx].layer_norm1_weight;
     float *wq_w = enc->layers[layer_idx].wq_weight;
     float *wk_w = enc->layers[layer_idx].wk_weight;
     float *wv_w = enc->layers[layer_idx].wv_weight;
     float *wo_w = enc->layers[layer_idx].wo_weight;
+    float *wq_b = enc->layers[layer_idx].wq_bias;
+    float *wk_b = enc->layers[layer_idx].wk_bias;
+    float *wv_b = enc->layers[layer_idx].wv_bias;
     float *ln2_w = enc->layers[layer_idx].layer_norm2_weight;
     float *gate_w = enc->layers[layer_idx].gate_weight;
     float *up_w = enc->layers[layer_idx].up_weight;
     float *down_w = enc->layers[layer_idx].down_weight;
 
-    /* Pre-attention LayerNorm */
+    /* Pre-attention RMSNorm */
     float *x_norm = (float *)malloc(total_len * hidden * sizeof(float));
     ds_rms_norm(x_norm, x, ln1_w, total_len, hidden, cfg->dec_rms_norm_eps);
 
-    /* QKV projections */
+    /* QKV projections with bias (GQA: Q is full, K/V are smaller) */
     float *Q = (float *)malloc(total_len * hidden * sizeof(float));
-    float *K = (float *)malloc(total_len * hidden * sizeof(float));
-    float *V = (float *)malloc(total_len * hidden * sizeof(float));
+    float *K = (float *)malloc(total_len * kv_dim * sizeof(float));
+    float *V = (float *)malloc(total_len * kv_dim * sizeof(float));
 
-    ds_linear_nobias(Q, x_norm, wq_w, total_len, hidden, hidden);
-    ds_linear_nobias(K, x_norm, wk_w, total_len, hidden, hidden);
-    ds_linear_nobias(V, x_norm, wv_w, total_len, hidden, hidden);
+    ds_linear(Q, x_norm, wq_w, wq_b, total_len, hidden, hidden);
+    ds_linear(K, x_norm, wk_w, wk_b, total_len, hidden, kv_dim);
+    ds_linear(V, x_norm, wv_w, wv_b, total_len, hidden, kv_dim);
 
-    /* Mixed attention: bidirectional for visual, causal for flow queries */
+    /* Apply RoPE to Q and K */
+    enc_apply_rope(Q, K, total_len, n_q_heads, n_kv_heads, head_dim, cfg->enc_rope_theta);
+
+    /* GQA mixed attention (bidirectional for visual, causal for flow) */
     float *attn_out = (float *)malloc(total_len * hidden * sizeof(float));
-    if (cfg->enc_causal_flow_queries > 0) {
-        ds_mixed_attention(attn_out, Q, K, V, visual_len, total_len, n_heads, head_dim, scale);
-    } else {
-        ds_bidirectional_attention(attn_out, Q, K, V, total_len, n_heads, head_dim, scale);
-    }
+    enc_gqa_mixed_attention(attn_out, Q, K, V, visual_len, total_len,
+                            n_q_heads, n_kv_heads, head_dim);
 
     /* Output projection + residual */
     float *proj_out = (float *)malloc(total_len * hidden * sizeof(float));
     ds_linear_nobias(proj_out, attn_out, wo_w, total_len, hidden, hidden);
     for (int i = 0; i < total_len * hidden; i++) out[i] = x[i] + proj_out[i];
 
-    /* Pre-FFN LayerNorm + SwiGLU MLP */
+    /* Pre-FFN RMSNorm + SwiGLU MLP */
     float *ffn_norm = (float *)malloc(total_len * hidden * sizeof(float));
     ds_rms_norm(ffn_norm, out, ln2_w, total_len, hidden, cfg->dec_rms_norm_eps);
 
@@ -398,28 +514,22 @@ static void enc_v2_layer_forward(float *out, const float *x,
     ds_linear_nobias(gate_buf, ffn_norm, gate_w, total_len, hidden, intermediate);
     ds_linear_nobias(up_buf, ffn_norm, up_w, total_len, hidden, intermediate);
 
-    /* SwiGLU */
-    float *gate_up = (float *)malloc(total_len * 2 * intermediate * sizeof(float));
-    for (int s = 0; s < total_len; s++) {
-        for (int i = 0; i < intermediate; i++) {
-            gate_up[s * 2 * intermediate + 2 * i] = gate_buf[s * intermediate + i];
-            gate_up[s * 2 * intermediate + 2 * i + 1] = up_buf[s * intermediate + i];
-        }
+    /* SwiGLU: silu(gate) * up */
+    for (int i = 0; i < total_len * intermediate; i++) {
+        float g = gate_buf[i];
+        float sigmoid_g = 1.0f / (1.0f + expf(-g));
+        gate_buf[i] = g * sigmoid_g * up_buf[i];
     }
-    free(gate_buf); free(up_buf);
-
-    float *swiglu_out = (float *)malloc(total_len * intermediate * sizeof(float));
-    ds_swiglu_multiply(swiglu_out, gate_up, total_len, intermediate);
-    free(gate_up);
+    free(up_buf);
 
     /* Down projection + residual */
     float *down_out = (float *)malloc(total_len * hidden * sizeof(float));
-    ds_linear_nobias(down_out, swiglu_out, down_w, total_len, intermediate, hidden);
+    ds_linear_nobias(down_out, gate_buf, down_w, total_len, intermediate, hidden);
     for (int i = 0; i < total_len * hidden; i++) out[i] += down_out[i];
 
     free(x_norm); free(Q); free(K); free(V);
     free(attn_out); free(proj_out); free(ffn_norm);
-    free(swiglu_out); free(down_out);
+    free(gate_buf); free(down_out);
 }
 
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
@@ -475,8 +585,19 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
     free(x_norm);
     *out_seq_len = output_len;
 
-    if (ds_verbose >= 1)
+    if (ds_verbose >= 1) {
         fprintf(stderr, "DeepEncoder V2: %d in -> %d out\n", total_len, output_len);
+        /* Debug: print first few values of encoder output */
+        float sum = 0, max_val = 0;
+        for (int i = 0; i < output_len * cfg->dec_hidden; i++) {
+            float v = encoder_output[i] < 0 ? -encoder_output[i] : encoder_output[i];
+            sum += v;
+            if (v > max_val) max_val = v;
+        }
+        fprintf(stderr, "  encoder output: mean_abs=%.4f max_abs=%.4f first=[%.4f, %.4f, %.4f, %.4f]\n",
+                sum / (output_len * cfg->dec_hidden), max_val,
+                encoder_output[0], encoder_output[1], encoder_output[2], encoder_output[3]);
+    }
 
     return encoder_output;
 }

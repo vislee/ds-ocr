@@ -6,7 +6,7 @@
 
 set -e
 
-MODEL_ID="deepseek-ai/DeepSeek-OCR"
+MODEL_ID="deepseek-ai/DeepSeek-OCR-2"
 OUT_DIR="${1:-./deepseek-ocr}"
 
 echo "Downloading DeepSeek-OCR model to: $OUT_DIR"

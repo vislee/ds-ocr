@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SAFETENSORS_MAX_TENSORS 1024
+#define SAFETENSORS_MAX_TENSORS 4096
 #define SAFETENSORS_MAX_SHARDS 8
 
 typedef enum {

@@ -13,10 +13,14 @@
 #include "ds_kernels.h"
 #include "ds_image.h"
 #include "ds_safetensors.h"
+#include "ds_ocr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* Set by ds_visual_tokenizer_forward based on model version */
+static int g_sam_is_v2 = 0;
 
 /* ========================================================================
  * SAM LayerNorm2d (Channel-wise LayerNorm for spatial features)
@@ -51,36 +55,41 @@ static void layer_norm_2d(float *out, const float *in,
  * ======================================================================== */
 
 /* Get relative position bias from rel_pos embeddings
- * rel_pos: [n_heads, head_dim, 2*window_size-1]
+ * V1: rel_pos shape [n_heads, head_dim, 2*window_size-1]
+ * V2: rel_pos shape [2*window_size-1, head_dim] (shared across heads)
  * q_coords, k_coords: coordinates within the window
  * Returns bias value for this head and (q,k) pair
  */
-static float get_rel_pos(const float *rel_pos, int n_heads, int head_dim,
-                          int q_coord, int k_coord, int rel_size, int head_idx) {
+static float get_rel_pos_v2(const float *rel_pos, int head_dim,
+                             int q_coord, int k_coord, int rel_size) {
     int rel_offset = q_coord - k_coord + rel_size - 1;
     if (rel_offset < 0 || rel_offset >= 2 * rel_size - 1) return 0.0f;
+    /* V2: shape [2*rel_size-1, head_dim] */
+    const float *rp = rel_pos + rel_offset * head_dim;
+    float sum = 0.0f;
+    for (int d = 0; d < head_dim; d++) sum += rp[d];
+    return sum;
+}
 
-    /* rel_pos shape: [n_heads, head_dim, 2*rel_size-1]
-     * We use a simplified dot product: sum over head_dim of rel_pos[head, :, rel_offset] * 1
-     * This is equivalent to the PyTorch implementation's dot product with query
-     */
+static float get_rel_pos_v1(const float *rel_pos, int n_heads, int head_dim,
+                             int q_coord, int k_coord, int rel_size, int head_idx) {
+    int rel_offset = q_coord - k_coord + rel_size - 1;
+    if (rel_offset < 0 || rel_offset >= 2 * rel_size - 1) return 0.0f;
+    /* V1: shape [n_heads, head_dim, 2*rel_size-1] */
     const float *rp = rel_pos + (size_t)head_idx * head_dim * (2 * rel_size - 1) + rel_offset;
     float sum = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        sum += rp[d * (2 * rel_size - 1)];
-    }
+    for (int d = 0; d < head_dim; d++) sum += rp[d * (2 * rel_size - 1)];
     return sum;
 }
 
 /* Add relative position embedding to attention scores
- * attn_scores: [n_heads, n_q, n_k] — modified in place
- * rel_pos_h: [n_heads, head_dim, 2*window_h-1]
- * rel_pos_w: [n_heads, head_dim, 2*window_w-1]
+ * V1: rel_pos_h/w shape [n_heads, head_dim, 2*window_h/w-1]
+ * V2: rel_pos_h/w shape [2*window_h/w-1, head_dim] (shared across heads)
  */
 static void add_rel_pos_bias(float *attn_scores, int n_heads,
                               int q_h, int q_w, int k_h, int k_w,
                               const float *rel_pos_h, const float *rel_pos_w,
-                              int head_dim) {
+                              int head_dim, int is_v2) {
     for (int h = 0; h < n_heads; h++) {
         for (int qi = 0; qi < q_h * q_w; qi++) {
             int qy = qi / q_w;
@@ -88,8 +97,14 @@ static void add_rel_pos_bias(float *attn_scores, int n_heads,
             for (int ki = 0; ki < k_h * k_w; ki++) {
                 int ky = ki / k_w;
                 int kx = ki % k_w;
-                float bias = get_rel_pos(rel_pos_h, n_heads, head_dim, qy, ky, q_h, h)
-                           + get_rel_pos(rel_pos_w, n_heads, head_dim, qx, kx, q_w, h);
+                float bias;
+                if (is_v2) {
+                    bias = get_rel_pos_v2(rel_pos_h, head_dim, qy, ky, q_h)
+                         + get_rel_pos_v2(rel_pos_w, head_dim, qx, kx, q_w);
+                } else {
+                    bias = get_rel_pos_v1(rel_pos_h, n_heads, head_dim, qy, ky, q_h, h)
+                         + get_rel_pos_v1(rel_pos_w, n_heads, head_dim, qx, kx, q_w, h);
+                }
                 attn_scores[(size_t)h * q_h * q_w * k_h * k_w + qi * k_h * k_w + ki] += bias;
             }
         }
@@ -100,16 +115,34 @@ static void add_rel_pos_bias(float *attn_scores, int n_heads,
  * SAM Window Attention
  * ======================================================================== */
 
-/* Window partition: [seq_len, dim] -> [n_windows, window_size*window_size, dim]
- * seq_h, seq_w: spatial dimensions
- * win_size: window size (14)
+/* Window partition with padding: [seq_h, seq_w, dim] -> [n_windows, window_size*window_size, dim]
+ * Pads if seq_h/seq_w not divisible by win_size.
  * Returns: [n_windows, win_size*win_size, dim] (caller must free)
- * Also sets *n_windows_out
+ * Also sets *n_windows_out and *pad_h_out, *pad_w_out
  */
-static float *window_partition(const float *x, int seq_h, int seq_w,
-                                int win_size, int dim, int *n_windows_out) {
-    int n_h = seq_h / win_size;
-    int n_w = seq_w / win_size;
+static float *window_partition_pad(const float *x, int seq_h, int seq_w,
+                                    int win_size, int dim, int *n_windows_out,
+                                    int *padded_h, int *padded_w) {
+    int pad_h = (win_size - seq_h % win_size) % win_size;
+    int pad_w = (win_size - seq_w % win_size) % win_size;
+    int Hp = seq_h + pad_h;
+    int Wp = seq_w + pad_w;
+    *padded_h = Hp;
+    *padded_w = Wp;
+
+    /* Pad input if needed (zero padding) */
+    float *padded = NULL;
+    if (pad_h > 0 || pad_w > 0) {
+        padded = (float *)calloc((size_t)Hp * Wp * dim, sizeof(float));
+        for (int y = 0; y < seq_h; y++) {
+            memcpy(padded + y * Wp * dim, x + y * seq_w * dim, seq_w * dim * sizeof(float));
+        }
+    }
+    const float *src = padded ? padded : x;
+    int src_w = padded ? Wp : seq_w;
+
+    int n_h = Hp / win_size;
+    int n_w = Wp / win_size;
     int n_windows = n_h * n_w;
     int win_tokens = win_size * win_size;
 
@@ -120,37 +153,63 @@ static float *window_partition(const float *x, int seq_h, int seq_w,
             int win_idx = nh * n_w + nw;
             for (int wh = 0; wh < win_size; wh++) {
                 for (int ww = 0; ww < win_size; ww++) {
-                    int src_row = (nh * win_size + wh) * seq_w + (nw * win_size + ww);
+                    int src_row = (nh * win_size + wh) * src_w + (nw * win_size + ww);
                     int dst_row = win_idx * win_tokens + wh * win_size + ww;
-                    memcpy(out + dst_row * dim, x + src_row * dim, dim * sizeof(float));
+                    memcpy(out + dst_row * dim, src + src_row * dim, dim * sizeof(float));
                 }
             }
         }
     }
 
+    if (padded) free(padded);
     *n_windows_out = n_windows;
     return out;
 }
 
-/* Window unpartition (reverse of window_partition) */
-static void window_unpartition(float *x, int seq_h, int seq_w,
-                                int win_size, int dim, int n_windows,
-                                const float *windowed) {
+/* Window unpartition with unpadding: reverse of window_partition_pad */
+static void window_unpartition_pad(float *x, int seq_h, int seq_w,
+                                    int win_size, int dim,
+                                    int padded_h, int padded_w,
+                                    const float *windowed) {
     int win_tokens = win_size * win_size;
-    int n_h = seq_h / win_size;
-    int n_w = seq_w / win_size;
+    int n_h = padded_h / win_size;
+    int n_w = padded_w / win_size;
 
-    for (int nh = 0; nh < n_h; nh++) {
-        for (int nw = 0; nw < n_w; nw++) {
-            int win_idx = nh * n_w + nw;
-            for (int wh = 0; wh < win_size; wh++) {
-                for (int ww = 0; ww < win_size; ww++) {
-                    int dst_row = (nh * win_size + wh) * seq_w + (nw * win_size + ww);
-                    int src_row = win_idx * win_tokens + wh * win_size + ww;
-                    memcpy(x + dst_row * dim, windowed + src_row * dim, dim * sizeof(float));
+    /* Unpartition to padded size, then copy only valid region */
+    if (padded_h == seq_h && padded_w == seq_w) {
+        /* No padding needed */
+        for (int nh = 0; nh < n_h; nh++) {
+            for (int nw = 0; nw < n_w; nw++) {
+                int win_idx = nh * n_w + nw;
+                for (int wh = 0; wh < win_size; wh++) {
+                    for (int ww = 0; ww < win_size; ww++) {
+                        int dst_row = (nh * win_size + wh) * seq_w + (nw * win_size + ww);
+                        int src_row = win_idx * win_tokens + wh * win_size + ww;
+                        memcpy(x + dst_row * dim, windowed + src_row * dim, dim * sizeof(float));
+                    }
                 }
             }
         }
+    } else {
+        /* Unpartition to padded buffer, then extract valid region */
+        float *padded_out = (float *)malloc((size_t)padded_h * padded_w * dim * sizeof(float));
+        for (int nh = 0; nh < n_h; nh++) {
+            for (int nw = 0; nw < n_w; nw++) {
+                int win_idx = nh * n_w + nw;
+                for (int wh = 0; wh < win_size; wh++) {
+                    for (int ww = 0; ww < win_size; ww++) {
+                        int dst_row = (nh * win_size + wh) * padded_w + (nw * win_size + ww);
+                        int src_row = win_idx * win_tokens + wh * win_size + ww;
+                        memcpy(padded_out + dst_row * dim, windowed + src_row * dim, dim * sizeof(float));
+                    }
+                }
+            }
+        }
+        /* Extract original region [seq_h, seq_w] from padded [padded_h, padded_w] */
+        for (int y = 0; y < seq_h; y++) {
+            memcpy(x + y * seq_w * dim, padded_out + y * padded_w * dim, seq_w * dim * sizeof(float));
+        }
+        free(padded_out);
     }
 }
 
@@ -158,10 +217,9 @@ static void window_unpartition(float *x, int seq_h, int seq_w,
 static void window_attn_forward(float *out, const float *Q, const float *K, const float *V,
                                  int n_tokens, int n_heads, int head_dim,
                                  const float *rel_pos_h, const float *rel_pos_w,
-                                 int win_size) {
+                                 int win_h, int win_w) {
     int hidden = n_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
-    int wh = win_size, ww = win_size; /* Window is square for now */
 
     for (int h = 0; h < n_heads; h++) {
         for (int i = 0; i < n_tokens; i++) {
@@ -172,8 +230,8 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
             float sum_exp = 0.0f;
             for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
 
-            int qy = i / ww;
-            int qx = i % ww;
+            int qy = i / win_w;
+            int qx = i % win_w;
 
             for (int j = 0; j < n_tokens; j++) {
                 const float *k_row = K + j * hidden + h * head_dim;
@@ -184,11 +242,23 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
                     score += q_row[d] * k_row[d];
                 score *= scale;
 
-                /* Add relative position bias */
-                int ky = j / ww;
-                int kx = j % ww;
-                score += get_rel_pos(rel_pos_h, n_heads, head_dim, qy, ky, wh, h)
-                       + get_rel_pos(rel_pos_w, n_heads, head_dim, qx, kx, ww, h);
+                /* Add relative position bias: dot(q, Rh[offset]) + dot(q, Rw[offset]) */
+                int ky = j / win_w;
+                int kx = j % win_w;
+
+                int rh_offset = qy - ky + win_h - 1;
+                int rw_offset = qx - kx + win_w - 1;
+
+                if (rh_offset >= 0 && rh_offset < 2 * win_h - 1) {
+                    const float *rh_vec = rel_pos_h + rh_offset * head_dim;
+                    for (int d = 0; d < head_dim; d++)
+                        score += q_row[d] * rh_vec[d];
+                }
+                if (rw_offset >= 0 && rw_offset < 2 * win_w - 1) {
+                    const float *rw_vec = rel_pos_w + rw_offset * head_dim;
+                    for (int d = 0; d < head_dim; d++)
+                        score += q_row[d] * rw_vec[d];
+                }
 
                 /* Online softmax */
                 if (score > max_score) {
@@ -290,8 +360,18 @@ static void sam_layer_forward(float *out, const float *x,
                     float score = 0.0f;
                     for (int d = 0; d < head_dim; d++) score += q_row[d] * k_row[d];
                     score *= scale;
-                    score += get_rel_pos(rel_h, n_heads, head_dim, qy, ky, seq_h, h)
-                           + get_rel_pos(rel_w, n_heads, head_dim, qx, kx, seq_w, h);
+
+                    /* Rel pos bias: dot(q, Rh[offset]) + dot(q, Rw[offset]) */
+                    int rh_off = qy - ky + seq_h - 1;
+                    int rw_off = qx - kx + seq_w - 1;
+                    if (rh_off >= 0 && rh_off < 2 * seq_h - 1) {
+                        const float *rh_vec = rel_h + rh_off * head_dim;
+                        for (int d = 0; d < head_dim; d++) score += q_row[d] * rh_vec[d];
+                    }
+                    if (rw_off >= 0 && rw_off < 2 * seq_w - 1) {
+                        const float *rw_vec = rel_w + rw_off * head_dim;
+                        for (int d = 0; d < head_dim; d++) score += q_row[d] * rw_vec[d];
+                    }
 
                     if (score > max_s) {
                         float c = expf(max_s - score);
@@ -311,12 +391,11 @@ static void sam_layer_forward(float *out, const float *x,
             }
         }
     } else {
-        /* Window attention: partition into windows, attend within each */
-        int n_windows;
-        float *win_x = window_partition(x_norm, seq_h, seq_w, win_size, dim, &n_windows);
-        float *win_Q = window_partition(Q, seq_h, seq_w, win_size, dim, &n_windows);
-        float *win_K = window_partition(K, seq_h, seq_w, win_size, dim, &n_windows);
-        float *win_V = window_partition(V, seq_h, seq_w, win_size, dim, &n_windows);
+        /* Window attention: partition into windows (with padding), attend within each */
+        int n_windows, padded_h, padded_w;
+        float *win_Q = window_partition_pad(Q, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
+        float *win_K = window_partition_pad(K, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
+        float *win_V = window_partition_pad(V, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
 
         int win_tokens = win_size * win_size;
         float *win_attn = (float *)calloc((size_t)n_windows * win_tokens * dim, sizeof(float));
@@ -328,13 +407,13 @@ static void sam_layer_forward(float *out, const float *x,
             float *wout = win_attn + (size_t)w * win_tokens * dim;
 
             window_attn_forward(wout, wq, wk, wv, win_tokens, n_heads, head_dim,
-                                rel_h, rel_w, win_size);
+                                rel_h, rel_w, win_size, win_size);
         }
 
-        /* Unpartition back to full sequence */
-        window_unpartition(attn_out, seq_h, seq_w, win_size, dim, n_windows, win_attn);
+        /* Unpartition back to full sequence (removes padding) */
+        window_unpartition_pad(attn_out, seq_h, seq_w, win_size, dim, padded_h, padded_w, win_attn);
 
-        free(win_x); free(win_Q); free(win_K); free(win_V); free(win_attn);
+        free(win_Q); free(win_K); free(win_V); free(win_attn);
     }
 
     free(Q); free(K); free(V);
@@ -388,10 +467,17 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
                   c_mid, spatial_sz);
     free(conv1_out);
 
-    /* Neck conv2: [256, h, w] → [256, h, w] (1×1 conv, no padding) */
+    /* Neck conv2: [256, h, w] → [256, h, w]
+     * V1: 1×1 conv, no padding
+     * V2: 3×3 conv, stride=1, padding=1 */
     float *conv2_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
-    ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
-              c_mid, c_mid, h, w, 1, 1, 1, 0);
+    if (g_sam_is_v2) {
+        ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
+                  c_mid, c_mid, h, w, 3, 3, 1, 1);
+    } else {
+        ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
+                  c_mid, c_mid, h, w, 1, 1, 1, 0);
+    }
 
     /* LayerNorm2d after conv2 */
     float *ln2_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
@@ -403,11 +489,12 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
 }
 
 /* Downsample via net_2 and net_3
- * Input: [256, H, W] → net_2 → [512, H/2, W/2] → net_3 → [1024, H/4, W/4]
+ * Input: [256, H, W] → net_2 → [512, H/2, W/2] → net_3 → [ds2_dim, H/4, W/4]
  * Each: Conv2d(k=3, s=2, p=1)
  */
 static float *sam_downsample_forward(const float *spatial, int h, int w,
                                       const ds_visual_tokenizer_t *vt,
+                                      int ds2_dim,
                                       int *out_h, int *out_w) {
     /* net_2: Conv2d(256→512, k3, s2, p1) */
     int h2 = (h + 2 * 1 - 3) / 2 + 1; /* = h/2 */
@@ -418,14 +505,14 @@ static float *sam_downsample_forward(const float *spatial, int h, int w,
     ds_conv2d(net2_out, spatial, vt->sam_net2_weight, vt->sam_net2_bias,
               DS_SAM_NECK_DIM, DS_SAM_DS1_DIM, h, w, 3, 3, 2, 1);
 
-    /* net_3: Conv2d(512→1024, k3, s2, p1) */
+    /* net_3: Conv2d(512→ds2_dim, k3, s2, p1) */
     int h3 = (h2 + 2 * 1 - 3) / 2 + 1; /* = h/4 */
     int w3 = (w2 + 2 * 1 - 3) / 2 + 1;
     int sp3 = h3 * w3;
 
-    float *net3_out = (float *)malloc(DS_SAM_DS2_DIM * sp3 * sizeof(float));
+    float *net3_out = (float *)malloc(ds2_dim * sp3 * sizeof(float));
     ds_conv2d(net3_out, net2_out, vt->sam_net3_weight, vt->sam_net3_bias,
-              DS_SAM_DS1_DIM, DS_SAM_DS2_DIM, h2, w2, 3, 3, 2, 1);
+              DS_SAM_DS1_DIM, ds2_dim, h2, w2, 3, 3, 2, 1);
     free(net2_out);
 
     *out_h = h3;
@@ -468,17 +555,33 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
     ds_visual_tokenizer_t *vt = &ctx->vis_tokenizer;
     ds_config_t *cfg = &ctx->config;
 
-    /* Step 1: Resize to target image size (1024x1024) */
+    /* Step 1: Resize to target image size (e.g. 1024x1024) */
+    g_sam_is_v2 = (cfg->model_version == 2);
     ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
     int target_size = cfg->image_size;
 
+    ds_image_t *resized_img = NULL;
     int need_resize = (width != target_size || height != target_size);
-    if (need_resize && ds_verbose >= 1)
-        fprintf(stderr, "Note: image %dx%d != %dx%d, resize recommended before inference\n",
-                width, height, target_size, target_size);
+    if (need_resize) {
+        if (ds_verbose >= 1)
+            fprintf(stderr, "Resizing %dx%d -> %dx%d\n",
+                    width, height, target_size, target_size);
+        if (cfg->model_version == 2) {
+            /* V2: pad to maintain aspect ratio (like ImageOps.pad) with gray fill */
+            resized_img = ds_image_pad(&img, target_size, 128);
+        } else {
+            resized_img = ds_image_resize(&img, target_size, target_size);
+        }
+        if (!resized_img) {
+            fprintf(stderr, "Failed to resize image\n");
+            return NULL;
+        }
+    }
 
     /* Convert to float CHW */
-    float *image_chw = ds_image_to_float_chw(&img);
+    ds_image_t *effective_img = resized_img ? resized_img : &img;
+    float *image_chw = ds_image_to_float_chw(effective_img);
+    if (resized_img) ds_image_free(resized_img);
     if (!image_chw) return NULL;
 
     /* Step 2: SAM patch embedding */
@@ -500,10 +603,24 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
     /* Step 3: Add positional embedding */
     /* Convert [768, n_patches] → [n_patches, 768] and add pos_embed */
     float *x = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
-    for (int p = 0; p < n_patches; p++) {
-        for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-            x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
-                                           + vt->sam_pos_embed[(p + 1) * DS_SAM_EMBED_DIM + d]; /* +1 for CLS token pos */
+
+    if (cfg->model_version == 2) {
+        /* V2: pos_embed is 2D spatial [1, grid_h, grid_w, 768] (e.g. [1, 64, 64, 768]) */
+        for (int p = 0; p < n_patches; p++) {
+            int row = p / grid_w;
+            int col = p % grid_w;
+            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
+                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
+                    + vt->sam_pos_embed[(row * grid_w + col) * DS_SAM_EMBED_DIM + d];
+            }
+        }
+    } else {
+        /* V1: pos_embed is 1D sequence [1, n_patches+1, 768] (with CLS token at index 0) */
+        for (int p = 0; p < n_patches; p++) {
+            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
+                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
+                    + vt->sam_pos_embed[(p + 1) * DS_SAM_EMBED_DIM + d]; /* +1 for CLS token pos */
+            }
         }
     }
     free(patch_spatial);
@@ -535,18 +652,19 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
     float *neck_out = sam_neck_forward(spatial, grid_h, grid_w, vt);
     free(spatial);
 
-    /* Step 7: SAM downsample: [256, H, W] → [512, H/2, W/2] → [1024, H/4, W/4] */
+    /* Step 7: SAM downsample: [256, H, W] → [512, H/2, W/2] → [ds2_dim, H/4, W/4] */
     int ds_h, ds_w;
-    float *ds_out = sam_downsample_forward(neck_out, grid_h, grid_w, vt, &ds_h, &ds_w);
+    int ds2_dim = cfg->sam_ds2_dim;
+    float *ds_out = sam_downsample_forward(neck_out, grid_h, grid_w, vt, ds2_dim, &ds_h, &ds_w);
     free(neck_out);
 
     int ds_spatial = ds_h * ds_w;
 
-    /* Convert [1024, ds_h*ds_w] → [ds_h*ds_w, 1024] for downstream use */
-    float *tokens = (float *)malloc(ds_spatial * DS_SAM_DS2_DIM * sizeof(float));
+    /* Convert [ds2_dim, ds_h*ds_w] → [ds_h*ds_w, ds2_dim] for downstream use */
+    float *tokens = (float *)malloc(ds_spatial * ds2_dim * sizeof(float));
     for (int p = 0; p < ds_spatial; p++) {
-        for (int d = 0; d < DS_SAM_DS2_DIM; d++) {
-            tokens[p * DS_SAM_DS2_DIM + d] = ds_out[d * ds_spatial + p];
+        for (int d = 0; d < ds2_dim; d++) {
+            tokens[p * ds2_dim + d] = ds_out[d * ds_spatial + p];
         }
     }
     free(ds_out);

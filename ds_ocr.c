@@ -52,7 +52,8 @@ static int detect_model_version(const char *model_dir) {
     buf[n] = '\0';
     fclose(f);
 
-    if (strstr(buf, "DeepEncoderV2") || strstr(buf, "causal_flow") ||
+    if (strstr(buf, "DeepEncoderV2") || strstr(buf, "deepencoderv2") ||
+        strstr(buf, "causal_flow") ||
         (strstr(buf, "enc_type") && strstr(buf, "\"2\""))) {
         return 2;
     }
@@ -73,7 +74,6 @@ static void init_config(ds_config_t *cfg, int version) {
     cfg->sam_window_size = DS_SAM_WINDOW_SIZE;
     cfg->sam_neck_dim = DS_SAM_NECK_DIM;
     cfg->sam_ds1_dim = DS_SAM_DS1_DIM;
-    cfg->sam_ds2_dim = DS_SAM_DS2_DIM;
     cfg->visual_tokens_base = DS_VISUAL_TOKENS_BASE;
     cfg->max_local_crops = DS_MAX_LOCAL_CROPS;
     cfg->sam_global_attn_indexes[0] = 2;
@@ -87,20 +87,26 @@ static void init_config(ds_config_t *cfg, int version) {
         cfg->enc_layers = DS_ENC_V2_LAYERS;
         cfg->enc_hidden = DS_ENC_V2_HIDDEN;
         cfg->enc_heads = DS_ENC_V2_HEADS;
+        cfg->enc_kv_heads = DS_ENC_V2_KV_HEADS;
         cfg->enc_head_dim = DS_ENC_V2_HEAD_DIM;
         cfg->enc_intermediate = DS_ENC_V2_INTERMEDIATE;
         cfg->enc_causal_flow_queries = DS_VISUAL_TOKENS_BASE; /* 256 queries */
         cfg->proj_input_dim = DS_PROJECTOR_V2_INPUT; /* 896 */
+        cfg->enc_rope_theta = 1000000.0f;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM_V2; /* 896 for V2 */
     } else {
         /* V1: CLIP ViT-L/14 */
         cfg->enc_type = 1;
         cfg->enc_layers = DS_CLIP_LAYERS;
         cfg->enc_hidden = DS_CLIP_HIDDEN;
         cfg->enc_heads = DS_CLIP_HEADS;
+        cfg->enc_kv_heads = DS_CLIP_HEADS;
         cfg->enc_head_dim = DS_CLIP_HEAD_DIM;
         cfg->enc_intermediate = DS_CLIP_MLP_DIM;
         cfg->enc_causal_flow_queries = 0;
         cfg->proj_input_dim = DS_PROJECTOR_V1_INPUT; /* 2048 */
+        cfg->enc_rope_theta = 0;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 for V1 */
     }
 
     /* MoE Decoder (same for V1 and V2) */
@@ -175,7 +181,7 @@ static int load_all_weights(ds_ctx_t *ctx) {
         SAM_WEIGHT(mlp_lin2_bias, "mlp.lin2.bias");
     }
 
-    /* SAM neck */
+    /* SAM neck — V1 uses neck.{0,1,2,3}.{weight,bias}, V2 omits Conv biases */
     LOAD_F32("model.sam_model.neck.0.weight", vt->sam_neck_conv1_weight);
     LOAD_F32("model.sam_model.neck.0.bias", vt->sam_neck_conv1_bias);
     LOAD_F32("model.sam_model.neck.1.weight", vt->sam_neck_ln1_weight);
@@ -185,13 +191,18 @@ static int load_all_weights(ds_ctx_t *ctx) {
     LOAD_F32("model.sam_model.neck.3.weight", vt->sam_neck_ln2_weight);
     LOAD_F32("model.sam_model.neck.3.bias", vt->sam_neck_ln2_bias);
 
-    /* SAM downsample */
+    /* SAM downsample — V1 uses net_2.0/net_3.0, V2 uses net_2/net_3 */
     LOAD_F32("model.sam_model.net_2.0.weight", vt->sam_net2_weight);
     LOAD_F32("model.sam_model.net_2.0.bias", vt->sam_net2_bias);
     LOAD_F32("model.sam_model.net_3.0.weight", vt->sam_net3_weight);
     LOAD_F32("model.sam_model.net_3.0.bias", vt->sam_net3_bias);
+    /* V2 naming (no .0 suffix, no bias) */
+    if (!vt->sam_net2_weight)
+        LOAD_F32("model.sam_model.net_2.weight", vt->sam_net2_weight);
+    if (!vt->sam_net3_weight)
+        LOAD_F32("model.sam_model.net_3.weight", vt->sam_net3_weight);
 
-    /* Learnable tokens */
+    /* Learnable tokens — image_newline is V1 only, view_seperator is shared */
     LOAD_F32("model.image_newline", vt->image_newline);
     LOAD_F32("model.view_seperator", vt->view_seperator);
 
@@ -234,10 +245,13 @@ static int load_all_weights(ds_ctx_t *ctx) {
     if (cfg->enc_type == 2) {
         ds_deep_encoder_t *enc = &ctx->encoder;
 
+        /* V2 encoder prefix: model.qwen2_model.model.model.layers.* */
+        const char *enc_prefix = "model.qwen2_model.model.model";
+
         for (int l = 0; l < cfg->enc_layers; l++) {
             char name[256];
             #define ENC_WEIGHT(field, weight_name) do { \
-                snprintf(name, sizeof(name), "model.encoder.model.model.layers.%d." weight_name, l); \
+                snprintf(name, sizeof(name), "%s.layers.%d." weight_name, enc_prefix, l); \
                 LOAD_F32(name, enc->layers[l].field); \
             } while(0)
 
@@ -246,13 +260,22 @@ static int load_all_weights(ds_ctx_t *ctx) {
             ENC_WEIGHT(wk_weight, "self_attn.k_proj.weight");
             ENC_WEIGHT(wv_weight, "self_attn.v_proj.weight");
             ENC_WEIGHT(wo_weight, "self_attn.o_proj.weight");
+            ENC_WEIGHT(wq_bias, "self_attn.q_proj.bias");
+            ENC_WEIGHT(wk_bias, "self_attn.k_proj.bias");
+            ENC_WEIGHT(wv_bias, "self_attn.v_proj.bias");
             ENC_WEIGHT(layer_norm2_weight, "post_attention_layernorm.weight");
             ENC_WEIGHT(gate_weight, "mlp.gate_proj.weight");
             ENC_WEIGHT(up_weight, "mlp.up_proj.weight");
             ENC_WEIGHT(down_weight, "mlp.down_proj.weight");
         }
 
-        LOAD_F32("model.encoder.model.model.norm.weight", enc->final_norm_weight);
+        char enc_norm_name[256];
+        snprintf(enc_norm_name, sizeof(enc_norm_name), "%s.norm.weight", enc_prefix);
+        LOAD_F32(enc_norm_name, enc->final_norm_weight);
+
+        /* V2 causal flow query embeddings */
+        LOAD_F32("model.qwen2_model.query_1024.weight", vt->causal_query_embeddings);
+        /* query_768 is for 768x768 resolution (144 tokens) */
     }
 
     /* ---- Projector Weights ---- */
@@ -567,28 +590,128 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 
     double encode_end = now_ms();
 
-    /* Step 3: Build decoder input (image tokens + BOS) */
+    /* Step 3: Build decoder input sequence */
     int hidden = cfg->dec_hidden;
 
-    /* Token embedding for image start/end tokens + encoder output */
-    /* For now: directly use encoder output as visual embeddings */
-    int prefix_len = n_encoder_tokens + 2; /* image_start + encoder_tokens + image_end */
-    float *input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
-    memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
+    /* Load tokenizer early (needed for prompt encoding in V2) */
+    char tokenizer_path[4096];
+    const char *model_dir = ctx->model_dir ? ctx->model_dir : ".";
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir);
+    ds_tokenizer_t *tokenizer = ds_tokenizer_load(tokenizer_path);
+    if (!tokenizer && ds_verbose >= 1)
+        fprintf(stderr, "Note: vocab.json not found, tokenizer not loaded\n");
 
-    /* Copy encoder output (skip first and last for image tokens) */
-    memcpy(input_embeds + hidden, encoder_output, n_encoder_tokens * hidden * sizeof(float));
+    float *input_embeds = NULL;
+    int prefix_len = 0;
+
+    if (cfg->model_version == 2) {
+        /* V2 prompt format: [BOS][encoder_output(256)][view_separator][text_tokens]
+         * Text tokens encode "\nFree OCR. " */
+        int n_text_tokens = 0;
+        int *text_token_ids = NULL;
+        if (tokenizer) {
+            text_token_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR. ", &n_text_tokens);
+            if (ds_verbose >= 2 && text_token_ids) {
+                fprintf(stderr, "Prompt text tokens (%d): [", n_text_tokens);
+                for (int i = 0; i < n_text_tokens; i++)
+                    fprintf(stderr, "%d%s", text_token_ids[i], i < n_text_tokens-1 ? ", " : "");
+                fprintf(stderr, "]\n");
+            }
+        }
+
+        /* prefix = BOS(1) + encoder(256) + view_sep(1) + text_tokens */
+        prefix_len = 1 + n_encoder_tokens + 1 + n_text_tokens;
+        input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
+        memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
+        int pos = 0;
+
+        /* BOS token embedding */
+        if (ctx->decoder.tok_embeddings_bf16) {
+            const uint16_t *emb_bos = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_BOS * hidden;
+            for (int i = 0; i < hidden; i++) {
+                uint32_t f32_bits = ((uint32_t)emb_bos[i]) << 16;
+                memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
+            }
+        }
+        pos++;
+
+        /* Encoder output tokens (256) */
+        memcpy(input_embeds + pos * hidden, encoder_output, n_encoder_tokens * hidden * sizeof(float));
+        pos += n_encoder_tokens;
+
+        /* View separator (learned 1280-dim embedding) */
+        if (ctx->vis_tokenizer.view_seperator) {
+            memcpy(input_embeds + pos * hidden, ctx->vis_tokenizer.view_seperator, hidden * sizeof(float));
+        }
+        pos++;
+
+        /* Text token embeddings */
+        if (text_token_ids && ctx->decoder.tok_embeddings_bf16) {
+            for (int t = 0; t < n_text_tokens; t++) {
+                int tid = text_token_ids[t];
+                if (tid >= 0 && tid < cfg->vocab_size) {
+                    const uint16_t *emb = ctx->decoder.tok_embeddings_bf16 + (size_t)tid * hidden;
+                    for (int i = 0; i < hidden; i++) {
+                        uint32_t f32_bits = ((uint32_t)emb[i]) << 16;
+                        memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
+                    }
+                }
+                pos++;
+            }
+        }
+        free(text_token_ids);
+    } else {
+        /* V1 prompt format: [image_start][encoder_output][image_end] */
+        prefix_len = n_encoder_tokens + 2;
+        input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
+        memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
+
+        /* Embed image_start token */
+        if (ctx->decoder.tok_embeddings_bf16) {
+            const uint16_t *emb_start = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_IMAGE_START * hidden;
+            for (int i = 0; i < hidden; i++) {
+                uint32_t f32_bits = ((uint32_t)emb_start[i]) << 16;
+                memcpy(&input_embeds[i], &f32_bits, sizeof(float));
+            }
+        }
+
+        /* Encoder output */
+        memcpy(input_embeds + hidden, encoder_output, n_encoder_tokens * hidden * sizeof(float));
+
+        /* Embed image_end token */
+        if (ctx->decoder.tok_embeddings_bf16) {
+            const uint16_t *emb_end = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_IMAGE_END * hidden;
+            float *last_pos = input_embeds + (prefix_len - 1) * hidden;
+            for (int i = 0; i < hidden; i++) {
+                uint32_t f32_bits = ((uint32_t)emb_end[i]) << 16;
+                memcpy(&last_pos[i], &f32_bits, sizeof(float));
+            }
+        }
+    }
     free(encoder_output);
 
-    /* Step 4: Reset KV cache and prefill */
+    if (ds_verbose >= 1)
+        fprintf(stderr, "Decoder prefix: %d tokens\n", prefix_len);
+
+    /* Step 4: Reset KV cache and prefill (all but last token),
+     * then use decoder_forward with last token to get first predicted token */
     ctx->kv_cache_len = 0;
-    ds_decoder_prefill(ctx, input_embeds, prefix_len);
+
+    float *dec_input = (float *)malloc(hidden * sizeof(float));
+
+    if (prefix_len > 1) {
+        ds_decoder_prefill(ctx, input_embeds, prefix_len - 1);
+        /* Last prefix token becomes first decoder_forward input */
+        memcpy(dec_input, input_embeds + (prefix_len - 1) * hidden, hidden * sizeof(float));
+    } else {
+        /* Single token: use it directly */
+        memcpy(dec_input, input_embeds, hidden * sizeof(float));
+    }
     free(input_embeds);
 
     double decode_start = now_ms();
 
     /* Step 5: Autoregressive decoding */
-    ds_tokenizer_t *tokenizer = NULL; /* TODO: load tokenizer from model_dir */
 
     /* Build output string */
     int capacity = 4096;
@@ -596,21 +719,21 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     int out_len = 0;
     output[0] = '\0';
 
-    /* Use last hidden state as first decoder input */
-    /* The first generated token comes from the last position of prefill */
-    /* Generate subsequent tokens using decoder forward */
-    float *dec_input = (float *)malloc(hidden * sizeof(float));
-    memset(dec_input, 0, hidden * sizeof(float)); /* Will be set by embedding lookup */
-
     int n_generated = 0;
     int eos_token = DS_TOKEN_EOS;
 
     for (int step = 0; step < ctx->max_new_tokens; step++) {
+        /* Check KV cache bounds */
+        if (ctx->kv_cache_len >= ctx->kv_cache_max) break;
+
         /* Get embedding for current token and decode */
-        /* TODO: Implement proper token → embedding lookup */
         int token = ds_decoder_forward(ctx, dec_input);
 
-        if (token == eos_token) break;
+        if (token == eos_token) {
+            if (ds_verbose >= 2) fprintf(stderr, "EOS at step %d\n", step);
+            break;
+        }
+        if (ds_verbose >= 2) fprintf(stderr, "  token[%d] = %d\n", step, token);
 
         /* Decode token to text */
         if (tokenizer) {

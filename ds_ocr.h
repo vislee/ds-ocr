@@ -26,7 +26,8 @@
 #define DS_SAM_WINDOW_SIZE      14      /* SAM window attention window size */
 #define DS_SAM_NECK_DIM         256     /* SAM neck output channels */
 #define DS_SAM_DS1_DIM          512     /* SAM net_2 downsample channels */
-#define DS_SAM_DS2_DIM          1024    /* SAM net_3 downsample channels */
+#define DS_SAM_DS2_DIM          1024    /* SAM net_3 downsample channels (V1) */
+#define DS_SAM_DS2_DIM_V2       896     /* SAM net_3 downsample channels (V2) */
 #define DS_VISUAL_TOKENS_BASE   256     /* Base visual tokens for 1024x1024 */
 #define DS_LOCAL_CROP_TOKENS    144     /* Tokens per local crop (768x768) */
 #define DS_MAX_LOCAL_CROPS      6       /* Maximum local crop regions */
@@ -43,6 +44,7 @@
 #define DS_ENC_V2_LAYERS        24
 #define DS_ENC_V2_HIDDEN        896
 #define DS_ENC_V2_HEADS         14
+#define DS_ENC_V2_KV_HEADS      2       /* GQA: 2 KV heads for 14 Q heads */
 #define DS_ENC_V2_HEAD_DIM      64
 #define DS_ENC_V2_INTERMEDIATE  4864
 
@@ -94,7 +96,7 @@ typedef struct {
     int sam_window_size;        /* 14 */
     int sam_neck_dim;           /* 256 */
     int sam_ds1_dim;            /* 512 */
-    int sam_ds2_dim;            /* 1024 */
+    int sam_ds2_dim;            /* 1024 (V1) or 896 (V2) */
     int visual_tokens_base;     /* 256 */
     int max_local_crops;        /* 6 */
     int sam_global_attn_indexes[4]; /* [2, 5, 8, 11] */
@@ -104,10 +106,12 @@ typedef struct {
     int enc_layers;             /* 24 */
     int enc_hidden;             /* 1024 (CLIP) or 896 (Qwen2) */
     int enc_heads;              /* 16 (CLIP) or 14 (Qwen2) */
+    int enc_kv_heads;           /* 16 (CLIP) or 2 (Qwen2 GQA) */
     int enc_head_dim;           /* 64 */
     int enc_intermediate;       /* 4096 (CLIP) or 4864 (Qwen2) */
     int enc_output_dim;         /* 1280 (matches decoder hidden) */
     int enc_causal_flow_queries;/* Number of causal flow query tokens (V2 only) */
+    float enc_rope_theta;       /* RoPE theta for Qwen2 encoder */
 
     /* Projector */
     int proj_input_dim;         /* 2048 (V1: CLIP+SAM concat) or 896 (V2) */
@@ -235,9 +239,12 @@ typedef struct {
         /* Self-attention */
         float *layer_norm1_weight;      /* [896] */
         float *wq_weight;               /* [896, 896] */
-        float *wk_weight;               /* [896, 896] */
-        float *wv_weight;               /* [896, 896] */
+        float *wk_weight;               /* [128, 896] (GQA: 2 kv_heads) */
+        float *wv_weight;               /* [128, 896] (GQA: 2 kv_heads) */
         float *wo_weight;               /* [896, 896] */
+        float *wq_bias;                 /* [896] */
+        float *wk_bias;                 /* [128] */
+        float *wv_bias;                 /* [128] */
 
         /* FFN (SwiGLU) */
         float *layer_norm2_weight;      /* [896] */

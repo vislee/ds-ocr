@@ -1,6 +1,7 @@
 # Build artifacts
 *.o
 ds_ocr
+ds_ocr_asan
 
 # macOS
 .DS_Store
@@ -8,10 +9,21 @@ ds_ocr
 # Model files (too large for git)
 *.safetensors
 models/
+deepseek-ocr/
+deepseek-ocr-2/
 
 # IDE
 .vscode/
 .idea/
 
-# Monbot internal
+# Monbot / Agent config
 .monbot/
+BOOTSTRAP.md
+CLAUDE.md
+HEARTBEAT.md
+TOOLS.md
+AGENTS.md
+
+# Screenshots & test images
+*.png
+*.jpg
