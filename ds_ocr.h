@@ -182,7 +182,8 @@ typedef struct {
     float *view_seperator;              /* [1280] */
 
     /* Causal flow query embeddings (V2 only) */
-    float *causal_query_embeddings;     /* [n_queries, 896] */
+    float *causal_query_embeddings;     /* [256, 896] for 1024x1024 input */
+    float *causal_query_768_embeddings; /* [144, 896] for 768x768 input */
 } ds_visual_tokenizer_t;
 
 /* ========================================================================
@@ -371,7 +372,15 @@ typedef struct {
     /* Inference settings */
     int max_new_tokens;        /* Max tokens to generate (default: 4096) */
     float temperature;         /* Sampling temperature (default: 0.0 = greedy) */
+    float repeat_penalty;      /* Repetition penalty (default: 1.0 = none, 1.1-1.5 typical) */
     int num_local_crops;       /* Number of local crop regions (0-6) */
+
+    /* Repetition penalty support */
+    float *dec_logits;                 /* [vocab_size] logits buffer */
+    int *token_history;                /* generated token IDs for penalty */
+    int token_history_len;
+    int token_history_cap;
+    int no_repeat_ngram_size;          /* n-gram blocking (0=disabled, default=20) */
 
     /* Per-run performance stats */
     double perf_total_ms;
@@ -418,11 +427,13 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
 
 /* DeepEncoder V2 forward pass: visual tokens -> encoder output */
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
-                               int n_tokens, int *out_seq_len);
+                               int n_tokens, int *out_seq_len,
+                               int n_causal_queries, const float *causal_queries);
 
 /* Unified encoder forward (dispatches to V1 CLIP or V2 DeepEncoder) */
 float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
-                           int n_tokens, int *out_seq_len);
+                           int n_tokens, int *out_seq_len,
+                           int n_causal_queries, const float *causal_queries);
 
 /* Decoder prefill (multiple tokens) */
 void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len);

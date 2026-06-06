@@ -13,11 +13,13 @@
 #include "ds_moe_decoder.h"
 #include "ds_tokenizer.h"
 
+#include "ds_dump.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 int ds_verbose = 1;
 
@@ -276,6 +278,7 @@ static int load_all_weights(ds_ctx_t *ctx) {
         /* V2 causal flow query embeddings */
         LOAD_F32("model.qwen2_model.query_1024.weight", vt->causal_query_embeddings);
         /* query_768 is for 768x768 resolution (144 tokens) */
+        LOAD_F32("model.qwen2_model.query_768.weight", vt->causal_query_768_embeddings);
     }
 
     /* ---- Projector Weights ---- */
@@ -407,6 +410,12 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->dec_shared_out = (float *)malloc(hidden * sizeof(float));
     ctx->dec_gate_scores = (float *)malloc(cfg->dec_n_routed_experts * sizeof(float));
 
+    /* Repetition penalty: logits buffer and token history */
+    ctx->dec_logits = (float *)malloc(cfg->vocab_size * sizeof(float));
+    ctx->token_history_cap = max_seq + 512;
+    ctx->token_history = (int *)malloc(ctx->token_history_cap * sizeof(int));
+    ctx->token_history_len = 0;
+
     /* Dense FFN buffers (for layer 0 and any layer < first_k_dense) */
     if (cfg->dec_first_k_dense > 0) {
         ctx->dec_dense_gate = (float *)malloc(intermediate * sizeof(float));
@@ -440,6 +449,8 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     /* Default settings */
     ctx->max_new_tokens = 4096;
     ctx->temperature = 0.0f; /* Greedy by default */
+    ctx->repeat_penalty = 1.0f; /* No penalty by default */
+    ctx->no_repeat_ngram_size = 20; /* Match Python default */
 
     return 0;
 }
@@ -556,48 +567,296 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     double t0 = now_ms();
     double encode_start = t0;
     ds_config_t *cfg = &ctx->config;
+    int hidden = cfg->dec_hidden;
 
-    /* Step 1: Visual tokenizer (SAM) */
-    int n_visual_tokens;
-    float *patch_embeds = NULL;
-    float *visual_tokens = ds_visual_tokenizer_forward(ctx, pixels, width, height, channels,
-                                                        &n_visual_tokens, &patch_embeds);
-    if (!visual_tokens) {
-        fprintf(stderr, "Visual tokenizer failed\n");
-        return NULL;
-    }
+    /* Initialize dump directory if DS_DUMP_TENSORS is set */
+    ds_dump_init();
 
-    /* Step 2: Encoder (CLIP V1 or DeepEncoder V2) */
-    int n_encoder_tokens;
-    float *encoder_output;
+    /* ---- V2: Multi-crop encoding ----
+     * Python flow:
+     *   dynamic_preprocess → P patches (768x768) + 1 thumbnail (1024x1024)
+     *   for each crop:   SAM(768x768) → Qwen2(144 queries) → Projector → 144 tokens
+     *   for global image: SAM(1024x1024) → Qwen2(256 queries) → Projector → 256 tokens
+     *   concat: [local(P*144), global(256), view_separator(1)]
+     */
 
-    if (cfg->enc_type == 1) {
-        /* V1: CLIP encoder takes SAM patch_embeds + SAM features */
-        encoder_output = ds_clip_encoder_forward(ctx, patch_embeds,
-                                                  n_visual_tokens, visual_tokens,
-                                                  n_visual_tokens, &n_encoder_tokens);
+    int n_encoder_tokens = 0;
+    float *encoder_output = NULL;  /* [n_encoder_tokens, dec_hidden] */
+    char tokenizer_path[4096];
+    const char *model_dir_str = ctx->model_dir ? ctx->model_dir : ".";
+    ds_tokenizer_t *tokenizer = NULL;
+
+    if (cfg->model_version == 2 && cfg->enc_type != 1) {
+        /* V2 multi-crop path */
+        ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
+
+        /* Fast-path: skip encoding entirely and load from Python reference dump */
+        if (getenv("DS_SKIP_ENCODER")) {
+            const char *npy_path = "dump/multicrop/full_proj_output.npy";
+            FILE *f = fopen(npy_path, "rb");
+            if (f) {
+                unsigned char buf[10];
+                fread(buf, 1, 10, f);
+                uint16_t header_len = *(uint16_t *)(buf + 8);
+                fseek(f, 10 + header_len, SEEK_SET);
+                n_encoder_tokens = 1121;
+                encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
+                fread(encoder_output, sizeof(float), n_encoder_tokens * hidden, f);
+                fclose(f);
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "SKIP_ENCODER: loaded %d tokens from %s (no SAM/encoder compute)\n",
+                            n_encoder_tokens, npy_path);
+                goto prompt_construction;
+            } else {
+                fprintf(stderr, "DS_SKIP_ENCODER: %s not found, falling back to encoding\n", npy_path);
+            }
+        }
+
+        /* Step 1: Dynamic preprocess — generate crops + thumbnail
+         * For small images (both dims <= 768), dynamic_preprocess returns 1 image padded to 768.
+         * We still need a 1024x1024 global image for the encoder, so we handle this as
+         * "no crop" case: just encode the global image at 1024x1024.
+         * For larger images, dynamic_preprocess returns N crops (768x768) + 1 thumbnail (1024x1024).
+         */
+        int n_crops = 0;
+        int use_crop = (width > 768 || height > 768);
+        ds_image_t **crops = NULL;
+
+        if (use_crop) {
+            crops = ds_dynamic_preprocess(&img, 768, 1, 12, 0, &n_crops);
+            if (!crops || n_crops < 1) {
+                fprintf(stderr, "dynamic_preprocess failed\n");
+                return NULL;
+            }
+        }
+
+        if (!use_crop) {
+            /* Small image: no cropping, just global 1024x1024 encoding */
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Small image %dx%d: global-only encoding (1024x1024)\n", width, height);
+
+            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
+            if (!global_img) return NULL;
+
+            int n_sam_tokens;
+            float *sam_tokens = ds_sam_forward_image(ctx, global_img, &n_sam_tokens, NULL);
+            ds_image_free(global_img);
+            if (!sam_tokens) return NULL;
+
+            int global_queries = 256;
+            encoder_output = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
+                                                    &n_encoder_tokens,
+                                                    global_queries,
+                                                    ctx->vis_tokenizer.causal_query_embeddings);
+            free(sam_tokens);
+            if (!encoder_output) {
+                fprintf(stderr, "Encoder forward failed for global image\n");
+                return NULL;
+            }
+        } else {
+            /* Large image: multi-crop encoding */
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Multi-crop: %d local crops (768x768)\n", n_crops - 1);
+
+            /* Step 2: Encode each local crop (768x768) */
+            int tokens_per_crop = 144;  /* 48/4 * 48/4 = 12*12 = 144 */
+            float *local_features = NULL;
+            int local_token_count = 0;
+
+            for (int i = 0; i < n_crops; i++) {  /* all are 768x768 local crops */
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
+
+                int n_sam_tokens;
+                float *sam_tokens = ds_sam_forward_image(ctx, crops[i], &n_sam_tokens, NULL);
+                if (!sam_tokens) {
+                    fprintf(stderr, "SAM forward failed for crop %d\n", i);
+                    goto cleanup_crops;
+                }
+
+                /* Dump SAM output for first crop if DS_DUMP_TENSORS set */
+                if (i == 0 && getenv("DS_DUMP_TENSORS")) {
+                    FILE *df = fopen("dump/local_crop0_sam_output.bin", "wb");
+                    if (df) { fwrite(sam_tokens, sizeof(float), n_sam_tokens * 896, df); fclose(df); }
+                }
+
+                /* Encoder: Qwen2 with 144 causal flow queries (includes projector) */
+                int n_enc_tokens;
+                float *enc_tokens = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
+                                                           &n_enc_tokens,
+                                                           tokens_per_crop,
+                                                           ctx->vis_tokenizer.causal_query_768_embeddings);
+                free(sam_tokens);
+                if (!enc_tokens) {
+                    fprintf(stderr, "Encoder forward failed for crop %d\n", i);
+                    goto cleanup_crops;
+                }
+
+                /* Dump crop encoder output for comparison if DS_DUMP_TENSORS set */
+                if (getenv("DS_DUMP_TENSORS")) {
+                    char dump_path[256];
+                    snprintf(dump_path, sizeof(dump_path), "dump/local_crop%d_proj_output.bin", i);
+                    FILE *df = fopen(dump_path, "wb");
+                    if (df) { fwrite(enc_tokens, sizeof(float), n_enc_tokens * hidden, df); fclose(df); }
+                }
+
+                /* Quick debug: after first crop, dump and exit early */
+                if (i == 0 && getenv("DS_DUMP_FIRST_CROP")) {
+                    FILE *df = fopen("dump/c_crop0_proj_output.bin", "wb");
+                    if (df) { fwrite(enc_tokens, sizeof(float), n_enc_tokens * hidden, df); fclose(df); }
+                    fprintf(stderr, "DS_DUMP_FIRST_CROP: dumped crop 0, exiting\n");
+                    goto cleanup_crops;
+                }
+
+                /* Append to local_features */
+                int old_count = local_token_count;
+                local_token_count += n_enc_tokens;
+                local_features = (float *)realloc(local_features, local_token_count * hidden * sizeof(float));
+                memcpy(local_features + old_count * hidden, enc_tokens, n_enc_tokens * hidden * sizeof(float));
+                free(enc_tokens);
+            }
+
+            /* Step 3: Encode global image (1024x1024)
+             * Python: global_features_1 = sam_model(image_ori) where image_ori is 1024x1024
+             * Note: ds_dynamic_preprocess thumbnail is 768x768, NOT 1024x1024.
+             * We need to pad the original image to 1024x1024 separately. */
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Encoding global image (1024x1024)\n");
+
+            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
+            if (!global_img) {
+                free(local_features);
+                goto cleanup_crops;
+            }
+
+            int n_global_sam_tokens;
+            float *global_sam_tokens = ds_sam_forward_image(ctx, global_img, &n_global_sam_tokens, NULL);
+            ds_image_free(global_img);
+            if (!global_sam_tokens) {
+                fprintf(stderr, "SAM forward failed for global image\n");
+                free(local_features);
+                goto cleanup_crops;
+            }
+
+            int n_global_enc_tokens;
+            int global_queries = 256;  /* 64/4 * 64/4 = 16*16 = 256 */
+            float *global_enc_tokens = ds_encoder_forward_v2(ctx, global_sam_tokens, n_global_sam_tokens,
+                                                              &n_global_enc_tokens,
+                                                              global_queries,
+                                                              ctx->vis_tokenizer.causal_query_embeddings);
+            free(global_sam_tokens);
+
+            /* Step 4: Concatenate [local, global, view_separator] — matches Python
+             * Python uses masked_scatter_ with source=[local, global, view_sep]
+             * into mask positions ordered [global, view_sep, local].
+             * The net effect is that embedding positions get filled with
+             * [local[0:256], local[256], local[257:864]+global[0:256]+view_sep].
+             * Since C code directly places encoder_output into embed positions,
+             * we use the same source order: [local, global, view_sep]. */
+            int view_sep = 1;
+            n_encoder_tokens = local_token_count + n_global_enc_tokens + view_sep;
+            encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
+
+            int offset = 0;
+            /* Local tokens first */
+            if (local_token_count > 0) {
+                memcpy(encoder_output, local_features, local_token_count * hidden * sizeof(float));
+                offset = local_token_count;
+            }
+            /* Global tokens next */
+            memcpy(encoder_output + offset * hidden, global_enc_tokens, n_global_enc_tokens * hidden * sizeof(float));
+            offset += n_global_enc_tokens;
+            /* View separator last */
+            if (ctx->vis_tokenizer.view_seperator) {
+                memcpy(encoder_output + offset * hidden, ctx->vis_tokenizer.view_seperator, hidden * sizeof(float));
+            } else {
+                memset(encoder_output + offset * hidden, 0, hidden * sizeof(float));
+            }
+
+            free(local_features);
+            free(global_enc_tokens);
+
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Multi-crop encoding: %d local + %d global + %d sep = %d tokens\n",
+                        local_token_count, n_global_enc_tokens, view_sep, n_encoder_tokens);
+
+        cleanup_crops:
+            for (int i = 0; i < n_crops; i++) ds_image_free(crops[i]);
+            free(crops);
+            if (!encoder_output) return NULL;
+        } /* end else (large image) */
+
     } else {
-        /* V2: DeepEncoder takes SAM features */
-        encoder_output = ds_encoder_forward_v2(ctx, visual_tokens, n_visual_tokens,
-                                                &n_encoder_tokens);
+        /* V1 or single-image V2 path (no cropping) */
+        /* Step 1: Visual tokenizer (SAM) — resize to 1024x1024 */
+        int n_visual_tokens;
+        float *patch_embeds = NULL;
+        float *visual_tokens = ds_visual_tokenizer_forward(ctx, pixels, width, height, channels,
+                                                            &n_visual_tokens, &patch_embeds);
+        if (!visual_tokens) {
+            fprintf(stderr, "Visual tokenizer failed\n");
+            return NULL;
+        }
+
+        /* Step 2: Encoder (CLIP V1 or DeepEncoder V2) */
+        if (cfg->enc_type == 1) {
+            encoder_output = ds_clip_encoder_forward(ctx, patch_embeds,
+                                                      n_visual_tokens, visual_tokens,
+                                                      n_visual_tokens, &n_encoder_tokens);
+        } else {
+            encoder_output = ds_encoder_forward_v2(ctx, visual_tokens, n_visual_tokens,
+                                                    &n_encoder_tokens,
+                                                    cfg->enc_causal_flow_queries,
+                                                    ctx->vis_tokenizer.causal_query_embeddings);
+        }
+        free(patch_embeds);
+        free(visual_tokens);
+        if (!encoder_output) {
+            fprintf(stderr, "Encoder forward failed\n");
+            return NULL;
+        }
     }
-    free(patch_embeds);
-    free(visual_tokens);
-    if (!encoder_output) {
-        fprintf(stderr, "Encoder forward failed\n");
-        return NULL;
+
+    /* Override encoder output with Python reference for decoder quality testing */
+    if (getenv("DS_PERFECT_ENCODER")) {
+        /* Choose the right .npy file based on token count:
+         * 256 tokens -> dump/proj_output.npy (global-only)
+         * 1121 tokens -> dump/multicrop/full_proj_output.npy (multi-crop) */
+        const char *npy_path = NULL;
+        if (n_encoder_tokens == 256) {
+            npy_path = "dump/proj_output.npy";
+        } else if (n_encoder_tokens == 1121) {
+            npy_path = "dump/multicrop/full_proj_output.npy";
+        }
+        if (npy_path) {
+            FILE *f = fopen(npy_path, "rb");
+            if (f) {
+                /* .npy format: magic(6) + version(2) + header_len(2 or 4) + header + data */
+                unsigned char buf[10];
+                fread(buf, 1, 10, f);
+                uint16_t header_len = *(uint16_t *)(buf + 8);
+                fseek(f, 10 + header_len, SEEK_SET);
+                fread(encoder_output, sizeof(float), n_encoder_tokens * hidden, f);
+                fclose(f);
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "Override encoder output with Python reference (%d tokens from %s)\n",
+                            n_encoder_tokens, npy_path);
+            } else {
+                fprintf(stderr, "Warning: DS_PERFECT_ENCODER set but %s not found\n", npy_path);
+            }
+        } else {
+            fprintf(stderr, "Warning: DS_PERFECT_ENCODER: unsupported token count %d\n", n_encoder_tokens);
+        }
     }
 
     double encode_end = now_ms();
 
     /* Step 3: Build decoder input sequence */
-    int hidden = cfg->dec_hidden;
 
+prompt_construction:
     /* Load tokenizer early (needed for prompt encoding in V2) */
-    char tokenizer_path[4096];
-    const char *model_dir = ctx->model_dir ? ctx->model_dir : ".";
-    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir);
-    ds_tokenizer_t *tokenizer = ds_tokenizer_load(tokenizer_path);
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir_str);
+    tokenizer = ds_tokenizer_load(tokenizer_path);
     if (!tokenizer && ds_verbose >= 1)
         fprintf(stderr, "Note: vocab.json not found, tokenizer not loaded\n");
 
@@ -605,61 +864,148 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     int prefix_len = 0;
 
     if (cfg->model_version == 2) {
-        /* V2 prompt format: [BOS][encoder_output(256)][view_separator][text_tokens]
-         * Text tokens encode "\nFree OCR. " */
-        int n_text_tokens = 0;
-        int *text_token_ids = NULL;
+        /* V2 prompt format matching Python model.infer() with sft_format='plain':
+         * Python prompt = '<image>\nFree OCR. '
+         * With multi-crop: encoder_output already contains [local, global, view_sep]
+         * C equivalent: [BOS] + encoder_output(n_encoder_tokens) + '\nFree OCR. '(5 tokens)
+         * Note: PLAIN template has no role tokens — roles=("", ""), sep=""
+         */
+        /* Compute image_size=640 token layout (must match Python model.infer() default) */
+        int ds_image_size = 640;
+        int ds_num_queries = (ds_image_size + 15) / 16 / 4;  /* ceil(640/16/4) = 10 */
+        int ds_local_tokens_per_crop = ds_num_queries * ds_num_queries;  /* 100 */
+        int n_crops_count = (n_encoder_tokens - 257) / 144;  /* 864/144=6 */
+        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;  /* 600 */
+        int n_global_slots = 256;
+        int n_sep_slots = 1;
+        int n_img_tokens = n_global_slots + n_sep_slots + n_local_slots;  /* 857 */
+        int n_local_enc = n_encoder_tokens - 257;  /* 864 encoder local tokens */
+
+        int n_text_after = 0;
+        int *text_after_ids = NULL;
         if (tokenizer) {
-            text_token_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR. ", &n_text_tokens);
-            if (ds_verbose >= 2 && text_token_ids) {
-                fprintf(stderr, "Prompt text tokens (%d): [", n_text_tokens);
-                for (int i = 0; i < n_text_tokens; i++)
-                    fprintf(stderr, "%d%s", text_token_ids[i], i < n_text_tokens-1 ? ", " : "");
-                fprintf(stderr, "]\n");
+            /* Hardcode the correct token IDs for "\nFree OCR." (no trailing space,
+             * as Python's format_messages strips it).
+             * Verified against Python model: 862 = BOS(1) + image(857) + text(4)
+             * '\n' -> 201 (Ċ), 'Free' -> 21431, ' OCR' -> 126041 (ĠOCR), '.' -> 16 */
+            static const int hardcoded_text_ids[] = {201, 21431, 126041, 16};
+            n_text_after = 4;
+            text_after_ids = (int *)malloc(n_text_after * sizeof(int));
+            memcpy(text_after_ids, hardcoded_text_ids, n_text_after * sizeof(int));
+            if (ds_verbose >= 1) {
+                fprintf(stderr, "Prompt: BOS + img(%d) + after(%d) = %d tokens\n",
+                        n_img_tokens, n_text_after, 1 + n_img_tokens + n_text_after);
             }
         }
 
-        /* prefix = BOS(1) + encoder(256) + view_sep(1) + text_tokens */
-        prefix_len = 1 + n_encoder_tokens + 1 + n_text_tokens;
+        /* prefix = BOS(1) + image_tokens(n_img_tokens) + text_after(n_text_after)
+         * Note: n_img_tokens may differ from n_encoder_tokens when image_size=640
+         * because some encoder tokens are dropped by Python's masked_scatter. */
+        /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
+
+        if (ds_verbose >= 1) {
+            fprintf(stderr, "Image size config: image_size=%d, num_queries=%d, "
+                   "local_tokens/crop=%d, crops=%d\n",
+                   ds_image_size, ds_num_queries, ds_local_tokens_per_crop, n_crops_count);
+            fprintf(stderr, "Token layout: %d global + %d sep + %d local = %d image tokens "
+                   "(encoder has %d local, dropping %d)\n",
+                   n_global_slots, n_sep_slots, n_local_slots, n_img_tokens,
+                   n_local_enc, n_local_enc - n_local_slots);
+        }
+
+        prefix_len = 1 + n_img_tokens + n_text_after;
         input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
         memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
         int pos = 0;
 
-        /* BOS token embedding */
-        if (ctx->decoder.tok_embeddings_bf16) {
-            const uint16_t *emb_bos = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_BOS * hidden;
-            for (int i = 0; i < hidden; i++) {
-                uint32_t f32_bits = ((uint32_t)emb_bos[i]) << 16;
-                memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
-            }
-        }
-        pos++;
+        /* Helper: embed a single token ID at current pos and advance */
+        #define EMBED_TOKEN(tid) do { \
+            if (ctx->decoder.tok_embeddings_bf16 && (tid) >= 0 && (tid) < cfg->vocab_size) { \
+                const uint16_t *_e = ctx->decoder.tok_embeddings_bf16 + (size_t)(tid) * hidden; \
+                for (int _i = 0; _i < hidden; _i++) { \
+                    uint32_t _f32 = ((uint32_t)_e[_i]) << 16; \
+                    memcpy(&input_embeds[pos * hidden + _i], &_f32, sizeof(float)); \
+                } \
+            } \
+            pos++; \
+        } while(0)
 
-        /* Encoder output tokens (256) */
-        memcpy(input_embeds + pos * hidden, encoder_output, n_encoder_tokens * hidden * sizeof(float));
-        pos += n_encoder_tokens;
+        /* 1. BOS token (id=0) */
+        EMBED_TOKEN(DS_TOKEN_BOS);
 
-        /* View separator (learned 1280-dim embedding) */
-        if (ctx->vis_tokenizer.view_seperator) {
-            memcpy(input_embeds + pos * hidden, ctx->vis_tokenizer.view_seperator, hidden * sizeof(float));
-        }
-        pos++;
+        /* 2. Encoder output tokens — layout must match Python model.forward() behavior.
+         *
+         * CRITICAL: The Python model uses image_size=640 (not 768) for token layout.
+         * With image_size=640: num_queries=10, local_tokens_per_crop=100
+         * Total image tokens: 256 (global) + 1 (sep) + 600 (local) = 857
+         *
+         * But the encoder ALWAYS produces 144 tokens per crop (causal_query_768
+         * is nn.Embedding(144, 896)). So we have 864 local encoder tokens
+         * but only 600 image token positions. Python's masked_scatter silently
+         * drops the extra 264 tokens (the last 7 from each crop).
+         *
+         * Python's masked_scatter fills image token positions with source=[local(864), global(256), sep(1)]:
+         *   global slots (pos 1-256)   <- source[0:256]   = local[0:256]
+         *   sep slot (pos 257)         <- source[256]      = local[256]
+         *   local slots (pos 258-857)  <- source[257:857]  = local[257:600]+partial
+         *   (source[857:] = local[857:864] + global + sep are DROPPED)
+         *
+         * We must replicate this exact layout. */
+        /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
 
-        /* Text token embeddings */
-        if (text_token_ids && ctx->decoder.tok_embeddings_bf16) {
-            for (int t = 0; t < n_text_tokens; t++) {
-                int tid = text_token_ids[t];
-                if (tid >= 0 && tid < cfg->vocab_size) {
-                    const uint16_t *emb = ctx->decoder.tok_embeddings_bf16 + (size_t)tid * hidden;
-                    for (int i = 0; i < hidden; i++) {
-                        uint32_t f32_bits = ((uint32_t)emb[i]) << 16;
-                        memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
-                    }
-                }
-                pos++;
-            }
+        /* Debug: dump encoder_output for Python decoder comparison */
+        if (getenv("DS_DUMP_ENCODER")) {
+            FILE *df = fopen("dump/c_encoder_output.bin", "wb");
+            if (df) { fwrite(encoder_output, sizeof(float), n_encoder_tokens * hidden, df); fclose(df); }
+            fprintf(stderr, "Dumped C encoder output: %d tokens x %d dim to dump/c_encoder_output.bin\n",
+                    n_encoder_tokens, hidden);
         }
-        free(text_token_ids);
+
+        /* Apply Python model's masked_scatter layout:
+         * With image_size=640, only n_local_slots (600) of the n_local_enc (864) 
+         * local encoder tokens are used. Global features and sep from encoder
+         * are DROPPED (they don't fit in the 857 image token positions).
+         * 
+         * Python's masked_scatter result:
+         *   global slots (1-256)  <- source[0:256] = local_enc[0:256]
+         *   sep slot (257)        <- source[256]   = local_enc[256]
+         *   local slots (258-857) <- source[257:857] = local_enc[257:600]
+         *   (source[857:] dropped = local_enc[600:864] + global + sep)
+         */
+        float *enc = encoder_output;
+        int img_pos = pos;  /* starts at 1 (after BOS) */
+        
+        /* Global slots (256 positions) <- source[0:256] = local_enc[0:256] */
+        memcpy(input_embeds + img_pos * hidden, enc, n_global_slots * hidden * sizeof(float));
+        img_pos += n_global_slots;
+        /* Sep slot (1 position) <- source[256] = local_enc[256] */
+        memcpy(input_embeds + img_pos * hidden, enc + n_global_slots * hidden, hidden * sizeof(float));
+        img_pos += 1;
+        /* Local slots (n_local_slots positions) <- source[257:257+n_local_slots]
+         * = local_enc[257:257+n_local_slots]
+         * With n_local_slots=600, this is local_enc[257:857] (600 tokens) */
+        memcpy(input_embeds + img_pos * hidden, enc + (n_global_slots + 1) * hidden,
+               n_local_slots * hidden * sizeof(float));
+        img_pos += n_local_slots;
+        /* Note: global features (enc + n_local_enc*hidden) and sep are NOT placed,
+         * matching Python's masked_scatter behavior with image_size=640.
+         * local_enc[857:864] (7 tokens) are also dropped. */
+        pos = img_pos;
+
+        /* 3. Text after image: "\nFree OCR. " (5 tokens) */
+        for (int t = 0; t < n_text_after; t++) EMBED_TOKEN(text_after_ids[t]);
+
+        #undef EMBED_TOKEN
+
+        /* Dump input_embeds for comparison with Python */
+        if (getenv("DS_DUMP_INPUT_EMBEDS")) {
+            FILE *df = fopen("dump/c_inputs_embeds.bin", "wb");
+            if (df) { fwrite(input_embeds, sizeof(float), prefix_len * hidden, df); fclose(df); }
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Dumped C input_embeds: %d x %d to dump/c_inputs_embeds.bin\n", prefix_len, hidden);
+        }
+
+        free(text_after_ids);
     } else {
         /* V1 prompt format: [image_start][encoder_output][image_end] */
         prefix_len = n_encoder_tokens + 2;
@@ -729,9 +1075,32 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         /* Get embedding for current token and decode */
         int token = ds_decoder_forward(ctx, dec_input);
 
+        /* Debug: print top-5 logits for first token */
+        if (step == 0 && ctx->dec_logits) {
+            float *logits = ctx->dec_logits;
+            int vocab = ctx->config.vocab_size;
+            fprintf(stderr, "First token=%d, logit[100088]=%.3f\n", token, logits[100088]);
+            fprintf(stderr, "First token top-5: ");
+            /* Simple partial sort */
+            for (int r = 0; r < 5; r++) {
+                int best_i = 0; float best_v = -1e30f;
+                for (int i = 0; i < vocab; i++) {
+                    if (logits[i] > best_v) { best_v = logits[i]; best_i = i; }
+                }
+                fprintf(stderr, "[%d:%.3f] ", best_i, best_v);
+                logits[best_i] = -1e30f; /* mask for next rank */
+            }
+            fprintf(stderr, "\n");
+        }
+
         if (token == eos_token) {
             if (ds_verbose >= 2) fprintf(stderr, "EOS at step %d\n", step);
             break;
+        }
+
+        /* Record token in history for repetition penalty */
+        if (ctx->token_history && ctx->token_history_len < ctx->token_history_cap) {
+            ctx->token_history[ctx->token_history_len++] = token;
         }
         if (ds_verbose >= 2) fprintf(stderr, "  token[%d] = %d\n", step, token);
 

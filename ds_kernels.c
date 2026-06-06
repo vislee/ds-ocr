@@ -709,6 +709,12 @@ void ds_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
     ds_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
 }
 
+/* Public wrapper: compute logits = W_bf16 @ x + bias (single token, full output vector) */
+void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
+                         const float *b, int in_dim, int out_dim) {
+    ds_bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
+}
+
 /* Find argmax over a range of output rows [start, end).
  * Uses 2-row processing to amortize x vector loads (same as bf16_matvec_fused). */
 static void argmax_bf16_range(const float *x, const uint16_t *W_bf16,
@@ -1110,11 +1116,13 @@ void ds_silu(float *x, int n) {
 }
 
 void ds_gelu(float *x, int n) {
+    /* Exact GELU using erf: 0.5 * x * (1 + erf(x / sqrt(2)))
+     * Matches PyTorch nn.GELU(approximate='none') */
     for (int i = 0; i < n; i++) {
         float val = x[i];
-        float x3 = val * val * val;
-        float inner = 0.7978845608028654f * (val + 0.044715f * x3);
-        x[i] = 0.5f * val * (1.0f + tanhf(inner));
+        float arg = val * 0.7071067811865475f; /* 1/sqrt(2) */
+        float erf_val = erff(arg);
+        x[i] = 0.5f * val * (1.0f + erf_val);
     }
 }
 
@@ -1381,6 +1389,13 @@ void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
 
 void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
                               int seq, int head_dim, float theta) {
+    /* Split-half RoPE (matches LlamaAttention / DeepSeek-V2 with use_mla=False):
+     * Layout: [seq, head_dim] where cos[0:half] == cos[half:end] (repeated).
+     * This matches the Python model's:
+     *   freqs = outer(t, inv_freq)  # [seq, half]
+     *   emb = cat(freqs, freqs, dim=-1)  # [seq, dim]
+     *   cos_cached = emb.cos()
+     */
     int half = head_dim / 2;
 
     for (int s = 0; s < seq; s++) {
@@ -1390,11 +1405,11 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
             float angle = pos * freq;
             float c = cosf(angle);
             float sn = sinf(angle);
-            /* Duplicate for full head_dim */
-            cos_out[s * head_dim + d] = c;
-            cos_out[s * head_dim + half + d] = c;
-            sin_out[s * head_dim + d] = sn;
-            sin_out[s * head_dim + half + d] = sn;
+            /* Split-half: first half and second half have identical values */
+            cos_out[s * head_dim + d]         = c;
+            cos_out[s * head_dim + d + half]  = c;
+            sin_out[s * head_dim + d]         = sn;
+            sin_out[s * head_dim + d + half]  = sn;
         }
     }
 }
@@ -1402,10 +1417,26 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
 void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
                             int seq, int n_heads, int head_dim) {
     /*
-     * NeoX split-half style:
-     *   x1 = x[..., :half], x2 = x[..., half:]
-     *   rotated = cat(-x2, x1)
-     *   result = x * cos + rotated * sin
+     * Split-half RoPE (matches LlamaAttention convention used by DeepSeek-OCR-2):
+     *   x_first_half = x[..., :half],  x_second_half = x[..., half:]
+     *   rotate_half(x) = cat(-x_second_half, x_first_half)
+     *   out = x * cos + rotate_half(x) * sin
+     *
+     * This is equivalent to the model's:
+     *   q = q.view(b, h, s, d//2, 2).transpose(4,3).reshape(b, h, s, d)
+     *   q_embed = q * cos + rotate_half(q) * sin
+     * (The view/transpose/reshape converts interleaved→split-half,
+     *  but since we store Q/K in the same split-half layout after this,
+     *  the net effect on attention Q*K^T is the same.)
+     *
+     * IMPORTANT: This operates on Q/K that are in INTERLEAVED order
+     * (dim 0,1 are paired, dim 2,3 are paired, etc.).
+     * The model first converts to split-half, applies rotation, then
+     * computes attention. We achieve the same result by:
+     * 1. Treating interleaved pairs as if they were split-half
+     * 2. Applying the split-half rotation formula
+     * This is mathematically equivalent because the permutation
+     * is applied identically to Q and K.
      */
     int half = head_dim / 2;
     int hidden = n_heads * head_dim;
@@ -1418,48 +1449,30 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
             float *vec = x + s * hidden + h * head_dim;
 
 #if defined(__AVX512F__) && defined(__FMA__)
-            int d = 0;
-            for (; d + 16 <= half; d += 16) {
-                __m512 x1 = _mm512_loadu_ps(vec + d);
-                __m512 x2 = _mm512_loadu_ps(vec + half + d);
-                /* RoPE cache duplicates cos/sin across halves. */
-                __m512 cc = _mm512_loadu_ps(c + d);
-                __m512 ss = _mm512_loadu_ps(sn + d);
-                __m512 new1 = _mm512_fmsub_ps(x1, cc, _mm512_mul_ps(x2, ss));
-                __m512 new2 = _mm512_fmadd_ps(x2, cc, _mm512_mul_ps(x1, ss));
-                _mm512_storeu_ps(vec + d, new1);
-                _mm512_storeu_ps(vec + half + d, new2);
-            }
-            for (; d < half; d++) {
-                float x1 = vec[d];
-                float x2 = vec[half + d];
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
-                vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
+            /* AVX-512 path — process 8 elements at a time */
+            /* TODO: optimize AVX-512 split-half path */
+            /* Scalar fallback */
+            for (int d = 0; d < half; d++) {
+                float x1 = vec[d];            /* first half */
+                float x2 = vec[d + half];     /* second half */
+                vec[d]         = x1 * c[d]         - x2 * sn[d];
+                vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
             }
 #elif defined(__AVX2__) && defined(__FMA__)
-            int d = 0;
-            for (; d + 8 <= half; d += 8) {
-                __m256 x1 = _mm256_loadu_ps(vec + d);
-                __m256 x2 = _mm256_loadu_ps(vec + half + d);
-                __m256 cc = _mm256_loadu_ps(c + d);
-                __m256 ss = _mm256_loadu_ps(sn + d);
-                __m256 new1 = _mm256_fmsub_ps(x1, cc, _mm256_mul_ps(x2, ss));
-                __m256 new2 = _mm256_fmadd_ps(x2, cc, _mm256_mul_ps(x1, ss));
-                _mm256_storeu_ps(vec + d, new1);
-                _mm256_storeu_ps(vec + half + d, new2);
-            }
-            for (; d < half; d++) {
-                float x1 = vec[d];
-                float x2 = vec[half + d];
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
-                vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
+            /* Scalar fallback for AVX2 split-half */
+            for (int d = 0; d < half; d++) {
+                float x1 = vec[d];            /* first half */
+                float x2 = vec[d + half];     /* second half */
+                vec[d]         = x1 * c[d]         - x2 * sn[d];
+                vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
             }
 #else
+            /* Generic scalar path: split-half RoPE */
             for (int d = 0; d < half; d++) {
-                float x1 = vec[d];           /* first half */
-                float x2 = vec[half + d];    /* second half */
-                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
-                vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
+                float x1 = vec[d];            /* first half */
+                float x2 = vec[d + half];     /* second half */
+                vec[d]         = x1 * c[d]         - x2 * sn[d];
+                vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
             }
 #endif
         }

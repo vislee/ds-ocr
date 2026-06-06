@@ -26,11 +26,13 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
  * Output: encoder output [n_output_tokens, dec_hidden] (caller must free)
  */
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
-                               int n_tokens, int *out_seq_len);
+                               int n_tokens, int *out_seq_len,
+                               int n_causal_queries, const float *causal_queries);
 
 /* Unified encoder forward (dispatches to V1 CLIP or V2 DeepEncoder) */
 float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
-                           int n_tokens, int *out_seq_len);
+                           int n_tokens, int *out_seq_len,
+                           int n_causal_queries, const float *causal_queries);
 
 /* Load encoder weights from safetensors */
 int ds_encoder_load(ds_ctx_t *ctx);

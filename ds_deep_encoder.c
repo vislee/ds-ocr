@@ -8,10 +8,12 @@
 #include "ds_deep_encoder.h"
 #include "ds_kernels.h"
 #include "ds_safetensors.h"
+#include "ds_dump.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/stat.h>
 
 /* ========================================================================
  * CLIP ViT-L/14 Forward Pass (V1)
@@ -389,68 +391,57 @@ static void enc_gqa_mixed_attention(float *out, const float *Q, const float *K,
     float scale = 1.0f / sqrtf((float)head_dim);
     int kv_group_size = n_q_heads / n_kv_heads;
 
+    /* Allocate score buffer for two-pass softmax (better numerical stability) */
+    float *scores = (float *)malloc((size_t)total_len * sizeof(float));
+
     for (int h = 0; h < n_q_heads; h++) {
         int kv_h = h / kv_group_size; /* which KV head this Q head uses */
 
         for (int qi = 0; qi < total_len; qi++) {
             const float *q_vec = Q + qi * n_q_heads * head_dim + h * head_dim;
 
-            /* Compute attention scores with online softmax */
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            float *acc = (float *)calloc(head_dim, sizeof(float));
-
-            for (int ki = 0; ki < total_len; ki++) {
-                /* Mixed attention mask:
-                 * - Visual tokens (qi < visual_len): attend to all visual tokens (bidirectional)
-                 * - Causal tokens (qi >= visual_len): attend to all visual + causal up to qi
-                 */
-                int visible;
-                if (qi < visual_len) {
-                    /* Visual token: only attend to other visual tokens */
-                    visible = (ki < visual_len);
-                } else {
-                    /* Causal token: attend to all visual + causal tokens up to current pos */
-                    visible = (ki < visual_len) || (ki <= qi);
-                }
-                if (!visible) continue;
-
-                const float *k_vec = K + ki * n_kv_heads * head_dim + kv_h * head_dim;
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++)
-                    score += q_vec[d] * k_vec[d];
-                score *= scale;
-
-                /* Online softmax update */
-                if (score > max_score) {
-                    float exp_diff = expf(max_score - score);
-                    for (int d = 0; d < head_dim; d++)
-                        acc[d] *= exp_diff;
-                    sum_exp = sum_exp * exp_diff + 1.0f;
-                    max_score = score;
-                } else {
-                    float exp_score = expf(score - max_score);
-                    sum_exp += exp_score;
-                    const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
-                    for (int d = 0; d < head_dim; d++)
-                        acc[d] += exp_score * v_vec[d];
-                    continue;
-                }
-                /* Add current V when max_score was updated */
-                const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
-                for (int d = 0; d < head_dim; d++)
-                    acc[d] += v_vec[d];
+            /* Determine visible range for this query token */
+            int vis_end; /* exclusive: visible tokens are [0, vis_end) */
+            if (qi < visual_len) {
+                vis_end = visual_len; /* visual: only attend to other visual tokens */
+            } else {
+                vis_end = qi + 1; /* causal: attend to all visual + causal up to qi */
             }
 
-            /* Normalize */
-            float inv_sum = 1.0f / (sum_exp + 1e-9f);
-            float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
-            for (int d = 0; d < head_dim; d++)
-                out_vec[d] = acc[d] * inv_sum;
+            /* Pass 1: compute scores and find max */
+            float max_score = -1e30f;
+            for (int ki = 0; ki < vis_end; ki++) {
+                const float *k_vec = K + ki * n_kv_heads * head_dim + kv_h * head_dim;
+                float s = 0.0f;
+                for (int d = 0; d < head_dim; d++)
+                    s += q_vec[d] * k_vec[d];
+                s *= scale;
+                scores[ki] = s;
+                if (s > max_score) max_score = s;
+            }
 
-            free(acc);
+            /* Pass 2: exp(score - max), compute weighted sum, normalize */
+            float sum_exp = 0.0f;
+            float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
+            for (int d = 0; d < head_dim; d++) out_vec[d] = 0.0f;
+
+            for (int ki = 0; ki < vis_end; ki++) {
+                float w = expf(scores[ki] - max_score);
+                sum_exp += w;
+                const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
+                for (int d = 0; d < head_dim; d++)
+                    out_vec[d] += w * v_vec[d];
+            }
+
+            if (sum_exp > 0.0f) {
+                float inv = 1.0f / sum_exp;
+                for (int d = 0; d < head_dim; d++)
+                    out_vec[d] *= inv;
+            }
         }
     }
+
+    free(scores);
 }
 
 static void enc_v2_layer_forward(float *out, const float *x,
@@ -533,12 +524,12 @@ static void enc_v2_layer_forward(float *out, const float *x,
 }
 
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
-                               int n_tokens, int *out_seq_len) {
+                               int n_tokens, int *out_seq_len,
+                               int n_causal_queries, const float *causal_queries) {
     ds_deep_encoder_t *enc = &ctx->encoder;
     ds_config_t *cfg = &ctx->config;
 
     int visual_len = n_tokens;
-    int n_causal_queries = cfg->enc_causal_flow_queries;
     int total_len = visual_len + n_causal_queries;
     int hidden = cfg->enc_hidden;
 
@@ -550,11 +541,14 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
     float *x = (float *)calloc(total_len * hidden, sizeof(float));
     memcpy(x, visual_tokens, visual_len * hidden * sizeof(float));
 
-    if (n_causal_queries > 0 && ctx->vis_tokenizer.causal_query_embeddings) {
+    if (n_causal_queries > 0 && causal_queries) {
         memcpy(x + visual_len * hidden,
-               ctx->vis_tokenizer.causal_query_embeddings,
+               causal_queries,
                n_causal_queries * hidden * sizeof(float));
     }
+
+    /* DUMP: encoder input (visual + causal queries concatenated) */
+    ds_dump_tensor("enc_input", x, total_len * hidden, "[512, 896]");
 
     /* Transformer layers */
     for (int l = 0; l < cfg->enc_layers; l++) {
@@ -562,12 +556,22 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
         enc_v2_layer_forward(next, x, ctx, l, visual_len, total_len);
         free(x);
         x = next;
+
+        /* DUMP: each encoder layer output */
+        {
+            char dump_name[64];
+            snprintf(dump_name, sizeof(dump_name), "enc_layer%d", l);
+            ds_dump_tensor(dump_name, x, total_len * hidden, "[512, 896]");
+        }
     }
 
     /* Final norm */
     float *x_norm = (float *)malloc(total_len * hidden * sizeof(float));
     ds_rms_norm(x_norm, x, enc->final_norm_weight, total_len, hidden, cfg->dec_rms_norm_eps);
     free(x);
+
+    /* DUMP: after final norm (full [512, 896] including visual + causal) */
+    ds_dump_tensor("enc_final_norm", x_norm, total_len * hidden, "[512, 896]");
 
     /* Extract only causal flow query tokens, project to decoder dim */
     int output_len = n_causal_queries;
@@ -583,6 +587,9 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
     }
 
     free(x_norm);
+
+    /* DUMP: projector output [256, 1280] */
+    ds_dump_tensor("proj_output", encoder_output, output_len * cfg->dec_hidden, "[256, 1280]");
     *out_seq_len = output_len;
 
     if (ds_verbose >= 1) {
@@ -607,7 +614,8 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
  * ======================================================================== */
 
 float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
-                           int n_tokens, int *out_seq_len) {
+                           int n_tokens, int *out_seq_len,
+                           int n_causal_queries, const float *causal_queries) {
     if (ctx->config.enc_type == 1) {
         /* V1: CLIP path — visual_tokens here are SAM features
          * CLIP needs patch_embeds separately, but for the unified API
@@ -615,7 +623,8 @@ float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
         return ds_clip_encoder_forward(ctx, visual_tokens, n_tokens,
                                        visual_tokens, n_tokens, out_seq_len);
     } else {
-        return ds_encoder_forward_v2(ctx, visual_tokens, n_tokens, out_seq_len);
+        return ds_encoder_forward_v2(ctx, visual_tokens, n_tokens, out_seq_len,
+                                      n_causal_queries, causal_queries);
     }
 }
 

@@ -1,29 +1,22 @@
 # Build artifacts
+build/
 *.o
+*.dSYM/
 ds_ocr
-ds_ocr_asan
 
-# macOS
+# Debug dumps
+dump/
+
+# Python scripts (debugging, not part of the project)
+compare_*.py
+dump_*.py
+run_python_ocr.py
+debug_first_token.c
+
+# Backup files
+*.bak
+stb_image_custom.h.bak
+stb_image_full.h
+
+# OS files
 .DS_Store
-
-# Model files (too large for git)
-*.safetensors
-models/
-deepseek-ocr/
-deepseek-ocr-2/
-
-# IDE
-.vscode/
-.idea/
-
-# Monbot / Agent config
-.monbot/
-BOOTSTRAP.md
-CLAUDE.md
-HEARTBEAT.md
-TOOLS.md
-AGENTS.md
-
-# Screenshots & test images
-*.png
-*.jpg

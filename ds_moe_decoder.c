@@ -263,6 +263,20 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         if (layer->k_norm_weight)
             ds_rms_norm_per_head(K, layer->k_norm_weight, seq_len, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
 
+        /* Debug: dump layer 0 Q/K/V for comparison with Python */
+        if (l == 0 && getenv("DS_DUMP_DECODER")) {
+            FILE *df;
+            df = fopen("dump/c_layer0_Q_pre_rope.bin", "wb");
+            if (df) { fwrite(Q, sizeof(float), seq_len * q_dim, df); fclose(df); }
+            df = fopen("dump/c_layer0_K_pre_rope.bin", "wb");
+            if (df) { fwrite(K, sizeof(float), seq_len * kv_dim, df); fclose(df); }
+            df = fopen("dump/c_layer0_V.bin", "wb");
+            if (df) { fwrite(V, sizeof(float), seq_len * kv_dim, df); fclose(df); }
+            df = fopen("dump/c_layer0_x_norm.bin", "wb");
+            if (df) { fwrite(x_norm, sizeof(float), seq_len * hidden, df); fclose(df); }
+            fprintf(stderr, "Dumped layer 0 Q/K/V/x_norm for Python comparison\n");
+        }
+
         /* Compute RoPE for each position */
         int *positions = (int *)malloc(seq_len * sizeof(int));
         for (int i = 0; i < seq_len; i++) positions[i] = ctx->kv_cache_len + i;
@@ -283,6 +297,17 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             memcpy(cache_v, V + s * kv_dim, kv_dim * sizeof(float));
         }
 
+        /* Debug: dump cached K for layer 0 to verify cache layout */
+        if (l == 0 && getenv("DS_DUMP_DECODER")) {
+            FILE *df = fopen("dump/c_layer0_cached_K.bin", "wb");
+            if (df) {
+                /* Dump from cache base, seq_len positions */
+                float *cache_base = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim;
+                fwrite(cache_base, sizeof(float), seq_len * kv_dim, df);
+                fclose(df);
+            }
+        }
+
         /* Causal attention (prefill all tokens) */
         float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
         ds_causal_attention(attn_out, Q,
@@ -291,12 +316,34 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                             seq_len, ctx->kv_cache_len + seq_len,
                             n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len);
 
+        /* Debug: dump layer 0 attn_out */
+        if (l == 0 && getenv("DS_DUMP_DECODER")) {
+            FILE *df = fopen("dump/c_layer0_attn_out.bin", "wb");
+            if (df) { fwrite(attn_out, sizeof(float), seq_len * q_dim, df); fclose(df); }
+            fprintf(stderr, "Dumped C layer 0 attn_out (%d x %d)\n", seq_len, q_dim);
+        }
+
         /* Output projection + residual */
         float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
         ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, seq_len, q_dim, hidden);
         free(attn_out);
 
         for (int i = 0; i < seq_len * hidden; i++) x[i] += proj_out[i];
+
+        /* Debug: dump layer 0 after attention for comparison */
+        if (l == 0 && getenv("DS_DUMP_DECODER")) {
+            FILE *df = fopen("dump/c_layer0_after_attn.bin", "wb");
+            if (df) { fwrite(x, sizeof(float), seq_len * hidden, df); fclose(df); }
+            fprintf(stderr, "Dumped C layer 0 after attn (last token mean=%.6f)\n",
+                    x[(seq_len-1)*hidden] == x[(seq_len-1)*hidden] ? 
+                    0.0f : 0.0f); /* placeholder, actual check below */
+            /* Check last token stats */
+            float last_mean = 0;
+            for (int i = 0; i < hidden; i++) last_mean += x[(seq_len-1)*hidden + i];
+            last_mean /= hidden;
+            fprintf(stderr, "  C layer0 after_attn last token: mean=%.6f\n", last_mean);
+        }
+
         free(proj_out);
 
         /* Post-attention RMSNorm */
@@ -312,8 +359,58 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
         free(mlp_out);
 
+        /* Debug: dump per-layer output for comparison */
+        if (getenv("DS_DUMP_LAYERS")) {
+            char path[256];
+            snprintf(path, sizeof(path), "dump/c_layer%d_out.bin", l);
+            FILE *df = fopen(path, "wb");
+            if (df) { fwrite(x, sizeof(float), seq_len * hidden, df); fclose(df); }
+            /* Stats for last token */
+            float last_mean = 0, last_max = 0;
+            for (int i = 0; i < hidden; i++) {
+                float v = x[(seq_len-1)*hidden + i];
+                last_mean += v;
+                if (fabsf(v) > last_max) last_max = fabsf(v);
+            }
+            last_mean /= hidden;
+            fprintf(stderr, "  Layer %d done, last token: mean=%.4f max_abs=%.4f\n",
+                    l, last_mean, last_max);
+        }
+
         if (ds_verbose >= 2)
             fprintf(stderr, "Decoder prefill layer %d/%d done\n", l + 1, cfg->dec_layers);
+    }
+
+    /* Dump last token hidden state for debugging (before final norm) */
+    if (getenv("DS_DUMP_DECODER")) {
+        float *last_x = x + (seq_len - 1) * hidden;
+        FILE *f = fopen("dump/dec_prefill_last_hidden.bin", "wb");
+        if (f) { fwrite(last_x, sizeof(float), hidden, f); fclose(f); }
+        /* Compute logits for last token */
+        float *norm_x = (float *)malloc(hidden * sizeof(float));
+        ds_rms_norm(norm_x, last_x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
+        float *logits = (float *)malloc(cfg->vocab_size * sizeof(float));
+        if (dec->lm_head_bf16)
+            ds_bf16_matvec_pub(logits, norm_x, dec->lm_head_bf16, NULL, hidden, cfg->vocab_size);
+        else
+            ds_bf16_matvec_pub(logits, norm_x, dec->tok_embeddings_bf16, NULL, hidden, cfg->vocab_size);
+        f = fopen("dump/dec_prefill_first_logits.bin", "wb");
+        if (f) { fwrite(logits, sizeof(float), cfg->vocab_size, f); fclose(f); }
+        /* Print top-10 */
+        int top_ids[10]; float top_vals[10];
+        for (int i = 0; i < 10; i++) { top_ids[i] = -1; top_vals[i] = -1e30f; }
+        for (int i = 0; i < cfg->vocab_size; i++) {
+            for (int j = 0; j < 10; j++) {
+                if (logits[i] > top_vals[j]) {
+                    for (int k = 9; k > j; k--) { top_vals[k] = top_vals[k-1]; top_ids[k] = top_ids[k-1]; }
+                    top_vals[j] = logits[i]; top_ids[j] = i; break;
+                }
+            }
+        }
+        fprintf(stderr, "Prefill logits top-10: ");
+        for (int i = 0; i < 10; i++) fprintf(stderr, "[%d:%.3f] ", top_ids[i], top_vals[i]);
+        fprintf(stderr, "\n");
+        free(norm_x); free(logits);
     }
 
     ctx->kv_cache_len += seq_len;
@@ -338,6 +435,14 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     for (int l = 0; l < cfg->dec_layers; l++) {
         decoder_layer_forward(ctx, x, out, l, ctx->kv_cache_len);
         memcpy(x, out, hidden * sizeof(float));
+        
+        /* Debug: dump hidden state after each layer for comparison */
+        if (getenv("DS_DUMP_DECODER_LAYERS")) {
+            char path[256];
+            snprintf(path, sizeof(path), "dump/decoder_compare/c_hidden_layer%d.bin", l);
+            FILE *df = fopen(path, "wb");
+            if (df) { fwrite(x, sizeof(float), hidden, df); fclose(df); }
+        }
     }
     free(out);
 
@@ -347,13 +452,104 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     /* Final RMSNorm */
     ds_rms_norm(x, x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
 
-    /* LM head: argmax over vocab (streaming, no full logits) */
-    int token;
+    /* LM head: compute logits then sample with optional repetition penalty */
+    int vocab = cfg->vocab_size;
+    float *logits = ctx->dec_logits;  /* [vocab_size] buffer */
+    if (!logits) {
+        /* Fallback: direct argmax (no penalty support) */
+        int token;
+        if (dec->lm_head_bf16) {
+            token = ds_argmax_matvec_bf16(x, dec->lm_head_bf16, hidden, vocab);
+        } else {
+            token = ds_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, hidden, vocab);
+        }
+        return token;
+    }
+
+    /* Compute full logits vector */
     if (dec->lm_head_bf16) {
-        token = ds_argmax_matvec_bf16(x, dec->lm_head_bf16, hidden, cfg->vocab_size);
+        ds_bf16_matvec_pub(logits, x, dec->lm_head_bf16, NULL, hidden, vocab);
     } else {
-        /* Tied embeddings: use tok_embeddings as lm_head */
-        token = ds_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, hidden, cfg->vocab_size);
+        ds_bf16_matvec_pub(logits, x, dec->tok_embeddings_bf16, NULL, hidden, vocab);
+    }
+
+    /* Apply repetition penalty */
+    float rp = ctx->repeat_penalty;
+    if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
+        /* For each previously generated token, divide its logit by penalty
+         * (standard HuggingFace repetition penalty implementation) */
+        for (int i = 0; i < ctx->token_history_len; i++) {
+            int tid = ctx->token_history[i];
+            if (tid >= 0 && tid < vocab) {
+                if (logits[tid] > 0) {
+                    logits[tid] /= rp;
+                } else {
+                    logits[tid] *= rp;
+                }
+            }
+        }
+    }
+
+    /* N-gram blocking: prevent repeating any n-gram of given size.
+     * If the last (n-1) tokens match a previously seen n-gram prefix,
+     * ban the token that would complete it.
+     * This matches HuggingFace no_repeat_ngram_size behavior. */
+    int ngram_n = ctx->no_repeat_ngram_size;
+    if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
+        int prefix_len = ngram_n - 1;
+        int *hist = ctx->token_history;
+        int hist_len = ctx->token_history_len;
+        /* Check each position in history for matching prefix */
+        for (int i = 0; i <= hist_len - prefix_len - 1; i++) {
+            /* Compare prefix: hist[i..i+prefix_len-1] vs hist[hist_len-prefix_len..hist_len-1] */
+            int match = 1;
+            for (int j = 0; j < prefix_len; j++) {
+                if (hist[i + j] != hist[hist_len - prefix_len + j]) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                /* Ban the token that follows this prefix */
+                int banned = hist[i + prefix_len];
+                if (banned >= 0 && banned < vocab) {
+                    logits[banned] = -1e30f;
+                }
+            }
+        }
+    }
+
+    /* Find argmax from logits */
+    int token = 0;
+    float best = logits[0];
+    for (int i = 1; i < vocab; i++) {
+        if (logits[i] > best) {
+            best = logits[i];
+            token = i;
+        }
+    }
+
+    /* Temperature sampling (if enabled) */
+    if (ctx->temperature > 0.0f) {
+        /* Apply temperature, compute softmax, sample */
+        float temp = ctx->temperature;
+        float max_logit = best;
+        double sum_exp = 0.0;
+        for (int i = 0; i < vocab; i++) {
+            logits[i] = expf((logits[i] - max_logit) / temp);
+            sum_exp += logits[i];
+        }
+        float inv_sum = (float)(1.0 / sum_exp);
+        for (int i = 0; i < vocab; i++) logits[i] *= inv_sum;
+
+        /* Weighted random sampling */
+        float r = (float)rand() / (float)RAND_MAX;
+        float cum = 0.0f;
+        token = vocab - 1;
+        for (int i = 0; i < vocab; i++) {
+            cum += logits[i];
+            if (cum >= r) { token = i; break; }
+        }
     }
 
     return token;

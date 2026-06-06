@@ -170,6 +170,10 @@ void ds_expert_combine(float *output, const float *expert_outputs,
 int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                            int in_dim, int out_dim);
 
+/* Compute logits = W_bf16 @ x + bias, storing full [out_dim] vector */
+void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
+                         const float *b, int in_dim, int out_dim);
+
 /* ========================================================================
  * Threading
  * ======================================================================== */

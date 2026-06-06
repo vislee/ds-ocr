@@ -13,6 +13,7 @@
 #define DS_VISUAL_TOKENIZER_H
 
 #include "ds_ocr.h"
+#include "ds_image.h"
 
 /* SAM forward pass: image pixels -> SAM spatial features
  * Returns: [n_sam_tokens, sam_ds2_dim] in NCHW format (caller must free)
@@ -27,6 +28,12 @@ float *ds_sam_forward(ds_ctx_t *ctx, const unsigned char *pixels,
 float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int width, int height, int channels,
                                     int *out_n_tokens, float **out_patch_embeds);
+
+/* SAM forward from pre-processed ds_image_t (supports variable input size)
+ * Used for multi-crop encoding where each crop may be 768x768 (requires
+ * pos_embed bicubic interpolation from 64x64 to 48x48). */
+float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
+                             int *out_n_tokens, float **out_patch_embeds);
 
 /* Load visual tokenizer weights from safetensors */
 int ds_visual_tokenizer_load(ds_ctx_t *ctx);

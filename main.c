@@ -28,6 +28,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -t <n>        Number of threads (default: all CPUs)\n");
     fprintf(stderr, "  -n <n>        Max new tokens (default: 4096)\n");
     fprintf(stderr, "  --temp <f>    Sampling temperature (default: 0 = greedy)\n");
+    fprintf(stderr, "  --rp <f>      Repetition penalty (default: 1.0, try 1.1-1.5)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only recognition on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -40,6 +41,7 @@ int main(int argc, char **argv) {
     int n_threads = 0;
     int max_new_tokens = 4096;
     float temperature = 0.0f;
+    float repeat_penalty = 1.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -52,6 +54,8 @@ int main(int argc, char **argv) {
             max_new_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
             temperature = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--rp") == 0 && i + 1 < argc) {
+            repeat_penalty = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -87,6 +91,7 @@ int main(int argc, char **argv) {
     /* Apply settings */
     ctx->max_new_tokens = max_new_tokens;
     ctx->temperature = temperature;
+    ctx->repeat_penalty = repeat_penalty;
 
     /* Set up streaming callback */
     if (verbosity > 0) {

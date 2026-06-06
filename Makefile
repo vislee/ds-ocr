@@ -2,7 +2,7 @@
 # Makefile
 
 CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native
 LDFLAGS = -lm -lpthread
 
 # Platform detection
