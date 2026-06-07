@@ -1091,6 +1091,20 @@ prompt_construction:
     if (ds_verbose >= 1)
         fprintf(stderr, "Decoder prefix: %d tokens\n", prefix_len);
 
+    /* Optional: override inputs_embeds with Python reference for debugging */
+    const char *load_emb = getenv("DS_LOAD_INPUT_EMBEDS");
+    if (load_emb) {
+        FILE *ef = fopen(load_emb, "rb");
+        if (ef) {
+            fread(input_embeds, sizeof(float), prefix_len * hidden, ef);
+            fclose(ef);
+            fprintf(stderr, "Loaded inputs_embeds from %s (%d x %d)\n",
+                    load_emb, prefix_len, hidden);
+        } else {
+            fprintf(stderr, "Warning: DS_LOAD_INPUT_EMBEDS=%s not found\n", load_emb);
+        }
+    }
+
     /* Step 4: Reset KV cache and prefill (all but last token),
      * then use decoder_forward with last token to get first predicted token */
     ctx->kv_cache_len = 0;
