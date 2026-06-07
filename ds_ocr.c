@@ -33,6 +33,10 @@ static double now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+static double ds_time_sec(void) {
+    return now_ms() / 1000.0;
+}
+
 /* ========================================================================
  * Configuration Detection
  * ======================================================================== */
@@ -656,7 +660,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         } else {
             /* Large image: multi-crop encoding */
             if (ds_verbose >= 1)
-                fprintf(stderr, "Multi-crop: %d local crops (768x768)\n", n_crops - 1);
+                fprintf(stderr, "Multi-crop: %d local crops (768x768)\n", n_crops);
 
             /* Step 2: Encode each local crop (768x768) */
             int tokens_per_crop = 144;  /* 48/4 * 48/4 = 12*12 = 144 */
@@ -667,8 +671,11 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 if (ds_verbose >= 1)
                     fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
 
+                double crop_t0 = ds_time_sec();
+
                 int n_sam_tokens;
                 float *sam_tokens = ds_sam_forward_image(ctx, crops[i], &n_sam_tokens, NULL);
+                double sam_t = ds_time_sec() - crop_t0;
                 if (!sam_tokens) {
                     fprintf(stderr, "SAM forward failed for crop %d\n", i);
                     goto cleanup_crops;
@@ -681,16 +688,22 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 }
 
                 /* Encoder: Qwen2 with 144 causal flow queries (includes projector) */
+                double enc_t0 = ds_time_sec();
                 int n_enc_tokens;
                 float *enc_tokens = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
                                                            &n_enc_tokens,
                                                            tokens_per_crop,
                                                            ctx->vis_tokenizer.causal_query_768_embeddings);
+                double enc_t = ds_time_sec() - enc_t0;
                 free(sam_tokens);
                 if (!enc_tokens) {
                     fprintf(stderr, "Encoder forward failed for crop %d\n", i);
                     goto cleanup_crops;
                 }
+
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "  crop %d: SAM %.2fs + Encoder %.2fs = %.2fs\n",
+                            i + 1, sam_t, enc_t, sam_t + enc_t);
 
                 /* Dump crop encoder output for comparison if DS_DUMP_TENSORS set */
                 if (getenv("DS_DUMP_TENSORS")) {
@@ -884,14 +897,18 @@ prompt_construction:
         int n_text_after = 0;
         int *text_after_ids = NULL;
         if (tokenizer) {
-            /* Hardcode the correct token IDs for "\nFree OCR." (no trailing space,
-             * as Python's format_messages strips it).
-             * Verified against Python model: 862 = BOS(1) + image(857) + text(4)
-             * '\n' -> 201 (Ċ), 'Free' -> 21431, ' OCR' -> 126041 (ĠOCR), '.' -> 16 */
-            static const int hardcoded_text_ids[] = {201, 21431, 126041, 16};
-            n_text_after = 4;
-            text_after_ids = (int *)malloc(n_text_after * sizeof(int));
-            memcpy(text_after_ids, hardcoded_text_ids, n_text_after * sizeof(int));
+            /* Encode text after image using BPE tokenizer.
+             * Python format_messages strips the prompt, so "\nFree OCR. " (with
+             * trailing space) becomes "\nFree OCR." after strip().
+             * Expected: [201, 21431, 126041, 16] (4 tokens) */
+            text_after_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR.", &n_text_after);
+            if (!text_after_ids || n_text_after <= 0) {
+                /* Fallback: use verified hardcoded IDs if tokenizer fails */
+                static const int fallback_ids[] = {201, 21431, 126041, 16};
+                n_text_after = 4;
+                text_after_ids = (int *)malloc(n_text_after * sizeof(int));
+                memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
+            }
             if (ds_verbose >= 1) {
                 fprintf(stderr, "Prompt: BOS + img(%d) + after(%d) = %d tokens\n",
                         n_img_tokens, n_text_after, 1 + n_img_tokens + n_text_after);

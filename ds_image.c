@@ -54,68 +54,54 @@ static inline float ds_cubic_weight(float x) {
     return 0.0f;
 }
 
-/* Bicubic interpolation for a single channel value.
- * Samples a 4x4 neighborhood around (fx, fy) with clamping at boundaries.
- * This matches PIL's BICUBIC resize (antialias=False in Pillow >= 2.5). */
-static inline float ds_bicuberp(const unsigned char *src, int src_w, int src_h,
-                                 float fx, float fy, int c) {
-    int ix = (int)floorf(fx);
-    int iy = (int)floorf(fy);
-    float dx = fx - ix;
-    float dy = fy - iy;
+/* PIL-style antialias bicubic interpolation for a single channel value.
+ *
+ * For DOWNSAMPLING (dst < src), PIL expands the filter kernel:
+ *   scale_factor = min(1.0, dst_size / src_size)
+ *   filter_support = 2.0 / scale_factor  (wider kernel)
+ *   weight = cubic_weight((src_pixel - center) * scale_factor)
+ *   normalize so weights sum to 1
+ *
+ * For UPSAMPLING (dst >= src), this reduces to standard 4x4 bicubic.
+ *
+ * This matches PIL/Pillow >= 7.0 default BICUBIC behavior (antialias=True). */
+static inline float ds_bicuberp_aa(const unsigned char *src, int src_w, int src_h,
+                                    float fx, float fy, int c,
+                                    float x_scale_factor, float y_scale_factor) {
+    /* Compute filter support width (in source pixels) */
+    float x_support = 2.0f / x_scale_factor;  /* wider for downsampling */
+    float y_support = 2.0f / y_scale_factor;
+
+    int ix_min = (int)floorf(fx - x_support);
+    int ix_max = (int)ceilf(fx + x_support);
+    int iy_min = (int)floorf(fy - y_support);
+    int iy_max = (int)ceilf(fy + y_support);
+
+    /* Clamp to image bounds */
+    if (ix_min < 0) ix_min = 0;
+    if (ix_max >= src_w) ix_max = src_w - 1;
+    if (iy_min < 0) iy_min = 0;
+    if (iy_max >= src_h) iy_max = src_h - 1;
+
     float result = 0.0f;
     float w_sum = 0.0f;
 
-    for (int j = -1; j <= 2; j++) {
-        float wy = ds_cubic_weight(dy - (float)j);
-        int sy = iy + j;
-        /* Clamp to image bounds */
-        if (sy < 0) sy = 0;
-        if (sy >= src_h) sy = src_h - 1;
+    for (int iy = iy_min; iy <= iy_max; iy++) {
+        float wy = ds_cubic_weight(((float)iy - fy) * y_scale_factor);
+        if (wy == 0.0f) continue;
 
-        for (int i = -1; i <= 2; i++) {
-            float wx = ds_cubic_weight(dx - (float)i);
-            int sx = ix + i;
-            /* Clamp to image bounds */
-            if (sx < 0) sx = 0;
-            if (sx >= src_w) sx = src_w - 1;
+        for (int ix = ix_min; ix <= ix_max; ix++) {
+            float wx = ds_cubic_weight(((float)ix - fx) * x_scale_factor);
+            if (wx == 0.0f) continue;
 
             float w = wx * wy;
-            result += w * (float)src[(sy * src_w + sx) * 3 + c];
+            result += w * (float)src[(iy * src_w + ix) * 3 + c];
             w_sum += w;
         }
     }
-    /* Normalize to prevent drift from boundary clamping */
+    /* Normalize */
     if (w_sum > 0.0f) result /= w_sum;
     return result;
-}
-
-/* Bilinear interpolation helper — kept as fallback.
- * Coordinate mapping: fx = (x + 0.5) * scale - 0.5 (center-aligned). */
-static inline float ds_bilerp(const unsigned char *src, int src_w, int src_h,
-                               float fx, float fy, int c) {
-    /* Clamp source coordinates to valid range */
-    if (fx < 0.0f) fx = 0.0f;
-    if (fy < 0.0f) fy = 0.0f;
-    if (fx > src_w - 1.0f) fx = src_w - 1.0f;
-    if (fy > src_h - 1.0f) fy = src_h - 1.0f;
-
-    int x0 = (int)fx, y0 = (int)fy;
-    int x1 = x0 + 1, y1 = y0 + 1;
-    float dx = fx - x0, dy = fy - y0;
-
-    /* Clamp to image bounds */
-    if (x1 >= src_w) x1 = src_w - 1;
-    if (y1 >= src_h) y1 = src_h - 1;
-
-    float v00 = src[(y0 * src_w + x0) * 3 + c];
-    float v10 = src[(y0 * src_w + x1) * 3 + c];
-    float v01 = src[(y1 * src_w + x0) * 3 + c];
-    float v11 = src[(y1 * src_w + x1) * 3 + c];
-
-    float top = v00 * (1.0f - dx) + v10 * dx;
-    float bot = v01 * (1.0f - dx) + v11 * dx;
-    return top * (1.0f - dy) + bot * dy;
 }
 
 ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_height) {
@@ -127,6 +113,14 @@ ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_
     float x_scale = (float)img->width / target_width;
     float y_scale = (float)img->height / target_height;
 
+    /* Antialias scale factors: min(1.0, dst/src).
+     * For upsampling (scale >= 1): factor = 1.0, standard 4x4 bicubic.
+     * For downsampling (scale < 1): factor < 1.0, wider kernel to avoid aliasing. */
+    float x_aa_factor = (float)target_width / (float)img->width;   /* min(1, dst/src) */
+    float y_aa_factor = (float)target_height / (float)img->height;
+    if (x_aa_factor > 1.0f) x_aa_factor = 1.0f;
+    if (y_aa_factor > 1.0f) y_aa_factor = 1.0f;
+
     for (int y = 0; y < target_height; y++) {
         for (int x = 0; x < target_width; x++) {
             /* Center-aligned coordinate mapping (matches PIL): 
@@ -135,8 +129,9 @@ ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_
             float fy = (y + 0.5f) * y_scale - 0.5f;
 
             for (int c = 0; c < 3; c++) {
-                /* Bicubic interpolation — matches PIL BICUBIC default */
-                float val = ds_bicuberp(img->pixels, img->width, img->height, fx, fy, c);
+                /* Antialias bicubic interpolation — matches PIL BICUBIC default (antialias=True) */
+                float val = ds_bicuberp_aa(img->pixels, img->width, img->height, fx, fy, c,
+                                           x_aa_factor, y_aa_factor);
                 /* Clamp to [0, 255] (bicubic can overshoot) */
                 if (val < 0.0f) val = 0.0f;
                 if (val > 255.0f) val = 255.0f;
