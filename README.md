@@ -45,8 +45,9 @@ A pure C implementation of [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSee
 ```
                           DeepSeek-OCR V2
                     ┌───────────────────────────────┐
-  Large Image ───►  │ Dynamic Preprocess             │
-  (e.g. 1938×1210) │  ├─ 6 crops × 768×768         │
+  Any Image ────►   │ Dynamic Preprocess             │
+  (small/large)    │  ├─ N crops × 768×768          │
+                    │  │   (1 crop if both dims≤768) │
                     │  └─ 1 global view 1024×1024   │
                     └───────┬───────────┬───────────┘
                             │           │
@@ -92,16 +93,18 @@ A pure C implementation of [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSee
 
 ### V2 Multi-Crop Preprocessing
 
-DeepSeek-OCR V2 uses a multi-crop strategy for large images:
+DeepSeek-OCR V2 uses a multi-crop strategy for **all images** (including small ones):
 
-1. **Dynamic preprocess**: `find_closest_aspect_ratio()` selects optimal crop ratio (min aspect diff)
-   - e.g., 1938×1210 → ratio (3,2) → 6 local crops of 768×768
-2. **Global view**: `ImageOps.pad()` to 1024×1024 (centered with gray padding)
-3. **SAM processes**: 6 local (768×768 → 896×12×12) + 1 global (1024×1024 → 896×16×16)
-4. **Encoder output**: local(6×144) + global(256) + view_separator(1) = 1121 tokens
-5. **Token layout** (image_size=640): num_queries=10 → 857 image positions
-6. **masked_scatter**: 1121 encoder tokens → 857 image slots (drops last 264)
-7. **Prefix**: BOS(1) + 857 image + 4 text ("\nFree OCR.") = 862 tokens
+1. **Dynamic preprocess**: `find_closest_aspect_ratio()` selects optimal crop ratio (min aspect diff, area tie-breaker)
+   - Large image, e.g., 1938×1210 → ratio (3,2) → 6 local crops of 768×768
+   - Small image (both dims ≤ 768) → ratio (1,1) → 1 local crop of 768×768
+2. **Global view**: `ImageOps.pad()` to 1024×1024 (centered with gray padding) — always present
+3. **SAM processes**: N local (768×768 → 896×12×12) + 1 global (1024×1024 → 896×16×16)
+   - Small image: 1 local + 1 global → 144 + 256 + 1 sep = 401 encoder tokens
+   - Large image (6 crops): 6 local + 1 global → 864 + 256 + 1 sep = 1121 encoder tokens
+4. **Token layout** (image_size=640): num_queries=10 → 857 image positions
+5. **masked_scatter**: encoder tokens → 857 image slots (truncates excess)
+6. **Prefix**: BOS(1) + 857 image + 4 text ("\nFree OCR.") = 862 tokens
 
 ### Key Architecture Details
 
@@ -270,6 +273,27 @@ ds-ocr/
 └── README.md
 ```
 
+### Debug Environment Variables
+
+The engine supports various `DS_*` environment variables for debugging and development:
+
+| Variable | Description |
+|----------|-------------|
+| `DS_DUMP_TENSORS` | Enable tensor dumping at key pipeline stages |
+| `DS_DUMP_FIRST_CROP` | Dump only the first crop's SAM output |
+| `DS_DUMP_PATCH_EMBED` | Dump SAM patch embedding output |
+| `DS_DUMP_SAM_LAYERS` | Dump per-layer SAM attention/output |
+| `DS_SAM_POSEMBED_FILE` | Override SAM position embedding (skip interpolation) |
+| `DS_DUMP_ENCODER` | Dump encoder output |
+| `DS_DUMP_INPUT_EMBEDS` | Dump final input embeddings (after projector) |
+| `DS_DUMP_DECODER` | Dump decoder layer 0 internals |
+| `DS_DUMP_DECODER_LAYERS` | Dump all decoder layers |
+| `DS_DUMP_LAYERS` | Dump MoE expert routing details |
+| `DS_PERFECT_ENCODER` | Override encoder output with Python reference .npy |
+| `DS_SKIP_ENCODER` | Skip encoder, load embeddings from file |
+| `DS_LOAD_INPUT_EMBEDS` | Load Python reference inputs_embeds for decoder debugging |
+| `DS_BF16_CACHE_MB` | Set BF16 weight cache size (MB) |
+
 ## Weight Loading
 
 The engine loads weights directly from HuggingFace safetensors format:
@@ -350,8 +374,7 @@ Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 ### Known Issues (V2)
 
 1. **Encoder numerical precision**: Image resize antialias bicubic matches PIL closely (mean pixel diff 0.017, max 8.0 at edge features). Remaining diff from PIL's internal boundary handling, affects <0.1% of pixels.
-2. **Tokenizer BPE**: ✅ Fixed — `ds_tokenizer_encode()` verified to match Python tokenization.
-3. **Encoding speed**: SAM+Encoder per crop ~5s (down from ~40s via BLAS attention + block rel_pos). Full V2 pipeline ~35s.
+2. **Encoding speed**: SAM+Encoder per crop ~5s (down from ~40s via BLAS attention + block rel_pos). Full V2 pipeline ~35s.
 
 ## Model Support
 
