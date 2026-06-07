@@ -635,28 +635,61 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         }
 
         if (!use_crop) {
-            /* Small image: no cropping, just global 1024x1024 encoding */
+            /* Small image (both dims <= 768): process as 1 local crop + 1 global view.
+             * Python always processes both: patches (768x768) and image_ori (1024x1024).
+             * For small images, dynamic_preprocess returns 1 crop (768x768 padded).
+             * Then the global view is padded to 1024x1024 separately. */
             if (ds_verbose >= 1)
-                fprintf(stderr, "Small image %dx%d: global-only encoding (1024x1024)\n", width, height);
+                fprintf(stderr, "Small image %dx%d: 1 crop (768x768) + global (1024x1024)\n",
+                        width, height);
 
-            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
-            if (!global_img) return NULL;
+            /* Local: pad to 768x768 */
+            ds_image_t *local_img = ds_image_pad(&img, 768, 127);
+            if (!local_img) return NULL;
 
             int n_sam_tokens;
-            float *sam_tokens = ds_sam_forward_image(ctx, global_img, &n_sam_tokens, NULL);
-            ds_image_free(global_img);
+            float *sam_tokens = ds_sam_forward_image(ctx, local_img, &n_sam_tokens, NULL);
+            ds_image_free(local_img);
             if (!sam_tokens) return NULL;
 
-            int global_queries = 256;
-            encoder_output = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
-                                                    &n_encoder_tokens,
-                                                    global_queries,
-                                                    ctx->vis_tokenizer.causal_query_embeddings);
+            int n_enc_tokens;
+            float *local_enc = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
+                                                      &n_enc_tokens, 144,
+                                                      ctx->vis_tokenizer.causal_query_768_embeddings);
             free(sam_tokens);
-            if (!encoder_output) {
-                fprintf(stderr, "Encoder forward failed for global image\n");
+            if (!local_enc) {
+                fprintf(stderr, "Encoder forward failed for small local image\n");
                 return NULL;
             }
+
+            /* Global: pad to 1024x1024 */
+            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
+            if (!global_img) { free(local_enc); return NULL; }
+
+            float *global_sam = ds_sam_forward_image(ctx, global_img, &n_sam_tokens, NULL);
+            ds_image_free(global_img);
+            if (!global_sam) { free(local_enc); return NULL; }
+
+            int n_global_enc;
+            float *global_enc = ds_encoder_forward_v2(ctx, global_sam, n_sam_tokens,
+                                                       &n_global_enc, 256,
+                                                       ctx->vis_tokenizer.causal_query_embeddings);
+            free(global_sam);
+            if (!global_enc) { free(local_enc); return NULL; }
+
+            /* Concat: [local(144), global(256), view_sep(1)] */
+            n_encoder_tokens = n_enc_tokens + n_global_enc + 1;
+            encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
+            memcpy(encoder_output, local_enc, n_enc_tokens * hidden * sizeof(float));
+            memcpy(encoder_output + n_enc_tokens * hidden, global_enc, n_global_enc * hidden * sizeof(float));
+            if (ctx->vis_tokenizer.view_seperator) {
+                memcpy(encoder_output + (n_enc_tokens + n_global_enc) * hidden,
+                       ctx->vis_tokenizer.view_seperator, hidden * sizeof(float));
+            } else {
+                memset(encoder_output + (n_enc_tokens + n_global_enc) * hidden, 0, hidden * sizeof(float));
+            }
+            free(local_enc);
+            free(global_enc);
         } else {
             /* Large image: multi-crop encoding */
             if (ds_verbose >= 1)
@@ -887,12 +920,14 @@ prompt_construction:
         int ds_image_size = 640;
         int ds_num_queries = (ds_image_size + 15) / 16 / 4;  /* ceil(640/16/4) = 10 */
         int ds_local_tokens_per_crop = ds_num_queries * ds_num_queries;  /* 100 */
-        int n_crops_count = (n_encoder_tokens - 257) / 144;  /* 864/144=6 */
-        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;  /* 600 */
+        int n_crops_count = (n_encoder_tokens - 257) / 144;  /* works for 1 or 6 crops */
+        if (n_crops_count < 0) n_crops_count = 0;  /* safety */
+        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;
         int n_global_slots = 256;
         int n_sep_slots = 1;
-        int n_img_tokens = n_global_slots + n_sep_slots + n_local_slots;  /* 857 */
-        int n_local_enc = n_encoder_tokens - 257;  /* 864 encoder local tokens */
+        int n_img_tokens = n_global_slots + n_sep_slots + n_local_slots;
+        int n_local_enc = n_encoder_tokens - 257;
+        if (n_local_enc < 0) n_local_enc = 0;
 
         int n_text_after = 0;
         int *text_after_ids = NULL;

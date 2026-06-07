@@ -1114,7 +1114,7 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
 
         if (ds_verbose >= 1)
             clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t1 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9; \
-            fprintf(stderr, "  SAM layer %d: %.2fs\n", l, _sam_t1 - _sam_t0); _sam_t0 = _sam_t1;
+            if (ds_verbose >= 2) fprintf(stderr, "  SAM layer %d: %.2fs\n", l, _sam_t1 - _sam_t0); _sam_t0 = _sam_t1;
 
         if (ds_verbose >= 2)
             fprintf(stderr, "SAM layer %d/%d done (global_attn=%d)\n", l + 1, 12,
