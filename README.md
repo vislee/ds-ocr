@@ -322,15 +322,18 @@ See [test.c](test.c) for available test suites:
 
 ## Performance
 
-Typical inference on Apple M2 Pro (8 threads):
+Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 
-| Stage | V1 Time | V2 Time |
+| Stage | V1 Time | V2 Time (per crop) |
 |-------|---------|---------|
 | Model loading (mmap) | < 1s | < 1s |
-| Visual encoding (SAM + encoder) | ~200ms | ~350s (CPU float32) |
+| SAM encoding (768×768) | ~200ms | ~4s (BLAS QK^T + block rel_pos) |
+| DeepEncoder V2 | N/A | ~1.3s |
 | Decoding (per token) | ~15ms | ~20ms |
+| **Total (6 crops)** | ~1s | **~35s** |
 
-> **Note**: V2 encoding is slow on CPU due to SAM (12 ViT layers × 6 crops) + Qwen2-0.5B (24 layers × 7 crops). GPU inference would be ~100× faster.
+> **Note**: V2 multi-crop encoding: 6 local crops (768×768) + 1 global (1024×1024).
+> SAM attention uses BLAS sgemm for QK^T and Attn×V, plus block-structured rel_pos bias (30× faster than scalar).
 
 ## Current Status
 
@@ -340,15 +343,15 @@ Typical inference on Apple M2 Pro (8 threads):
 | **Encoder** | ✅ Working | ✅ Working (DeepEncoder V2 + causal queries) |
 | **Projector** | ✅ Working | ✅ Working (linear 896→1280) |
 | **MoE Decoder** | ✅ Working | ✅ Working (RoPE fix: split-half, verified correct) |
-| **Tokenizer** | ✅ Working | ⚠️ BPE encoding has known issues (text tokens hardcoded) |
+| **Tokenizer** | ✅ Working | ✅ Working (BPE encode verified, matches Python) |
 | **Multi-crop** | N/A | ✅ Working (dynamic_preprocess, 6 crops + 1 global) |
 | **End-to-end OCR** | ✅ | ✅ Working (antialias bicubic matches PIL, mean pixel diff 0.017) |
 
 ### Known Issues (V2)
 
 1. **Encoder numerical precision**: Image resize antialias bicubic matches PIL closely (mean pixel diff 0.017, max 8.0 at edge features). Remaining diff from PIL's internal boundary handling, affects <0.1% of pixels.
-2. **Tokenizer BPE**: `ds_tokenizer_encode()` has edge cases in BPE merge; text tokens currently hardcoded for V2 prompt.
-3. **Encoding speed**: SAM + Qwen2 encoder on CPU is slow (~5 min for 6 crops). Future: batch processing, SIMD attention.
+2. **Tokenizer BPE**: ✅ Fixed — `ds_tokenizer_encode()` verified to match Python tokenization.
+3. **Encoding speed**: SAM+Encoder per crop ~5s (down from ~40s via BLAS attention + block rel_pos). Full V2 pipeline ~35s.
 
 ## Model Support
 

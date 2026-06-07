@@ -9,6 +9,7 @@
  * - Downsample: net_2 Conv2d(256→512, k3, s2, p1) + net_3 Conv2d(512→1024, k3, s2, p1)
  */
 
+#include <time.h>
 #include "ds_visual_tokenizer.h"
 #include "ds_kernels.h"
 #include "ds_image.h"
@@ -17,6 +18,13 @@
 #include "ds_dump.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef USE_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
@@ -223,66 +231,130 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
     int hidden = n_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* BLAS-accelerated window attention.
+     * Q, K, V are [n_tokens, hidden] in row-major.
+     * For each head h: Q_h is [n_tokens, head_dim] with stride=hidden.
+     *
+     * Step 1: scores[h] = Q_h @ K_h^T * scale  (BLAS sgemm)
+     * Step 2: Add rel_pos bias (block-structured)
+     * Step 3: Row-wise softmax
+     * Step 4: attn_out_h = scores @ V_h  (BLAS sgemm)
+     */
+    float *scores = (float *)malloc((size_t)n_tokens * n_tokens * sizeof(float));
+
     for (int h = 0; h < n_heads; h++) {
+        const float *Q_h = Q + h * head_dim;   /* stride = hidden */
+        const float *K_h = K + h * head_dim;
+        const float *V_h = V + h * head_dim;
+        float *out_h = out + h * head_dim;
+
+        /* Step 1: QK^T with BLAS */
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_tokens, n_tokens, head_dim,
+                    scale, Q_h, hidden, K_h, hidden,
+                    0.0f, scores, n_tokens);
+#else
         for (int i = 0; i < n_tokens; i++) {
-            const float *q_row = Q + i * hidden + h * head_dim;
-            float *o_row = out + i * hidden + h * head_dim;
-
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
-            int qy = i / win_w;
-            int qx = i % win_w;
-
             for (int j = 0; j < n_tokens; j++) {
-                const float *k_row = K + j * hidden + h * head_dim;
-                const float *v_row = V + j * hidden + h * head_dim;
-
-                float score = 0.0f;
+                float s = 0.0f;
                 for (int d = 0; d < head_dim; d++)
-                    score += q_row[d] * k_row[d];
-                score *= scale;
-
-                /* Add relative position bias: dot(q, Rh[offset]) + dot(q, Rw[offset]) */
-                int ky = j / win_w;
-                int kx = j % win_w;
-
-                int rh_offset = qy - ky + win_h - 1;
-                int rw_offset = qx - kx + win_w - 1;
-
-                if (rh_offset >= 0 && rh_offset < 2 * win_h - 1) {
-                    const float *rh_vec = rel_pos_h + rh_offset * head_dim;
-                    for (int d = 0; d < head_dim; d++)
-                        score += q_row[d] * rh_vec[d];
-                }
-                if (rw_offset >= 0 && rw_offset < 2 * win_w - 1) {
-                    const float *rw_vec = rel_pos_w + rw_offset * head_dim;
-                    for (int d = 0; d < head_dim; d++)
-                        score += q_row[d] * rw_vec[d];
-                }
-
-                /* Online softmax */
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    for (int d = 0; d < head_dim; d++)
-                        o_row[d] = o_row[d] * correction + v_row[d];
-                    max_score = score;
-                } else {
-                    float wt = expf(score - max_score);
-                    sum_exp += wt;
-                    for (int d = 0; d < head_dim; d++)
-                        o_row[d] += wt * v_row[d];
-                }
-            }
-
-            if (sum_exp > 0.0f) {
-                float inv = 1.0f / sum_exp;
-                for (int d = 0; d < head_dim; d++) o_row[d] *= inv;
+                    s += Q_h[i * hidden + d] * K_h[j * hidden + d];
+                scores[i * n_tokens + j] = s * scale;
             }
         }
+#endif
+
+        /* Step 2: Add rel_pos bias (block-structured for window attention) */
+        /* Height bias: depends on (qy, ky) only */
+        for (int dy = 0; dy < 2 * win_h - 1; dy++) {
+            int actual_dy = dy - (win_h - 1);
+            const float *rh_vec = rel_pos_h + dy * head_dim;
+
+            for (int qy = 0; qy < win_h; qy++) {
+                int ky = qy - actual_dy;
+                if (ky < 0 || ky >= win_h) continue;
+
+                int row_start = qy * win_w;
+                int col_start = ky * win_w;
+
+                for (int qx = 0; qx < win_w; qx++) {
+                    const float *q_vec = Q_h + (row_start + qx) * hidden;
+                    float bias = 0.0f;
+                    for (int d = 0; d < head_dim; d++)
+                        bias += q_vec[d] * rh_vec[d];
+
+                    float *row = scores + (row_start + qx) * n_tokens + col_start;
+                    for (int kx = 0; kx < win_w; kx++)
+                        row[kx] += bias;
+                }
+            }
+        }
+
+        /* Width bias: depends on (qx, kx) only */
+        for (int dx = 0; dx < 2 * win_w - 1; dx++) {
+            int actual_dx = dx - (win_w - 1);
+            const float *rw_vec = rel_pos_w + dx * head_dim;
+
+            for (int qx = 0; qx < win_w; qx++) {
+                int kx = qx - actual_dx;
+                if (kx < 0 || kx >= win_w) continue;
+
+                for (int qy = 0; qy < win_h; qy++) {
+                    const float *q_vec = Q_h + (qy * win_w + qx) * hidden;
+                    float bias = 0.0f;
+                    for (int d = 0; d < head_dim; d++)
+                        bias += q_vec[d] * rw_vec[d];
+
+                    for (int ky = 0; ky < win_h; ky++) {
+                        int row = qy * win_w + qx;
+                        int col = ky * win_w + kx;
+                        scores[row * n_tokens + col] += bias;
+                    }
+                }
+            }
+        }
+
+        /* Step 3: Row-wise softmax (float32 is fine for small 14x14 windows) */
+        for (int i = 0; i < n_tokens; i++) {
+            float *row = scores + i * n_tokens;
+            float max_s = -1e30f;
+            for (int j = 0; j < n_tokens; j++)
+                if (row[j] > max_s) max_s = row[j];
+
+            float sum_e = 0.0f;
+            for (int j = 0; j < n_tokens; j++) {
+                row[j] = expf(row[j] - max_s);
+                sum_e += row[j];
+            }
+            if (sum_e > 0.0f) {
+                float inv = 1.0f / sum_e;
+                for (int j = 0; j < n_tokens; j++)
+                    row[j] *= inv;
+            }
+        }
+
+        /* Step 4: attn_out_h = scores @ V_h  (BLAS sgemm) */
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    n_tokens, head_dim, n_tokens,
+                    1.0f, scores, n_tokens, V_h, hidden,
+                    0.0f, out_h, hidden);
+#else
+        for (int i = 0; i < n_tokens; i++) {
+            const float *srow = scores + i * n_tokens;
+            float *o_row = out_h + i * hidden;
+            for (int d = 0; d < head_dim; d++) {
+                float sum = 0.0f;
+                for (int j = 0; j < n_tokens; j++)
+                    sum += srow[j] * V_h[j * hidden + d];
+                o_row[d] = sum;
+            }
+        }
+#endif
     }
+
+    free(scores);
 }
 
 /* ========================================================================
@@ -402,70 +474,175 @@ static void sam_layer_forward(float *out, const float *x,
     float *attn_out = (float *)calloc(seq_len * dim, sizeof(float));
 
     if (use_global_attn) {
-        /* Global attention with float64 softmax for numerical stability.
-         * SAM global attn score range can exceed 500 (head 7: -493 to 68),
-         * causing severe float32 precision loss in softmax.
-         * We compute scores and softmax in double, then convert back.
+        /* BLAS-accelerated global attention with float64 softmax.
+         *
+         * Decomposition:
+         *   scores[h] = Q_h @ K_h^T * scale + rel_pos_bias_h + rel_pos_bias_w
+         *   attn_weights[h] = softmax(scores[h])    (float64 for stability)
+         *   attn_out_h = attn_weights[h] @ V_h
+         *
+         * Q_h, K_h, V_h are [seq_len, head_dim] slices of Q, K, V.
+         * Steps 1 and 3 use BLAS sgemm; step 2 (rel_pos + softmax) is scalar.
          */
-        double scale_d = 1.0 / sqrt((double)head_dim);
+        float scale = 1.0f / sqrtf((float)head_dim);
+
+        /* Allocate score buffer: [seq_len, seq_len] in row-major */
+        float *scores = (float *)malloc((size_t)seq_len * seq_len * sizeof(float));
 
         for (int h = 0; h < n_heads; h++) {
-            /* Allocate per-query buffers */
-            double *score_buf = (double *)malloc(seq_len * sizeof(double));
+            const float *Q_h = Q + h * head_dim;   /* [seq_len, dim] with stride dim */
+            const float *K_h = K + h * head_dim;
+            const float *V_h = V + h * head_dim;
+            float *out_h = attn_out + h * head_dim;
 
+            /* Step 1: scores = Q_h @ K_h^T * scale
+             * Q_h is [seq_len, dim] with leading dim = dim, but we only want
+             * the head_dim columns. We use a stride-aware sgemm:
+             * Q_h has stride=dim, but only head_dim contiguous elements per row.
+             * K_h similarly.
+             *
+             * Since Q/K are laid out as [seq_len, n_heads*head_dim], and we want
+             * columns [h*head_dim .. (h+1)*head_dim), we need to use the
+             * column-major BLAS with appropriate leading dimensions.
+             *
+             * Equivalently: scores[i,j] = sum_d Q[i, h*hd+d] * K[j, h*hd+d]
+             * = Q[:, h*hd:(h+1)*hd] @ K[:, h*hd:(h+1)*hd]^T
+             *
+             * Using CblasRowMajor, CblasNoTrans, CblasTrans:
+             *   C = alpha * A * B^T + beta * C
+             *   A = Q_h [seq_len, head_dim], lda = dim (row stride)
+             *   B = K_h [seq_len, head_dim], ldb = dim (row stride)
+             *   C = scores [seq_len, seq_len], ldc = seq_len
+             */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq_len, seq_len, head_dim,
+                        scale, Q_h, dim, K_h, dim,
+                        0.0f, scores, seq_len);
+#else
             for (int i = 0; i < seq_len; i++) {
-                int qy = i / seq_w, qx = i % seq_w;
-                const float *q_vec = Q + i * dim + h * head_dim;
-
-                /* Pass 1: compute scores in double, find max */
-                double max_s = -1e30;
                 for (int j = 0; j < seq_len; j++) {
-                    int ky = j / seq_w, kx = j % seq_w;
-                    const float *k_vec = K + j * dim + h * head_dim;
-                    double s = 0.0;
+                    float s = 0.0f;
                     for (int d = 0; d < head_dim; d++)
-                        s += (double)q_vec[d] * (double)k_vec[d];
-                    s *= scale_d;
-
-                    /* Rel pos bias in double (using interpolated rel_pos for global attn) */
-                    int rh_off = qy - ky + seq_h - 1;
-                    int rw_off = qx - kx + seq_w - 1;
-                    if (rh_off >= 0 && rh_off < 2 * seq_h - 1) {
-                        const float *rh_vec = eff_rel_h + rh_off * head_dim;
-                        for (int d = 0; d < head_dim; d++)
-                            s += (double)q_vec[d] * (double)rh_vec[d];
-                    }
-                    if (rw_off >= 0 && rw_off < 2 * seq_w - 1) {
-                        const float *rw_vec = eff_rel_w + rw_off * head_dim;
-                        for (int d = 0; d < head_dim; d++)
-                            s += (double)q_vec[d] * (double)rw_vec[d];
-                    }
-                    score_buf[j] = s;
-                    if (s > max_s) max_s = s;
+                        s += Q_h[i * dim + d] * K_h[j * dim + d];
+                    scores[i * seq_len + j] = s * scale;
                 }
+            }
+#endif
 
-                /* Pass 2: exp(score - max), weighted sum, normalize in double */
-                double sum_e = 0.0;
-                float *o_row = attn_out + i * dim + h * head_dim;
-                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+            /* Step 2: Add rel_pos bias using block-structured computation.
+             *
+             * Key insight: rel_pos bias decomposes as:
+             *   bias_h[i,j] = Q[i] · rh[qy-ky+seq_h-1]  (depends on qy,ky only)
+             *   bias_w[i,j] = Q[i] · rw[qx-kx+seq_w-1]  (depends on qx,kx only)
+             *
+             * For height: within a (qy,ky) block, bias is row-constant.
+             * For width: within a (qx,kx) block, bias is col-constant.
+             * This reduces O(seq²*head_dim) to O(seq_h²*seq_w*head_dim + seq_w²*seq_h*head_dim).
+             */
 
-                for (int j = 0; j < seq_len; j++) {
-                    double w = exp(score_buf[j] - max_s);
-                    sum_e += w;
-                    const float *v_row = V + j * dim + h * head_dim;
-                    for (int d = 0; d < head_dim; d++)
-                        o_row[d] += (float)(w * (double)v_row[d]);
-                }
+            /* Height bias: for each dy offset, fill matching blocks */
+            for (int dy = 0; dy < 2 * seq_h - 1; dy++) {
+                int actual_dy = dy - (seq_h - 1);
+                const float *rh_vec = eff_rel_h + dy * head_dim;
 
-                if (sum_e > 0.0) {
-                    float inv = (float)(1.0 / sum_e);
-                    for (int d = 0; d < head_dim; d++)
-                        o_row[d] *= inv;
+                for (int qy = 0; qy < seq_h; qy++) {
+                    int ky = qy - actual_dy;
+                    if (ky < 0 || ky >= seq_h) continue;
+
+                    int row_start = qy * seq_w;
+                    int col_start = ky * seq_w;
+
+                    /* Compute dot products for each qx: [seq_w] vector */
+                    for (int qx = 0; qx < seq_w; qx++) {
+                        const float *q_vec = Q_h + (row_start + qx) * dim;
+                        float bias = 0.0f;
+                        for (int d = 0; d < head_dim; d++)
+                            bias += q_vec[d] * rh_vec[d];
+
+                        /* Fill entire row in this block (same value for all kx) */
+                        float *row = scores + (row_start + qx) * seq_len + col_start;
+                        for (int kx = 0; kx < seq_w; kx++)
+                            row[kx] += bias;
+                    }
                 }
             }
 
-            free(score_buf);
+            /* Width bias: for each dx offset, fill matching positions */
+            for (int dx = 0; dx < 2 * seq_w - 1; dx++) {
+                int actual_dx = dx - (seq_w - 1);
+                const float *rw_vec = eff_rel_w + dx * head_dim;
+
+                for (int qx = 0; qx < seq_w; qx++) {
+                    int kx = qx - actual_dx;
+                    if (kx < 0 || kx >= seq_w) continue;
+
+                    /* For each qy: compute dot product and add to score */
+                    for (int qy = 0; qy < seq_h; qy++) {
+                        const float *q_vec = Q_h + (qy * seq_w + qx) * dim;
+                        float bias = 0.0f;
+                        for (int d = 0; d < head_dim; d++)
+                            bias += q_vec[d] * rw_vec[d];
+
+                        /* Add to all ky positions at column kx */
+                        for (int ky = 0; ky < seq_h; ky++) {
+                            int row = qy * seq_w + qx;
+                            int col = ky * seq_w + kx;
+                            scores[row * seq_len + col] += bias;
+                        }
+                    }
+                }
+            }
+
+            /* Step 2b: Softmax in float64 for stability (row-wise) */
+            double *softmax_buf = (double *)malloc(seq_len * sizeof(double));
+
+            for (int i = 0; i < seq_len; i++) {
+                float *score_row = scores + i * seq_len;
+
+                double max_s = -1e30;
+                for (int j = 0; j < seq_len; j++) {
+                    double s = (double)score_row[j];
+                    softmax_buf[j] = s;
+                    if (s > max_s) max_s = s;
+                }
+
+                double sum_e = 0.0;
+                for (int j = 0; j < seq_len; j++) {
+                    softmax_buf[j] = exp(softmax_buf[j] - max_s);
+                    sum_e += softmax_buf[j];
+                }
+                if (sum_e > 0.0) {
+                    for (int j = 0; j < seq_len; j++)
+                        score_row[j] = (float)(softmax_buf[j] / sum_e);
+                }
+            }
+            free(softmax_buf);
+
+            /* Step 3: attn_out_h = softmax_scores @ V_h
+             * scores is [seq_len, seq_len], V_h is [seq_len, head_dim] with stride dim
+             * out_h is [seq_len, head_dim] with stride dim
+             */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, head_dim, seq_len,
+                        1.0f, scores, seq_len, V_h, dim,
+                        0.0f, out_h, dim);
+#else
+            for (int i = 0; i < seq_len; i++) {
+                const float *srow = scores + i * seq_len;
+                float *o_row = out_h + i * dim;
+                for (int d = 0; d < head_dim; d++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < seq_len; j++)
+                        sum += srow[j] * V_h[j * dim + d];
+                    o_row[d] = sum;
+                }
+            }
+#endif
         }
+
+        free(scores);
     } else {
         /* Window attention: partition into windows (with padding), attend within each */
         int n_windows, padded_h, padded_w;
@@ -913,6 +1090,7 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                 img_h, img_w, n_patches, grid_h, grid_w);
 
     /* SAM transformer layers (12 layers with window/global attention) */
+    double _sam_t0 = 0, _sam_t1 = 0; struct timespec _sam_ts; clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t0 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9;
     for (int l = 0; l < 12; l++) {
         float *next = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
         sam_layer_forward(next, x, vt, l, grid_h, grid_w);
@@ -933,6 +1111,10 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         
         free(x);
         x = next;
+
+        if (ds_verbose >= 1)
+            clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t1 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9; \
+            fprintf(stderr, "  SAM layer %d: %.2fs\n", l, _sam_t1 - _sam_t0); _sam_t0 = _sam_t1;
 
         if (ds_verbose >= 2)
             fprintf(stderr, "SAM layer %d/%d done (global_attn=%d)\n", l + 1, 12,
