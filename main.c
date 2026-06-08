@@ -6,6 +6,7 @@
 
 #include "ds_ocr.h"
 #include "ds_kernels.h"
+#include "ds_platform_ocr.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -n <n>        Max new tokens (default: 4096)\n");
     fprintf(stderr, "  --temp <f>    Sampling temperature (default: 0 = greedy)\n");
     fprintf(stderr, "  --rp <f>      Repetition penalty (default: 1.0, try 1.1-1.5)\n");
+    fprintf(stderr, "  --vision      Use macOS Vision OCR backend (no model required)\n");
+    fprintf(stderr, "  --vision-fast Use macOS Vision OCR backend in fast mode\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only recognition on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -42,6 +45,8 @@ int main(int argc, char **argv) {
     int max_new_tokens = 4096;
     float temperature = 0.0f;
     float repeat_penalty = 1.0f;
+    int use_platform_ocr = 0;
+    int platform_accurate = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -56,6 +61,12 @@ int main(int argc, char **argv) {
             temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--rp") == 0 && i + 1 < argc) {
             repeat_penalty = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--vision") == 0) {
+            use_platform_ocr = 1;
+            platform_accurate = 1;
+        } else if (strcmp(argv[i], "--vision-fast") == 0) {
+            use_platform_ocr = 1;
+            platform_accurate = 0;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -70,12 +81,23 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_dir || !input_image) {
+    if ((!model_dir && !use_platform_ocr) || !input_image) {
         usage(argv[0]);
         return 1;
     }
 
     ds_verbose = verbosity;
+
+    if (use_platform_ocr) {
+        char *text = ds_platform_ocr_file(input_image, platform_accurate, verbosity);
+        if (!text) {
+            fprintf(stderr, "Platform OCR failed or is unavailable on this build\n");
+            return 1;
+        }
+        printf("%s\n", text);
+        free(text);
+        return 0;
+    }
 
     /* Initialize thread pool */
     if (n_threads <= 0) n_threads = ds_get_num_cpus();

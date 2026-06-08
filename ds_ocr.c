@@ -428,6 +428,25 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
         ctx->dec_dense_out = (float *)malloc(hidden * sizeof(float));
     }
 
+    /* MoE scratch buffers (reused across all decode steps) */
+    {
+        int moe_inter = cfg->dec_moe_inter;
+        int shared_inter = cfg->dec_n_shared_experts * moe_inter;
+        int top_k = cfg->dec_top_k;
+
+        ctx->moe_expert_gate_buf = (float *)malloc(moe_inter * sizeof(float));
+        ctx->moe_expert_up_buf = (float *)malloc(moe_inter * sizeof(float));
+        ctx->moe_expert_gate_up_buf = (float *)malloc(2 * moe_inter * sizeof(float));
+        ctx->moe_expert_hidden_buf = (float *)malloc(moe_inter * sizeof(float));
+        ctx->moe_expert_outputs = (float *)malloc(top_k * hidden * sizeof(float));
+
+        ctx->moe_shared_gate_buf = (float *)malloc(shared_inter * sizeof(float));
+        ctx->moe_shared_up_buf = (float *)malloc(shared_inter * sizeof(float));
+        ctx->moe_shared_gate_up_buf = (float *)malloc(2 * shared_inter * sizeof(float));
+        ctx->moe_shared_swiglu_buf = (float *)malloc(shared_inter * sizeof(float));
+        ctx->moe_shared_out_buf = (float *)malloc(hidden * sizeof(float));
+    }
+
     /* RoPE cache */
     ctx->rope_inv_freq_half = head_dim / 2;
     ctx->rope_inv_freq = (float *)malloc(ctx->rope_inv_freq_half * sizeof(float));

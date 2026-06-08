@@ -190,6 +190,10 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 
 # Silent mode (only output recognized text)
 ./ds_ocr -d ./deepseek-ocr -i doc.png --silent > output.txt
+
+# macOS Vision backend (no model weights required)
+./ds_ocr -i doc.png --vision --silent
+./ds_ocr -i doc.png --vision-fast --silent
 ```
 
 ### CLI Options
@@ -201,6 +205,8 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | `-t <n>` | Number of threads | all CPUs |
 | `-n <n>` | Max new tokens | 4096 |
 | `--temp <f>` | Sampling temperature | 0 (greedy) |
+| `--vision` | Use macOS Vision OCR backend | off |
+| `--vision-fast` | Use macOS Vision OCR backend in fast mode | off |
 | `--debug` | Verbose debug output | off |
 | `--silent` | Only output recognition text | off |
 | `-h` | Show help | — |

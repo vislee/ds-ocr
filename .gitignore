@@ -18,5 +18,17 @@ debug_first_token.c
 stb_image_custom.h.bak
 stb_image_full.h
 
+# Model weights and data files
+deepseek-ocr/
+download.log
+test*.png
+test*.jpg
+
+# monbot workspace
+.monbot/
+BOOTSTRAP.md
+HEARTBEAT.md
+TOOLS.md
+
 # OS files
 .DS_Store

@@ -13,19 +13,22 @@ echo "Downloading DeepSeek-OCR model to: $OUT_DIR"
 echo "Model: $MODEL_ID"
 echo ""
 
-# Check for huggingface-cli or wget
-if command -v huggingface-cli &> /dev/null; then
+# Check for hf, huggingface-cli, or pip
+if command -v hf &> /dev/null; then
+    echo "Using hf..."
+    hf download "$MODEL_ID" --local-dir "$OUT_DIR"
+elif command -v huggingface-cli &> /dev/null; then
     echo "Using huggingface-cli..."
     huggingface-cli download "$MODEL_ID" --local-dir "$OUT_DIR"
 elif command -v pip &> /dev/null; then
     echo "Installing huggingface_hub..."
     pip install -q huggingface_hub
-    echo "Using huggingface-cli..."
-    huggingface-cli download "$MODEL_ID" --local-dir "$OUT_DIR"
+    echo "Using hf..."
+    hf download "$MODEL_ID" --local-dir "$OUT_DIR"
 else
-    echo "Neither huggingface-cli nor pip found."
+    echo "Neither hf, huggingface-cli, nor pip found."
     echo "Please install huggingface_hub: pip install huggingface_hub"
-    echo "Then run: huggingface-cli download $MODEL_ID --local-dir $OUT_DIR"
+    echo "Then run: hf download $MODEL_ID --local-dir $OUT_DIR"
     exit 1
 fi
 

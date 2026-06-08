@@ -12,7 +12,13 @@ UNAME_S := $(shell uname -s)
 SRCS = ds_ocr.c ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_avx.c \
        ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
        ds_tokenizer.c ds_safetensors.c
+ifeq ($(UNAME_S),Darwin)
+SRCS += ds_platform_ocr.m
+else
+SRCS += ds_platform_ocr.c
+endif
 OBJS = $(SRCS:.c=.o)
+OBJS := $(OBJS:.m=.o)
 MAIN = main.c
 TARGET = ds_ocr
 TEST_TARGET = test_ds_ocr
@@ -50,8 +56,8 @@ help:
 # BLAS backend (Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
-BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-BLAS_LDFLAGS = -lm -lpthread -framework Accelerate -framework ApplicationServices
+BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_APPLE_VISION -DACCELERATE_NEW_LAPACK
+BLAS_LDFLAGS = -lm -lpthread -framework Accelerate -framework ApplicationServices -framework Foundation -framework Vision -framework ImageIO
 else
 BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 BLAS_LDFLAGS = -lm -lpthread -lopenblas
@@ -95,6 +101,9 @@ $(TARGET): $(OBJS) main.o
 %.o: %.c ds_ocr.h ds_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+%.o: %.m ds_platform_ocr.h
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
+
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
@@ -133,4 +142,5 @@ ds_moe_decoder.o: ds_moe_decoder.c ds_moe_decoder.h ds_kernels.h ds_safetensors.
 ds_tokenizer.o: ds_tokenizer.c ds_tokenizer.h
 ds_safetensors.o: ds_safetensors.c ds_safetensors.h
 main.o: main.c ds_ocr.h ds_kernels.h
+ds_platform_ocr.o: ds_platform_ocr.m ds_platform_ocr.h
 test.o: test.c ds_ocr.h ds_kernels.h ds_safetensors.h ds_tokenizer.h ds_image.h

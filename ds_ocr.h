@@ -356,6 +356,14 @@ typedef struct {
     float *dec_dense_gate, *dec_dense_up, *dec_dense_swiglu;
     float *dec_dense_out;
 
+    /* Pre-allocated MoE scratch buffers (avoid per-token malloc) */
+    float *moe_expert_gate_buf, *moe_expert_up_buf;
+    float *moe_expert_gate_up_buf, *moe_expert_hidden_buf;
+    float *moe_shared_gate_buf, *moe_shared_up_buf;
+    float *moe_shared_gate_up_buf, *moe_shared_swiglu_buf;
+    float *moe_shared_out_buf;
+    float *moe_expert_outputs; /* top_k * hidden */
+
     /* Cached RoPE tables for decoder positions */
     float *rope_cache_cos, *rope_cache_sin;
     float *rope_inv_freq;

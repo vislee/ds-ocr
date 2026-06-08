@@ -21,7 +21,12 @@
 
 /* Forward declaration */
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg);
+                         ds_config_t *cfg,
+                         float *expert_gate_buf, float *expert_up_buf,
+                         float *expert_gate_up_buf, float *expert_hidden_buf,
+                         float *shared_gate_buf, float *shared_up_buf,
+                         float *shared_gate_up_buf, float *shared_swiglu_buf,
+                         float *shared_out_buf);
 
 /* ========================================================================
  * Dense FFN Forward Pass (SwiGLU, used for layer 0)
@@ -65,18 +70,33 @@ static void dense_ffn_forward(float *output, const float *x,
 
 static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          ds_config_t *cfg, int layer_idx,
-                         float *dense_gate_buf, float *dense_up_buf, float *dense_swiglu_buf) {
+                         float *dense_gate_buf, float *dense_up_buf, float *dense_swiglu_buf,
+                         float *expert_gate_buf, float *expert_up_buf,
+                         float *expert_gate_up_buf, float *expert_hidden_buf,
+                         float *shared_gate_buf, float *shared_up_buf,
+                         float *shared_gate_up_buf, float *shared_swiglu_buf,
+                         float *shared_out_buf) {
     if (layer_idx < cfg->dec_first_k_dense) {
         /* Dense FFN (SwiGLU) */
         dense_ffn_forward(output, x, layer, cfg, dense_gate_buf, dense_up_buf, dense_swiglu_buf);
     } else {
         /* MoE */
-        moe_forward(output, x, layer, cfg);
+        moe_forward(output, x, layer, cfg,
+                    expert_gate_buf, expert_up_buf,
+                    expert_gate_up_buf, expert_hidden_buf,
+                    shared_gate_buf, shared_up_buf,
+                    shared_gate_up_buf, shared_swiglu_buf,
+                    shared_out_buf);
     }
 }
 
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg) {
+                         ds_config_t *cfg,
+                         float *expert_gate_buf, float *expert_up_buf,
+                         float *expert_gate_up_buf, float *expert_hidden_buf,
+                         float *shared_gate_buf, float *shared_up_buf,
+                         float *shared_gate_up_buf, float *shared_swiglu_buf,
+                         float *shared_out_buf) {
     int hidden = cfg->dec_hidden;
     int moe_inter = cfg->dec_moe_inter;
     int n_experts = cfg->dec_n_routed_experts;
@@ -84,14 +104,16 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     int n_shared = cfg->dec_n_shared_experts;
 
     /* Step 1: Router gate scores */
-    float *scores = (float *)malloc(n_experts * sizeof(float));
+    float scores_buf[DS_MAX_EXPERTS];
+    float *scores = (n_experts <= DS_MAX_EXPERTS) ? scores_buf :
+                    (float *)malloc(n_experts * sizeof(float));
     ds_moe_router(scores, x, layer->gate_weight, hidden, n_experts);
 
     /* Step 2: Top-K expert selection */
     int top_indices[DS_MAX_EXPERTS];
     float top_weights[DS_MAX_EXPERTS];
     ds_moe_top_k(top_indices, top_weights, scores, n_experts, top_k);
-    free(scores);
+    if (scores != scores_buf) free(scores);
 
     /* Step 3: Forward through each selected routed expert */
     float *expert_outputs = (float *)calloc(top_k * hidden, sizeof(float));
@@ -101,7 +123,9 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                           layer->experts[expert_id].gate_weight_bf16,
                           layer->experts[expert_id].up_weight_bf16,
                           layer->experts[expert_id].down_weight_bf16,
-                          hidden, moe_inter);
+                          hidden, moe_inter,
+                          expert_gate_buf, expert_up_buf,
+                          expert_gate_up_buf, expert_hidden_buf);
     }
 
     /* Step 4: Combine routed expert outputs */
@@ -112,35 +136,22 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
         int shared_inter = n_shared * moe_inter;
 
-        /* Shared experts: fused gate+up → SwiGLU → down */
-        float *shared_gate = (float *)malloc(shared_inter * sizeof(float));
-        float *shared_up = (float *)malloc(shared_inter * sizeof(float));
+        ds_linear_nobias_bf16(shared_gate_buf, x, layer->shared_gate_weight_bf16, 1, hidden, shared_inter);
+        ds_linear_nobias_bf16(shared_up_buf, x, layer->shared_up_weight_bf16, 1, hidden, shared_inter);
 
-        ds_linear_nobias_bf16(shared_gate, x, layer->shared_gate_weight_bf16, 1, hidden, shared_inter);
-        ds_linear_nobias_bf16(shared_up, x, layer->shared_up_weight_bf16, 1, hidden, shared_inter);
-
-        /* Interleave for SwiGLU */
-        float *shared_gate_up = (float *)malloc(2 * shared_inter * sizeof(float));
         for (int i = 0; i < shared_inter; i++) {
-            shared_gate_up[2 * i] = shared_gate[i];
-            shared_gate_up[2 * i + 1] = shared_up[i];
+            shared_gate_up_buf[2 * i] = shared_gate_buf[i];
+            shared_gate_up_buf[2 * i + 1] = shared_up_buf[i];
         }
-        free(shared_gate); free(shared_up);
 
-        float *shared_swiglu = (float *)malloc(shared_inter * sizeof(float));
-        ds_swiglu_multiply(shared_swiglu, shared_gate_up, 1, shared_inter);
-        free(shared_gate_up);
+        ds_swiglu_multiply(shared_swiglu_buf, shared_gate_up_buf, 1, shared_inter);
 
-        float *shared_out = (float *)malloc(hidden * sizeof(float));
-        ds_linear_nobias_bf16(shared_out, shared_swiglu, layer->shared_down_weight_bf16,
+        ds_linear_nobias_bf16(shared_out_buf, shared_swiglu_buf, layer->shared_down_weight_bf16,
                                1, shared_inter, hidden);
-        free(shared_swiglu);
 
-        /* Add shared expert output */
         for (int i = 0; i < hidden; i++) {
-            output[i] += shared_out[i];
+            output[i] += shared_out_buf[i];
         }
-        free(shared_out);
     }
 }
 
@@ -215,7 +226,12 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
     float *mlp_out = (float *)malloc(hidden * sizeof(float));
     mlp_forward(mlp_out, x_norm, layer, cfg, layer_idx,
-                ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu);
+                ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
+                ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
+                ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
+                ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
+                ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
+                ctx->moe_shared_out_buf);
 
     /* Add MLP output + residual */
     for (int i = 0; i < hidden; i++) out[i] += mlp_out[i];
@@ -353,7 +369,12 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
         for (int s = 0; s < seq_len; s++) {
             mlp_forward(mlp_out + s * hidden, x_norm + s * hidden, layer, cfg, l,
-                        NULL, NULL, NULL); /* prefill uses separate allocs for dense */
+                        ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
+                        ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
+                        ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
+                        ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
+                        ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
+                        ctx->moe_shared_out_buf);
         }
 
         for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];

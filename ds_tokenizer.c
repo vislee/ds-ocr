@@ -116,6 +116,76 @@ static char *decode_gpt2_token(const char *token_str) {
     return (char *)bytes;
 }
 
+/*
+ * Decode a DeepSeek BPE token string to UTF-8 text.
+ * DeepSeek uses a mix:
+ *   - Special tokens use ▁ (U+2581) for space (e.g., <｜begin▁of▁sentence｜>)
+ *   - Regular BPE tokens use Ġ (U+0120) for space (GPT-2 byte-level encoding)
+ * We handle both: replace ▁ with space first, then apply GPT-2 decoding.
+ * Returns allocated string (caller must free).
+ */
+static char *decode_deepseek_token(const char *token_str) {
+    init_gpt2_mapping();
+
+    /* First pass: replace ▁ (U+2581 = 0xE2 0x96 0x81) with space,
+     * keeping everything else as-is for GPT-2 decoding */
+    size_t len = strlen(token_str);
+    char *cleaned = (char *)malloc(len + 1);
+    if (!cleaned) return NULL;
+
+    size_t cw = 0;
+    const unsigned char *sp = (const unsigned char *)token_str;
+    while (*sp) {
+        if (sp[0] == 0xE2 && sp[1] == 0x96 && sp[2] == 0x81) {
+            cleaned[cw++] = ' ';  /* ▁ → space */
+            sp += 3;
+        } else {
+            cleaned[cw++] = *sp++;
+        }
+    }
+    cleaned[cw] = '\0';
+
+    /* Second pass: apply GPT-2 byte-level decoding */
+    size_t clen = strlen(cleaned);
+    unsigned char *bytes = (unsigned char *)malloc(clen + 1);
+    if (!bytes) { free(cleaned); return NULL; }
+
+    int byte_count = 0;
+    const unsigned char *p = (const unsigned char *)cleaned;
+    const unsigned char *end = p + clen;
+
+    while (p < end) {
+        int cp, nbytes;
+        if ((*p & 0x80) == 0) { cp = *p; nbytes = 1; }
+        else if ((*p & 0xE0) == 0xC0) {
+            cp = (*p & 0x1F) << 6;
+            if (p + 1 < end) cp |= (p[1] & 0x3F);
+            nbytes = 2;
+        } else if ((*p & 0xF0) == 0xE0) {
+            cp = (*p & 0x0F) << 12;
+            if (p + 1 < end) cp |= (p[1] & 0x3F) << 6;
+            if (p + 2 < end) cp |= (p[2] & 0x3F);
+            nbytes = 3;
+        } else if ((*p & 0xF8) == 0xF0) {
+            cp = (*p & 0x07) << 18;
+            if (p + 1 < end) cp |= (p[1] & 0x3F) << 12;
+            if (p + 2 < end) cp |= (p[2] & 0x3F) << 6;
+            if (p + 3 < end) cp |= (p[3] & 0x3F);
+            nbytes = 4;
+        } else { cp = *p; nbytes = 1; }
+        p += nbytes;
+
+        if (cp < 512 && gpt2_unicode_to_byte[cp] >= 0) {
+            bytes[byte_count++] = (unsigned char)gpt2_unicode_to_byte[cp];
+        } else {
+            bytes[byte_count++] = '?';
+        }
+    }
+    bytes[byte_count] = '\0';
+    free(cleaned);
+    return (char *)bytes;
+}
+
 /* ========================================================================
  * Simple JSON parser for vocab.json
  * ======================================================================== */
@@ -517,6 +587,33 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
     fclose(f);
     json[file_size] = '\0';
 
+    /* Detect tokenizer type: DeepSeek/Llama uses ▁ (U+2581) for space,
+     * GPT-2 uses Ġ (U+0120). Check first few tokens to decide. */
+    int is_deepseek_tokenizer = 0;
+    {
+        const char *peek = json;
+        skip_ws(&peek);
+        if (*peek == '{') {
+            peek++;
+            /* Scan first ~20 entries looking for ▁ */
+            int checked = 0;
+            while (*peek && *peek != '}' && checked < 50) {
+                skip_ws(&peek);
+                if (*peek == ',' || *peek == '}') { if (*peek == ',') peek++; continue; }
+                char test_key[4096];
+                
+                if (parse_json_string(&peek, test_key, sizeof(test_key)) == 0) {
+                    /* Check if token contains ▁ (0xE2 0x96 0x81) */
+                    if (strstr(test_key, "\xe2\x96\x81")) is_deepseek_tokenizer = 1;
+                    checked++;
+                }
+                /* Skip value */
+                skip_ws(&peek);
+                if (*peek == ':') { peek++; skip_ws(&peek); parse_json_int(&peek); }
+            }
+        }
+    }
+
     int max_id = 0;
     const char *p = json;
     skip_ws(&p);
@@ -573,7 +670,8 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
             free(tok->id_to_bpe[id]);
             free(tok->id_to_text[id]);
             tok->id_to_bpe[id] = strdup(key);
-            tok->id_to_text[id] = decode_gpt2_token(key);
+            tok->id_to_text[id] = is_deepseek_tokenizer ?
+                decode_deepseek_token(key) : decode_gpt2_token(key);
         }
     }
     free(json);

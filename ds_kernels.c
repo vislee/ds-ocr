@@ -154,18 +154,9 @@ void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
 void ds_expert_forward(float *out, const float *x,
                        const uint16_t *gate_bf16, const uint16_t *up_bf16,
                        const uint16_t *down_bf16,
-                       int hidden, int intermediate) {
-    /* Allocate scratch for gate and up projections */
-    float *gate_buf = (float *)malloc(intermediate * sizeof(float));
-    float *up_buf = (float *)malloc(intermediate * sizeof(float));
-    float *gate_up_buf = (float *)malloc(2 * intermediate * sizeof(float));
-
-    if (!gate_buf || !up_buf || !gate_up_buf) {
-        fprintf(stderr, "ds_expert_forward: allocation failed\n");
-        free(gate_buf); free(up_buf); free(gate_up_buf);
-        return;
-    }
-
+                       int hidden, int intermediate,
+                       float *gate_buf, float *up_buf,
+                       float *gate_up_buf, float *hidden_buf) {
     /* gate = gate_bf16 @ x, up = up_bf16 @ x */
     ds_linear_nobias_bf16(gate_buf, x, gate_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, up_bf16, 1, hidden, intermediate);
@@ -177,11 +168,30 @@ void ds_expert_forward(float *out, const float *x,
     }
 
     /* SwiGLU: SiLU(gate) * up */
-    float *hidden_buf = (float *)malloc(intermediate * sizeof(float));
     ds_swiglu_multiply(hidden_buf, gate_up_buf, 1, intermediate);
 
     /* down projection */
     ds_linear_nobias_bf16(out, hidden_buf, down_bf16, 1, intermediate, hidden);
+}
+
+/* Backward-compatible wrapper that allocates internally */
+void ds_expert_forward_legacy(float *out, const float *x,
+                       const uint16_t *gate_bf16, const uint16_t *up_bf16,
+                       const uint16_t *down_bf16,
+                       int hidden, int intermediate) {
+    float *gate_buf = (float *)malloc(intermediate * sizeof(float));
+    float *up_buf = (float *)malloc(intermediate * sizeof(float));
+    float *gate_up_buf = (float *)malloc(2 * intermediate * sizeof(float));
+    float *hidden_buf = (float *)malloc(intermediate * sizeof(float));
+
+    if (!gate_buf || !up_buf || !gate_up_buf || !hidden_buf) {
+        fprintf(stderr, "ds_expert_forward: allocation failed\n");
+        free(gate_buf); free(up_buf); free(gate_up_buf); free(hidden_buf);
+        return;
+    }
+
+    ds_expert_forward(out, x, gate_bf16, up_bf16, down_bf16,
+                      hidden, intermediate, gate_buf, up_buf, gate_up_buf, hidden_buf);
 
     free(gate_buf); free(up_buf); free(gate_up_buf); free(hidden_buf);
 }
