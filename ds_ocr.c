@@ -645,7 +645,53 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         int use_crop = (width > 768 || height > 768);
         ds_image_t **crops = NULL;
 
-        if (use_crop) {
+        /* Optional: load PIL-preprocessed pixels from bin files, bypassing C resize.
+         * DS_LOAD_PIL_PIXELS=1 loads:
+         *   dump/py_pil_local_crops.bin  (n_crops x 3 x 768 x 768 float32 CHW, [0,1])
+         *   dump/py_pil_global_view.bin  (3 x 1024 x 1024 float32 CHW, [0,1]) */
+        const char *pil_pixels = getenv("DS_LOAD_PIL_PIXELS");
+        if (pil_pixels && use_crop) {
+            int pil_n_crops = 6; /* fixed for test截屏.png */
+            int pil_local_size = 768;
+            int pil_global_size = 1024;
+
+            /* Load local crops from bin: 6 x 3 x 768 x 768 */
+            int local_total = pil_n_crops * 3 * pil_local_size * pil_local_size;
+            float *local_chw = (float *)malloc(local_total * sizeof(float));
+            FILE *f = fopen("dump/py_pil_local_crops.bin", "rb");
+            if (!f) { fprintf(stderr, "Cannot open py_pil_local_crops.bin\n"); free(local_chw); pil_pixels = NULL; }
+            else {
+                fread(local_chw, sizeof(float), local_total, f);
+                fclose(f);
+
+                crops = (ds_image_t **)malloc(pil_n_crops * sizeof(ds_image_t *));
+                for (int ci = 0; ci < pil_n_crops; ci++) {
+                    crops[ci] = (ds_image_t *)malloc(sizeof(ds_image_t));
+                    crops[ci]->width = pil_local_size;
+                    crops[ci]->height = pil_local_size;
+                    crops[ci]->channels = 3;
+                    crops[ci]->owns_stb = 0;
+                    int npix = pil_local_size * pil_local_size;
+                    crops[ci]->pixels = (unsigned char *)malloc(npix * 3);
+                    /* Convert CHW [0,1] float -> HWC uint8 */
+                    float *crop_chw = local_chw + ci * 3 * npix;
+                    for (int p = 0; p < npix; p++) {
+                        for (int c = 0; c < 3; c++) {
+                            float v = crop_chw[c * npix + p];
+                            int iv = (int)(v * 255.0f + 0.5f);
+                            if (iv < 0) iv = 0; if (iv > 255) iv = 255;
+                            crops[ci]->pixels[p * 3 + c] = (unsigned char)iv;
+                        }
+                    }
+                }
+                n_crops = pil_n_crops;
+                free(local_chw);
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "PIL_PIXELS: loaded %d local crops (768x768) from dump/\n", n_crops);
+            }
+        }
+
+        if (use_crop && !pil_pixels) {
             crops = ds_dynamic_preprocess(&img, 768, 1, 12, 0, &n_crops);
             if (!crops || n_crops < 1) {
                 fprintf(stderr, "dynamic_preprocess failed\n");
@@ -788,7 +834,42 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             if (ds_verbose >= 1)
                 fprintf(stderr, "Encoding global image (1024x1024)\n");
 
-            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
+            ds_image_t *global_img = NULL;
+            if (pil_pixels) {
+                /* Load PIL-preprocessed global view */
+                int gsize = 1024;
+                int gtotal = 3 * gsize * gsize;
+                float *g_chw = (float *)malloc(gtotal * sizeof(float));
+                FILE *gf = fopen("dump/py_pil_global_view.bin", "rb");
+                if (gf) {
+                    fread(g_chw, sizeof(float), gtotal, gf);
+                    fclose(gf);
+                    global_img = (ds_image_t *)malloc(sizeof(ds_image_t));
+                    global_img->width = gsize;
+                    global_img->height = gsize;
+                    global_img->channels = 3;
+                    global_img->owns_stb = 0;
+                    int gnpix = gsize * gsize;
+                    global_img->pixels = (unsigned char *)malloc(gnpix * 3);
+                    for (int p = 0; p < gnpix; p++) {
+                        for (int c = 0; c < 3; c++) {
+                            float v = g_chw[c * gnpix + p];
+                            int iv = (int)(v * 255.0f + 0.5f);
+                            if (iv < 0) iv = 0; if (iv > 255) iv = 255;
+                            global_img->pixels[p * 3 + c] = (unsigned char)iv;
+                        }
+                    }
+                    free(g_chw);
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "PIL_PIXELS: loaded global view (1024x1024) from dump/\n");
+                } else {
+                    fprintf(stderr, "Cannot open py_pil_global_view.bin, using C pad\n");
+                    free(g_chw);
+                    global_img = ds_image_pad(&img, 1024, 127);
+                }
+            } else {
+                global_img = ds_image_pad(&img, 1024, 127);
+            }
             if (!global_img) {
                 free(local_features);
                 goto cleanup_crops;
@@ -952,8 +1033,9 @@ prompt_construction:
         int *text_after_ids = NULL;
         if (tokenizer) {
             /* Encode text after image using BPE tokenizer.
-             * Python format_messages strips the prompt, so "\nFree OCR. " (with
-             * trailing space) becomes "\nFree OCR." after strip().
+             * Python format_messages strips each message's content and the final prompt,
+             * so "<image>\nFree OCR. " (with trailing space) becomes "<image>\nFree OCR."
+             * after strip(). Text after image = "\nFree OCR." (no trailing space).
              * Expected: [201, 21431, 126041, 16] (4 tokens) */
             text_after_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR.", &n_text_after);
             if (!text_after_ids || n_text_after <= 0) {

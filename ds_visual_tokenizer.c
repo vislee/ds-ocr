@@ -594,6 +594,13 @@ static void sam_layer_forward(float *out, const float *x,
                 }
             }
 
+            /* Debug: dump scores with bias for block 11 head 0 */
+            if (layer_idx == 11 && h == 0 && getenv("DS_DUMP_TENSORS")) {
+                FILE *sf = fopen("dump/c_block11_h0_scores_with_bias.bin", "wb");
+                if (sf) { fwrite(scores, sizeof(float), (size_t)seq_len * seq_len, sf); fclose(sf); }
+                fprintf(stderr, "Dumped block11 head0 scores+relpos_bias (%d x %d)\n", seq_len, seq_len);
+            }
+
             /* Step 2b: Softmax in float64 for stability (row-wise) */
             double *softmax_buf = (double *)malloc(seq_len * sizeof(double));
 
@@ -1090,20 +1097,21 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                 img_h, img_w, n_patches, grid_h, grid_w);
 
     /* SAM transformer layers (12 layers with window/global attention) */
+    static int _sam_call_idx = 0;  /* track which SAM call (crop 0-5 or global 6) */
     double _sam_t0 = 0, _sam_t1 = 0; struct timespec _sam_ts; clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t0 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9;
     for (int l = 0; l < 12; l++) {
         float *next = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
         sam_layer_forward(next, x, vt, l, grid_h, grid_w);
         
-        /* Debug: dump layer output for comparison with Python */
-        if (getenv("DS_DUMP_SAM_LAYERS")) {
+        /* Debug: dump layer output for comparison with Python (only crop 0 to avoid overwrite) */
+        if (getenv("DS_DUMP_SAM_LAYERS") && _sam_call_idx == 0) {
             char _lpath[256];
-            snprintf(_lpath, sizeof(_lpath), "dump/c_sam_layer%d_out.bin", l);
+            snprintf(_lpath, sizeof(_lpath), "dump/c_sam_crop0_layer%d_out.bin", l);
             FILE *df = fopen(_lpath, "wb");
             if (df) { fwrite(next, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
             /* Also dump input to SAM layer 0 (after pos_embed) */
             if (l == 0) {
-                df = fopen("dump/c_sam_after_posembed.bin", "wb");
+                df = fopen("dump/c_sam_crop0_after_posembed.bin", "wb");
                 if (df) { fwrite(x, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
             }
             fprintf(stderr, "Dumped SAM layer %d I/O for comparison\n", l);
@@ -1156,6 +1164,8 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     if (ds_verbose >= 1)
         fprintf(stderr, "SAM forward: %dx%d -> %d tokens (grid %dx%d, downsampled %dx%d)\n",
                 img_h, img_w, *out_n_tokens, grid_h, grid_w, ds_h, ds_w);
+
+    _sam_call_idx++;  /* increment for next SAM call (next crop or global view) */
 
     return tokens;
 }

@@ -1399,7 +1399,7 @@ void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
 
 void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
                               int seq, int head_dim, float theta) {
-    /* Split-half RoPE (matches LlamaAttention / DeepSeek-V2 with use_mla=False):
+    /* Split-half RoPE cos/sin cache (matches Python's DeepSeek-V2):
      * Layout: [seq, head_dim] where cos[0:half] == cos[half:end] (repeated).
      * This matches the Python model's:
      *   freqs = outer(t, inv_freq)  # [seq, half]
@@ -1427,29 +1427,28 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
 void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
                             int seq, int n_heads, int head_dim) {
     /*
-     * Split-half RoPE (matches LlamaAttention convention used by DeepSeek-OCR-2):
-     *   x_first_half = x[..., :half],  x_second_half = x[..., half:]
-     *   rotate_half(x) = cat(-x_second_half, x_first_half)
-     *   out = x * cos + rotate_half(x) * sin
+     * RoPE with interleaved→split-half transpose, matching Python's DeepSeek-V2:
      *
-     * This is equivalent to the model's:
+     * Python model does:
      *   q = q.view(b, h, s, d//2, 2).transpose(4,3).reshape(b, h, s, d)
      *   q_embed = q * cos + rotate_half(q) * sin
-     * (The view/transpose/reshape converts interleaved→split-half,
-     *  but since we store Q/K in the same split-half layout after this,
-     *  the net effect on attention Q*K^T is the same.)
      *
-     * IMPORTANT: This operates on Q/K that are in INTERLEAVED order
-     * (dim 0,1 are paired, dim 2,3 are paired, etc.).
-     * The model first converts to split-half, applies rotation, then
-     * computes attention. We achieve the same result by:
-     * 1. Treating interleaved pairs as if they were split-half
-     * 2. Applying the split-half rotation formula
-     * This is mathematically equivalent because the permutation
-     * is applied identically to Q and K.
+     * Step 1: Convert Q/K from interleaved [x0,x1,x2,x3,...,x126,x127]
+     *         to split-half [x0,x2,...,x126, x1,x3,...,x127]
+     * Step 2: Apply split-half rotation:
+     *         out[d]       = x[d] * cos[d] - x[d+half] * sin[d]
+     *         out[d+half]  = x[d] * sin[d+half] + x[d+half] * cos[d+half]
+     * Step 3: Leave in split-half format (attention Q*K^T is layout-agnostic
+     *         as long as Q and K use the same layout).
+     *
+     * The wo (output projection) treats attention output as a flat vector,
+     * so layout doesn't matter for the downstream computation.
      */
     int half = head_dim / 2;
     int hidden = n_heads * head_dim;
+
+    /* Temporary buffer for interleaved→split-half transpose */
+    float *tmp = (float *)malloc(head_dim * sizeof(float));
 
     for (int s = 0; s < seq; s++) {
         const float *c = cos_vals + s * head_dim;
@@ -1458,33 +1457,24 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
         for (int h = 0; h < n_heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-#if defined(__AVX512F__) && defined(__FMA__)
-            /* AVX-512 path — process 8 elements at a time */
-            /* TODO: optimize AVX-512 split-half path */
-            /* Scalar fallback */
+            /* Step 1: Interleaved → split-half transpose
+             * Interleaved: [x0,x1, x2,x3, ..., x_{2d},x_{2d+1}, ...]
+             * Split-half:  [x0,x2,...,x_{2d},..., x1,x3,...,x_{2d+1},...] */
+            for (int d = 0; d < half; d++) {
+                tmp[d]        = vec[2 * d];       /* first half: even indices */
+                tmp[d + half] = vec[2 * d + 1];  /* second half: odd indices */
+            }
+            memcpy(vec, tmp, head_dim * sizeof(float));
+
+            /* Step 2: Split-half rotation (original formula, now correct) */
             for (int d = 0; d < half; d++) {
                 float x1 = vec[d];            /* first half */
                 float x2 = vec[d + half];     /* second half */
                 vec[d]         = x1 * c[d]         - x2 * sn[d];
                 vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
             }
-#elif defined(__AVX2__) && defined(__FMA__)
-            /* Scalar fallback for AVX2 split-half */
-            for (int d = 0; d < half; d++) {
-                float x1 = vec[d];            /* first half */
-                float x2 = vec[d + half];     /* second half */
-                vec[d]         = x1 * c[d]         - x2 * sn[d];
-                vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
-            }
-#else
-            /* Generic scalar path: split-half RoPE */
-            for (int d = 0; d < half; d++) {
-                float x1 = vec[d];            /* first half */
-                float x2 = vec[d + half];     /* second half */
-                vec[d]         = x1 * c[d]         - x2 * sn[d];
-                vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
-            }
-#endif
         }
     }
+
+    free(tmp);
 }
