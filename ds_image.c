@@ -200,7 +200,8 @@ float *ds_image_to_float_chw(const ds_image_t *img) {
     if (!out) return NULL;
 
     /* Convert HWC (interleaved RGB) to CHW (planar), normalize to [-1, 1]
-     * Using mean=0.5, std=0.5: (pixel/255 - 0.5) / 0.5 = pixel/255*2 - 1 */
+     * Using mean=0.5, std=0.5: (pixel/255 - 0.5) / 0.5 = pixel/255*2 - 1
+     * This matches Python's BasicImageTransform(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)) */
     for (int y = 0; y < img->height; y++) {
         for (int x = 0; x < img->width; x++) {
             int hwc_idx = (y * img->width + x) * 3;

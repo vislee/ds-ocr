@@ -435,6 +435,30 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     }
 
     ctx->kv_cache_len += seq_len;
+
+    /* Compute logits from last token position (needed for first generated token) */
+    if (ctx->dec_logits) {
+        float *last_x = x + (seq_len - 1) * hidden;
+        float *norm_x = (float *)malloc(hidden * sizeof(float));
+        ds_rms_norm(norm_x, last_x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
+        if (dec->lm_head_bf16)
+            ds_bf16_matvec_pub(ctx->dec_logits, norm_x, dec->lm_head_bf16, NULL, hidden, cfg->vocab_size);
+        else
+            ds_bf16_matvec_pub(ctx->dec_logits, norm_x, dec->tok_embeddings_bf16, NULL, hidden, cfg->vocab_size);
+        free(norm_x);
+    }
+
+    /* Debug dump */
+    if (getenv("DS_DUMP_DECODER")) {
+        float *last_x = x + (seq_len - 1) * hidden;
+        FILE *f = fopen("dump/dec_prefill_last_hidden.bin", "wb");
+        if (f) { fwrite(last_x, sizeof(float), hidden, f); fclose(f); }
+        if (ctx->dec_logits) {
+            f = fopen("dump/dec_prefill_first_logits.bin", "wb");
+            if (f) { fwrite(ctx->dec_logits, sizeof(float), cfg->vocab_size, f); fclose(f); }
+        }
+    }
+
     free(x); free(x_norm); free(Q); free(K); free(V);
 }
 

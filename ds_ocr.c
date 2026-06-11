@@ -785,6 +785,23 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                     if (df) { fwrite(sam_tokens, sizeof(float), n_sam_tokens * 896, df); fclose(df); }
                 }
 
+                /* Optional: override SAM tokens with Python reference for encoder-only debugging.
+                 * DS_LOAD_SAM_TOKENS=dump/py_sam_tokens_crop0.bin loads [144, 896] float32 */
+                if (i == 0) {
+                    const char *load_sam = getenv("DS_LOAD_SAM_TOKENS");
+                    if (load_sam) {
+                        FILE *sf = fopen(load_sam, "rb");
+                        if (sf) {
+                            int n_read = (int)fread(sam_tokens, sizeof(float), n_sam_tokens * 896, sf);
+                            fclose(sf);
+                            fprintf(stderr, "DS_LOAD_SAM_TOKENS: loaded %d floats from %s (expected %d)\n",
+                                    n_read, load_sam, n_sam_tokens * 896);
+                        } else {
+                            fprintf(stderr, "Warning: DS_LOAD_SAM_TOKENS=%s not found\n", load_sam);
+                        }
+                    }
+                }
+
                 /* Encoder: Qwen2 with 144 causal flow queries (includes projector) */
                 double enc_t0 = ds_time_sec();
                 int n_enc_tokens;
@@ -1000,6 +1017,38 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     /* Step 3: Build decoder input sequence */
 
 prompt_construction:
+    /* Optional: skip SAM+encoder entirely by loading Python's encoder output.
+     * DS_LOAD_ENCODER_OUTPUT=dump/py_encoder_output.bin loads [1121, 1280] float32
+     * and overrides n_encoder_tokens and encoder_output. */
+    {
+        const char *load_enc = getenv("DS_LOAD_ENCODER_OUTPUT");
+        if (load_enc) {
+            FILE *ef = fopen(load_enc, "rb");
+            if (ef) {
+                fseek(ef, 0, SEEK_END);
+                long fsize = ftell(ef);
+                fseek(ef, 0, SEEK_SET);
+                int n_tokens = (int)(fsize / (sizeof(float) * hidden));
+                float *enc_buf = (float *)malloc(n_tokens * hidden * sizeof(float));
+                int n_read = (int)fread(enc_buf, sizeof(float), n_tokens * hidden, ef);
+                fclose(ef);
+                if (n_read == n_tokens * hidden) {
+                    free(encoder_output);
+                    encoder_output = enc_buf;
+                    n_encoder_tokens = n_tokens;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "DS_LOAD_ENCODER_OUTPUT: loaded %d tokens from %s\n",
+                                n_tokens, load_enc);
+                } else {
+                    fprintf(stderr, "Warning: DS_LOAD_ENCODER_OUTPUT size mismatch\n");
+                    free(enc_buf);
+                }
+            } else {
+                fprintf(stderr, "Warning: DS_LOAD_ENCODER_OUTPUT=%s not found\n", load_enc);
+            }
+        }
+    }
+
     /* Load tokenizer early (needed for prompt encoding in V2) */
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir_str);
     tokenizer = ds_tokenizer_load(tokenizer_path);
@@ -1060,10 +1109,10 @@ prompt_construction:
             fprintf(stderr, "Image size config: image_size=%d, num_queries=%d, "
                    "local_tokens/crop=%d, crops=%d\n",
                    ds_image_size, ds_num_queries, ds_local_tokens_per_crop, n_crops_count);
-            fprintf(stderr, "Token layout: %d global + %d sep + %d local = %d image tokens "
-                   "(encoder has %d local, dropping %d)\n",
-                   n_global_slots, n_sep_slots, n_local_slots, n_img_tokens,
-                   n_local_enc, n_local_enc - n_local_slots);
+            fprintf(stderr, "Token layout: %d image tokens from local_enc[0:%d] "
+                   "(encoder has %d local, dropping %d + global/sep dropped)\n",
+                   n_img_tokens, n_img_tokens,
+                   n_local_enc, n_local_enc - n_img_tokens);
         }
 
         prefix_len = 1 + n_img_tokens + n_text_after;
@@ -1088,22 +1137,22 @@ prompt_construction:
 
         /* 2. Encoder output tokens — layout must match Python model.forward() behavior.
          *
-         * CRITICAL: The Python model uses image_size=640 (not 768) for token layout.
+         * Python constructs: source = cat([local_features(864), global_features(256), view_sep(1)])
+         *   → 1121 elements total (after projector, dim=1280)
+         *
+         * Then masked_scatter_(images_seq_mask, source) fills 857 True positions
+         * with source[0:857] = local_features[0:857].
+         *
          * With image_size=640: num_queries=10, local_tokens_per_crop=100
-         * Total image tokens: 256 (global) + 1 (sep) + 600 (local) = 857
+         * Image positions = 857 (from image_size*image_size/14/14 = 640*640/196 ≈ 2088?
+         *   No — it's image_size/16/4=10, so local_slots = 6*100=600, plus global=256 + sep=1 = 857)
+         * 
+         * Key insight: ALL 857 image positions are filled with local_enc[0:857].
+         * The global features and sep in the source are AFTER local[864], so they
+         * land at source[864:1121] which is BEYOND the 857 True positions — they're dropped.
+         * Local_enc[857:864] (7 tokens, last ~1.17 per crop) are also dropped.
          *
-         * But the encoder ALWAYS produces 144 tokens per crop (causal_query_768
-         * is nn.Embedding(144, 896)). So we have 864 local encoder tokens
-         * but only 600 image token positions. Python's masked_scatter silently
-         * drops the extra 264 tokens (the last 7 from each crop).
-         *
-         * Python's masked_scatter fills image token positions with source=[local(864), global(256), sep(1)]:
-         *   global slots (pos 1-256)   <- source[0:256]   = local[0:256]
-         *   sep slot (pos 257)         <- source[256]      = local[256]
-         *   local slots (pos 258-857)  <- source[257:857]  = local[257:600]+partial
-         *   (source[857:] = local[857:864] + global + sep are DROPPED)
-         *
-         * We must replicate this exact layout. */
+         * So C simply copies local_enc[0:857] into positions 1-857. */
         /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
 
         /* Debug: dump encoder_output for Python decoder comparison */
@@ -1115,34 +1164,20 @@ prompt_construction:
         }
 
         /* Apply Python model's masked_scatter layout:
-         * With image_size=640, only n_local_slots (600) of the n_local_enc (864) 
-         * local encoder tokens are used. Global features and sep from encoder
-         * are DROPPED (they don't fit in the 857 image token positions).
-         * 
-         * Python's masked_scatter result:
-         *   global slots (1-256)  <- source[0:256] = local_enc[0:256]
-         *   sep slot (257)        <- source[256]   = local_enc[256]
-         *   local slots (258-857) <- source[257:857] = local_enc[257:600]
-         *   (source[857:] dropped = local_enc[600:864] + global + sep)
-         */
+         * All 857 image positions (pos 1-857) are filled with local_enc[0:857].
+         * Encoder output layout: [local_crops(864), global(256), sep(1)] after projector.
+         * So encoder_output[0:864] = local features (n_local_enc=864 tokens).
+         * We only use local_enc[0:n_img_tokens] = local_enc[0:857].
+         * Global and sep are dropped (they don't fit in 857 positions). */
         float *enc = encoder_output;
         int img_pos = pos;  /* starts at 1 (after BOS) */
-        
-        /* Global slots (256 positions) <- source[0:256] = local_enc[0:256] */
-        memcpy(input_embeds + img_pos * hidden, enc, n_global_slots * hidden * sizeof(float));
-        img_pos += n_global_slots;
-        /* Sep slot (1 position) <- source[256] = local_enc[256] */
-        memcpy(input_embeds + img_pos * hidden, enc + n_global_slots * hidden, hidden * sizeof(float));
-        img_pos += 1;
-        /* Local slots (n_local_slots positions) <- source[257:257+n_local_slots]
-         * = local_enc[257:257+n_local_slots]
-         * With n_local_slots=600, this is local_enc[257:857] (600 tokens) */
-        memcpy(input_embeds + img_pos * hidden, enc + (n_global_slots + 1) * hidden,
-               n_local_slots * hidden * sizeof(float));
-        img_pos += n_local_slots;
-        /* Note: global features (enc + n_local_enc*hidden) and sep are NOT placed,
-         * matching Python's masked_scatter behavior with image_size=640.
-         * local_enc[857:864] (7 tokens) are also dropped. */
+
+        /* Copy local_enc[0:n_img_tokens] = enc[0:857] into image positions 1-857 */
+        int n_copy = n_img_tokens < n_local_enc ? n_img_tokens : n_local_enc;
+        memcpy(input_embeds + img_pos * hidden, enc, n_copy * hidden * sizeof(float));
+        img_pos += n_copy;
+        /* If n_img_tokens > n_local_enc (shouldn't happen with image_size=640),
+         * remaining positions stay zero. */
         pos = img_pos;
 
         /* 3. Text after image: "\nFree OCR. " (5 tokens) */
@@ -1212,10 +1247,27 @@ prompt_construction:
 
     float *dec_input = (float *)malloc(hidden * sizeof(float));
 
+    /* Prefill ALL prefix tokens. Python's model.generate() prefills the entire
+     * prompt (including last text token), then samples from the last position's
+     * logits. We do the same: prefill prefix_len tokens, then use prefill logits
+     * for first generated token, then decode subsequent tokens. */
+    int first_token = -1;
     if (prefix_len > 1) {
-        ds_decoder_prefill(ctx, input_embeds, prefix_len - 1);
-        /* Last prefix token becomes first decoder_forward input */
-        memcpy(dec_input, input_embeds + (prefix_len - 1) * hidden, hidden * sizeof(float));
+        ds_decoder_prefill(ctx, input_embeds, prefix_len);
+        /* Use prefill logits for first token selection */
+        if (ctx->dec_logits) {
+            float *logits = ctx->dec_logits;
+            int vocab = cfg->vocab_size;
+            /* Simple argmax for first token */
+            float best_val = -1e30f;
+            int best_id = 0;
+            for (int i = 0; i < vocab; i++) {
+                if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
+            }
+            first_token = best_id;
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Prefill first token=%d (from prefill logits, %.3f)\n", first_token, best_val);
+        }
     } else {
         /* Single token: use it directly */
         memcpy(dec_input, input_embeds, hidden * sizeof(float));
@@ -1239,25 +1291,19 @@ prompt_construction:
         /* Check KV cache bounds */
         if (ctx->kv_cache_len >= ctx->kv_cache_max) break;
 
-        /* Get embedding for current token and decode */
-        int token = ds_decoder_forward(ctx, dec_input);
-
-        /* Debug: print top-5 logits for first token */
-        if (step == 0 && ctx->dec_logits) {
-            float *logits = ctx->dec_logits;
-            int vocab = ctx->config.vocab_size;
-            fprintf(stderr, "First token=%d, logit[100088]=%.3f\n", token, logits[100088]);
-            fprintf(stderr, "First token top-5: ");
-            /* Simple partial sort */
-            for (int r = 0; r < 5; r++) {
-                int best_i = 0; float best_v = -1e30f;
-                for (int i = 0; i < vocab; i++) {
-                    if (logits[i] > best_v) { best_v = logits[i]; best_i = i; }
-                }
-                fprintf(stderr, "[%d:%.3f] ", best_i, best_v);
-                logits[best_i] = -1e30f; /* mask for next rank */
-            }
-            fprintf(stderr, "\n");
+        int token;
+        if (step == 0 && first_token >= 0) {
+            /* First token comes from prefill logits — no extra decode needed.
+             * Python's generate() prefills all prefix tokens then samples from
+             * the last position. We already did that in ds_decoder_prefill. */
+            token = first_token;
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Step 0: token=%d (from prefill logits)\n", token);
+        } else {
+            /* Decode: process current token, get next token */
+            token = ds_decoder_forward(ctx, dec_input);
+            if (ds_verbose >= 2)
+                fprintf(stderr, "Step %d: token=%d\n", step, token);
         }
 
         if (token == eos_token) {

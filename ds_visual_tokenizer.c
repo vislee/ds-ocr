@@ -315,23 +315,29 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
             }
         }
 
-        /* Step 3: Row-wise softmax (float32 is fine for small 14x14 windows) */
-        for (int i = 0; i < n_tokens; i++) {
-            float *row = scores + i * n_tokens;
-            float max_s = -1e30f;
-            for (int j = 0; j < n_tokens; j++)
-                if (row[j] > max_s) max_s = row[j];
-
-            float sum_e = 0.0f;
-            for (int j = 0; j < n_tokens; j++) {
-                row[j] = expf(row[j] - max_s);
-                sum_e += row[j];
+        /* Step 3: Row-wise softmax in float64 for precision */
+        {
+            double *softmax_buf = (double *)malloc(n_tokens * sizeof(double));
+            for (int i = 0; i < n_tokens; i++) {
+                float *row = scores + i * n_tokens;
+                double max_s = -1e30;
+                for (int j = 0; j < n_tokens; j++) {
+                    double s = (double)row[j];
+                    if (s > max_s) max_s = s;
+                    softmax_buf[j] = s;
+                }
+                double sum_e = 0.0;
+                for (int j = 0; j < n_tokens; j++) {
+                    softmax_buf[j] = exp(softmax_buf[j] - max_s);
+                    sum_e += softmax_buf[j];
+                }
+                if (sum_e > 0.0) {
+                    double inv = 1.0 / sum_e;
+                    for (int j = 0; j < n_tokens; j++)
+                        row[j] = (float)(softmax_buf[j] * inv);
+                }
             }
-            if (sum_e > 0.0f) {
-                float inv = 1.0f / sum_e;
-                for (int j = 0; j < n_tokens; j++)
-                    row[j] *= inv;
-            }
+            free(softmax_buf);
         }
 
         /* Step 4: attn_out_h = scores @ V_h  (BLAS sgemm) */

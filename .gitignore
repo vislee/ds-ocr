@@ -3,11 +3,13 @@ build/
 *.o
 *.dSYM/
 ds_ocr
+ds_ocr_asan
 
 # Debug dumps
 dump/
 
-# Python scripts (debugging, not part of the project)
+# Debug/verification scripts
+verify_*.py
 compare_*.py
 dump_*.py
 run_python_ocr.py
@@ -20,6 +22,7 @@ stb_image_full.h
 
 # Model weights and data files
 deepseek-ocr/
+deepseek-ocr-2/
 download.log
 test*.png
 test*.jpg
@@ -29,6 +32,7 @@ test*.jpg
 BOOTSTRAP.md
 HEARTBEAT.md
 TOOLS.md
+AGENTS.md
 
 # OS files
 .DS_Store

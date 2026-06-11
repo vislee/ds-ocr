@@ -343,7 +343,34 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
  * DeepEncoder V2 Forward Pass (Qwen2-0.5B based)
  * ======================================================================== */
 
-/* Apply RoPE to Q/K vectors for encoder (Qwen2 style) */
+/* Encoder-specific linear layers with float64 accumulation.
+ * The 24-layer DeepEncoder amplifies float32 rounding errors dramatically.
+ * Accumulating dot products in float64 while keeping weights/inputs as float32
+ * costs ~2x in compute but dramatically reduces precision drift. */
+static void enc_linear_f64acc(float *y, const float *x, const float *W, const float *b,
+                               int seq_len, int in_dim, int out_dim) {
+    for (int s = 0; s < seq_len; s++) {
+        const float *x_row = x + s * in_dim;
+        float *y_row = y + s * out_dim;
+        for (int o = 0; o < out_dim; o++) {
+            const float *w_row = W + o * in_dim;
+            double sum = (b != NULL) ? (double)b[o] : 0.0;
+            for (int i = 0; i < in_dim; i++) {
+                sum += (double)x_row[i] * (double)w_row[i];
+            }
+            y_row[o] = (float)sum;
+        }
+    }
+}
+
+static void enc_linear_nobias_f64acc(float *y, const float *x, const float *W,
+                                       int seq_len, int in_dim, int out_dim) {
+    enc_linear_f64acc(y, x, W, NULL, seq_len, in_dim, out_dim);
+}
+
+/* Apply RoPE to Q/K vectors for encoder (Qwen2 style)
+ * Uses float64 for frequency, angle, cos/sin computation to avoid
+ * trig precision drift accumulating over 24 layers. */
 static void enc_apply_rope(float *q, float *k, int seq_len, int n_q_heads,
                             int n_kv_heads, int head_dim, float rope_theta) {
     /* Apply RoPE in split-half (NeoX/Llama) style:
@@ -352,96 +379,105 @@ static void enc_apply_rope(float *q, float *k, int seq_len, int n_q_heads,
      * result = x * cos + rotated * sin
      */
     int half = head_dim / 2;
+    double theta_d = (double)rope_theta;
     for (int pos = 0; pos < seq_len; pos++) {
         /* Q heads */
         for (int h = 0; h < n_q_heads; h++) {
             float *qh = q + pos * n_q_heads * head_dim + h * head_dim;
             for (int i = 0; i < half; i++) {
-                float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
-                float angle = pos * freq;
-                float cos_t = cosf(angle);
-                float sin_t = sinf(angle);
-                float x1 = qh[i];
-                float x2 = qh[half + i];
-                qh[i]        = x1 * cos_t - x2 * sin_t;
-                qh[half + i] = x2 * cos_t + x1 * sin_t;
+                double freq = 1.0 / pow(theta_d, (double)(2 * i) / (double)head_dim);
+                double angle = (double)pos * freq;
+                double cos_t = cos(angle);
+                double sin_t = sin(angle);
+                double x1 = (double)qh[i];
+                double x2 = (double)qh[half + i];
+                qh[i]        = (float)(x1 * cos_t - x2 * sin_t);
+                qh[half + i] = (float)(x2 * cos_t + x1 * sin_t);
             }
         }
         /* K heads */
         for (int h = 0; h < n_kv_heads; h++) {
             float *kh = k + pos * n_kv_heads * head_dim + h * head_dim;
             for (int i = 0; i < half; i++) {
-                float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
-                float angle = pos * freq;
-                float cos_t = cosf(angle);
-                float sin_t = sinf(angle);
-                float x1 = kh[i];
-                float x2 = kh[half + i];
-                kh[i]        = x1 * cos_t - x2 * sin_t;
-                kh[half + i] = x2 * cos_t + x1 * sin_t;
+                double freq = 1.0 / pow(theta_d, (double)(2 * i) / (double)head_dim);
+                double angle = (double)pos * freq;
+                double cos_t = cos(angle);
+                double sin_t = sin(angle);
+                double x1 = (double)kh[i];
+                double x2 = (double)kh[half + i];
+                kh[i]        = (float)(x1 * cos_t - x2 * sin_t);
+                kh[half + i] = (float)(x2 * cos_t + x1 * sin_t);
             }
         }
     }
 }
 
-/* GQA attention with mixed mask (bidirectional for visual, causal for flow) */
+/* GQA attention with mixed mask (bidirectional for visual, causal for flow)
+ * Uses float64 for QK^T dot product, softmax, and V accumulation to mitigate
+ * precision drift in the 24-layer DeepEncoder pipeline. */
 static void enc_gqa_mixed_attention(float *out, const float *Q, const float *K,
                                      const float *V, int visual_len, int total_len,
                                      int n_q_heads, int n_kv_heads, int head_dim) {
-    float scale = 1.0f / sqrtf((float)head_dim);
+    double scale = 1.0 / sqrt((double)head_dim);
     int kv_group_size = n_q_heads / n_kv_heads;
 
-    /* Allocate score buffer for two-pass softmax (better numerical stability) */
-    float *scores = (float *)malloc((size_t)total_len * sizeof(float));
+    /* Allocate double buffer for V accumulation */
+    double *o_row_d = (double *)malloc(head_dim * sizeof(double));
 
     for (int h = 0; h < n_q_heads; h++) {
-        int kv_h = h / kv_group_size; /* which KV head this Q head uses */
+        int kv_h = h / kv_group_size;
 
         for (int qi = 0; qi < total_len; qi++) {
             const float *q_vec = Q + qi * n_q_heads * head_dim + h * head_dim;
 
-            /* Determine visible range for this query token */
-            int vis_end; /* exclusive: visible tokens are [0, vis_end) */
+            int vis_end;
             if (qi < visual_len) {
-                vis_end = visual_len; /* visual: only attend to other visual tokens */
+                vis_end = visual_len;
             } else {
-                vis_end = qi + 1; /* causal: attend to all visual + causal up to qi */
+                vis_end = qi + 1;
             }
 
-            /* Pass 1: compute scores and find max */
-            float max_score = -1e30f;
+            /* Float64 online softmax with QK^T and V accumulation */
+            double max_score = -1e30;
+            double sum_exp = 0.0;
+            for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
+
             for (int ki = 0; ki < vis_end; ki++) {
                 const float *k_vec = K + ki * n_kv_heads * head_dim + kv_h * head_dim;
-                float s = 0.0f;
-                for (int d = 0; d < head_dim; d++)
-                    s += q_vec[d] * k_vec[d];
-                s *= scale;
-                scores[ki] = s;
-                if (s > max_score) max_score = s;
-            }
-
-            /* Pass 2: exp(score - max), compute weighted sum, normalize */
-            float sum_exp = 0.0f;
-            float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
-            for (int d = 0; d < head_dim; d++) out_vec[d] = 0.0f;
-
-            for (int ki = 0; ki < vis_end; ki++) {
-                float w = expf(scores[ki] - max_score);
-                sum_exp += w;
                 const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
+
+                /* Float64 QK dot product */
+                double s = 0.0;
                 for (int d = 0; d < head_dim; d++)
-                    out_vec[d] += w * v_vec[d];
+                    s += (double)q_vec[d] * (double)k_vec[d];
+                s *= scale;
+
+                if (s > max_score) {
+                    double correction = exp(max_score - s);
+                    sum_exp = sum_exp * correction + 1.0;
+                    for (int d = 0; d < head_dim; d++)
+                        o_row_d[d] = o_row_d[d] * correction + (double)v_vec[d];
+                    max_score = s;
+                } else {
+                    double wt = exp(s - max_score);
+                    sum_exp += wt;
+                    for (int d = 0; d < head_dim; d++)
+                        o_row_d[d] += wt * (double)v_vec[d];
+                }
             }
 
-            if (sum_exp > 0.0f) {
-                float inv = 1.0f / sum_exp;
+            float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
+            if (sum_exp > 0.0) {
+                double inv = 1.0 / sum_exp;
                 for (int d = 0; d < head_dim; d++)
-                    out_vec[d] *= inv;
+                    out_vec[d] = (float)(o_row_d[d] * inv);
+            } else {
+                for (int d = 0; d < head_dim; d++) out_vec[d] = 0.0f;
             }
         }
     }
 
-    free(scores);
+    free(o_row_d);
 }
 
 static void enc_v2_layer_forward(float *out, const float *x,
@@ -482,13 +518,31 @@ static void enc_v2_layer_forward(float *out, const float *x,
     ds_linear(K, x_norm, wk_w, wk_b, total_len, hidden, kv_dim);
     ds_linear(V, x_norm, wv_w, wv_b, total_len, hidden, kv_dim);
 
+    /* Debug: dump QKV before RoPE for layer 0 */
+    if (layer_idx == 0 && getenv("DS_DUMP_TENSORS")) {
+        ds_dump_tensor("enc0_Q_before_rope", Q, total_len * hidden, "[288, 896]");
+        ds_dump_tensor("enc0_K_before_rope", K, total_len * kv_dim, "[288, 128]");
+        ds_dump_tensor("enc0_V_before_rope", V, total_len * kv_dim, "[288, 128]");
+    }
+
     /* Apply RoPE to Q and K */
     enc_apply_rope(Q, K, total_len, n_q_heads, n_kv_heads, head_dim, cfg->enc_rope_theta);
+
+    /* Debug: dump QKV after RoPE for layer 0 */
+    if (layer_idx == 0 && getenv("DS_DUMP_TENSORS")) {
+        ds_dump_tensor("enc0_Q_after_rope", Q, total_len * hidden, "[288, 896]");
+        ds_dump_tensor("enc0_K_after_rope", K, total_len * kv_dim, "[288, 128]");
+    }
 
     /* GQA mixed attention (bidirectional for visual, causal for flow) */
     float *attn_out = (float *)malloc(total_len * hidden * sizeof(float));
     enc_gqa_mixed_attention(attn_out, Q, K, V, visual_len, total_len,
                             n_q_heads, n_kv_heads, head_dim);
+
+    /* Debug: dump attention output for layer 0 */
+    if (layer_idx == 0 && getenv("DS_DUMP_TENSORS")) {
+        ds_dump_tensor("enc0_attn_out", attn_out, total_len * hidden, "[288, 896]");
+    }
 
     /* Output projection + residual */
     float *proj_out = (float *)malloc(total_len * hidden * sizeof(float));
@@ -505,11 +559,11 @@ static void enc_v2_layer_forward(float *out, const float *x,
     ds_linear_nobias(gate_buf, ffn_norm, gate_w, total_len, hidden, intermediate);
     ds_linear_nobias(up_buf, ffn_norm, up_w, total_len, hidden, intermediate);
 
-    /* SwiGLU: silu(gate) * up */
+    /* SwiGLU: silu(gate) * up (float64 for numerical stability) */
     for (int i = 0; i < total_len * intermediate; i++) {
-        float g = gate_buf[i];
-        float sigmoid_g = 1.0f / (1.0f + expf(-g));
-        gate_buf[i] = g * sigmoid_g * up_buf[i];
+        double g = (double)gate_buf[i];
+        double sigmoid_g = 1.0 / (1.0 + exp(-g));
+        gate_buf[i] = (float)(g * sigmoid_g * (double)up_buf[i]);
     }
     free(up_buf);
 
@@ -549,6 +603,26 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
 
     /* DUMP: encoder input (visual + causal queries concatenated) */
     ds_dump_tensor("enc_input", x, total_len * hidden, "[512, 896]");
+
+    /* Optional: override encoder input with Python reference for debugging.
+     * This isolates encoder precision from SAM/resize differences.
+     * Usage: DS_LOAD_ENC_INPUT=dump/py_enc_input_crop0.bin */
+    {
+        const char *load_enc_input = getenv("DS_LOAD_ENC_INPUT");
+        if (load_enc_input) {
+            FILE *ef = fopen(load_enc_input, "rb");
+            if (ef) {
+                fread(x, sizeof(float), total_len * hidden, ef);
+                fclose(ef);
+                fprintf(stderr, "Loaded encoder input from %s (%d x %d)\n",
+                        load_enc_input, total_len, hidden);
+                /* Re-dump to confirm */
+                ds_dump_tensor("enc_input_loaded", x, total_len * hidden, "[512, 896]");
+            } else {
+                fprintf(stderr, "Warning: DS_LOAD_ENC_INPUT=%s not found\n", load_enc_input);
+            }
+        }
+    }
 
     /* Transformer layers */
     for (int l = 0; l < cfg->enc_layers; l++) {

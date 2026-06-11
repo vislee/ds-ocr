@@ -218,6 +218,11 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
                         int visual_len, int total_len, int n_heads,
                         int head_dim, float scale) {
     int hidden = n_heads * head_dim;
+    double dscale = (double)scale;
+
+    /* Allocate double buffers for V accumulation (float64 precision) */
+    double *o_row_d = (double *)malloc(head_dim * sizeof(double));
+    double *v_buf = (double *)malloc(head_dim * sizeof(double));
 
     for (int h = 0; h < n_heads; h++) {
         /* Visual tokens: bidirectional attention over visual tokens */
@@ -225,31 +230,42 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
             const float *q_row = Q + i * hidden + h * head_dim;
             float *o_row = out + i * hidden + h * head_dim;
 
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+            double max_score = -1e30;
+            double sum_exp = 0.0;
+            for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
 
             for (int j = 0; j < visual_len; j++) {
                 const float *k_row = K + j * hidden + h * head_dim;
                 const float *v_row = V + j * hidden + h * head_dim;
 
-                float score = ds_dot_f32_impl(q_row, k_row, head_dim) * scale;
+                /* Float64 QK dot product */
+                double score = 0.0;
+                for (int d = 0; d < head_dim; d++)
+                    score += (double)q_row[d] * (double)k_row[d];
+                score *= dscale;
 
                 if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    ds_vec_scale_add_impl(o_row, v_row, correction, head_dim);
+                    double correction = exp(max_score - score);
+                    sum_exp = sum_exp * correction + 1.0;
+                    for (int d = 0; d < head_dim; d++) {
+                        v_buf[d] = (double)v_row[d] * correction;
+                        o_row_d[d] = o_row_d[d] * correction + v_buf[d];
+                    }
                     max_score = score;
                 } else {
-                    float wt = expf(score - max_score);
+                    double wt = exp(score - max_score);
                     sum_exp += wt;
-                    ds_vec_axpy_inplace_impl(o_row, v_row, wt, head_dim);
+                    for (int d = 0; d < head_dim; d++)
+                        o_row_d[d] += wt * (double)v_row[d];
                 }
             }
 
-            if (sum_exp > 0.0f) {
-                float inv_sum = 1.0f / sum_exp;
-                ds_vec_scale_inplace_impl(o_row, inv_sum, head_dim);
+            if (sum_exp > 0.0) {
+                double inv_sum = 1.0 / sum_exp;
+                for (int d = 0; d < head_dim; d++)
+                    o_row[d] = (float)(o_row_d[d] * inv_sum);
+            } else {
+                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
             }
         }
 
@@ -258,38 +274,51 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
             const float *q_row = Q + i * hidden + h * head_dim;
             float *o_row = out + i * hidden + h * head_dim;
 
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+            double max_score = -1e30;
+            double sum_exp = 0.0;
+            for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
 
-            /* Can attend to all visual tokens + previous causal flow queries */
-            int k_end = i + 1;  /* Causal: can see up to current position */
+            int k_end = i + 1;
             if (k_end > total_len) k_end = total_len;
 
             for (int j = 0; j < k_end; j++) {
                 const float *k_row = K + j * hidden + h * head_dim;
                 const float *v_row = V + j * hidden + h * head_dim;
 
-                float score = ds_dot_f32_impl(q_row, k_row, head_dim) * scale;
+                /* Float64 QK dot product */
+                double score = 0.0;
+                for (int d = 0; d < head_dim; d++)
+                    score += (double)q_row[d] * (double)k_row[d];
+                score *= dscale;
 
                 if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    ds_vec_scale_add_impl(o_row, v_row, correction, head_dim);
+                    double correction = exp(max_score - score);
+                    sum_exp = sum_exp * correction + 1.0;
+                    for (int d = 0; d < head_dim; d++) {
+                        v_buf[d] = (double)v_row[d] * correction;
+                        o_row_d[d] = o_row_d[d] * correction + v_buf[d];
+                    }
                     max_score = score;
                 } else {
-                    float wt = expf(score - max_score);
+                    double wt = exp(score - max_score);
                     sum_exp += wt;
-                    ds_vec_axpy_inplace_impl(o_row, v_row, wt, head_dim);
+                    for (int d = 0; d < head_dim; d++)
+                        o_row_d[d] += wt * (double)v_row[d];
                 }
             }
 
-            if (sum_exp > 0.0f) {
-                float inv_sum = 1.0f / sum_exp;
-                ds_vec_scale_inplace_impl(o_row, inv_sum, head_dim);
+            if (sum_exp > 0.0) {
+                double inv_sum = 1.0 / sum_exp;
+                for (int d = 0; d < head_dim; d++)
+                    o_row[d] = (float)(o_row_d[d] * inv_sum);
+            } else {
+                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
             }
         }
     }
+
+    free(o_row_d);
+    free(v_buf);
 }
 
 /* ========================================================================
@@ -1427,28 +1456,25 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
 void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
                             int seq, int n_heads, int head_dim) {
     /*
-     * RoPE with interleaved→split-half transpose, matching Python's DeepSeek-V2:
+     * LLaMA-style RoPE: rotate_half on raw Q/K (no interleaved transpose).
      *
-     * Python model does:
-     *   q = q.view(b, h, s, d//2, 2).transpose(4,3).reshape(b, h, s, d)
+     * Python's LlamaAttention uses:
+     *   rotate_half(x) = cat(-x[half:], x[:half])
      *   q_embed = q * cos + rotate_half(q) * sin
      *
-     * Step 1: Convert Q/K from interleaved [x0,x1,x2,x3,...,x126,x127]
-     *         to split-half [x0,x2,...,x126, x1,x3,...,x127]
-     * Step 2: Apply split-half rotation:
-     *         out[d]       = x[d] * cos[d] - x[d+half] * sin[d]
-     *         out[d+half]  = x[d] * sin[d+half] + x[d+half] * cos[d+half]
-     * Step 3: Leave in split-half format (attention Q*K^T is layout-agnostic
-     *         as long as Q and K use the same layout).
+     * cos/sin layout: [seq, head_dim] where cos[0:half] == cos[half:end] (repeated)
+     * This matches Python's: emb = cat(freqs, freqs, dim=-1); cos = emb.cos()
      *
-     * The wo (output projection) treats attention output as a flat vector,
-     * so layout doesn't matter for the downstream computation.
+     * For each element d in [0, half):
+     *   out[d]       = x[d] * cos[d] + (-x[d+half]) * sin[d]
+     *                = x[d] * cos[d] - x[d+half] * sin[d]
+     *   out[d+half]  = x[d+half] * cos[d+half] + x[d] * sin[d+half]
+     *                = x[d+half] * cos[d] + x[d] * sin[d]
      */
     int half = head_dim / 2;
     int hidden = n_heads * head_dim;
 
-    /* Temporary buffer for interleaved→split-half transpose */
-    float *tmp = (float *)malloc(head_dim * sizeof(float));
+    float *tmp = (float *)malloc(half * sizeof(float));
 
     for (int s = 0; s < seq; s++) {
         const float *c = cos_vals + s * head_dim;
@@ -1457,19 +1483,15 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
         for (int h = 0; h < n_heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-            /* Step 1: Interleaved → split-half transpose
-             * Interleaved: [x0,x1, x2,x3, ..., x_{2d},x_{2d+1}, ...]
-             * Split-half:  [x0,x2,...,x_{2d},..., x1,x3,...,x_{2d+1},...] */
-            for (int d = 0; d < half; d++) {
-                tmp[d]        = vec[2 * d];       /* first half: even indices */
-                tmp[d + half] = vec[2 * d + 1];  /* second half: odd indices */
-            }
-            memcpy(vec, tmp, head_dim * sizeof(float));
+            /* Save first half before in-place modification */
+            memcpy(tmp, vec, half * sizeof(float));
 
-            /* Step 2: Split-half rotation (original formula, now correct) */
+            /* Apply rotate_half-style RoPE:
+             * out[d]      = x[d]*cos[d] - x[d+half]*sin[d]        for d < half
+             * out[d+half] = x[d]*sin[d]   + x[d+half]*cos[d]      for d < half */
             for (int d = 0; d < half; d++) {
-                float x1 = vec[d];            /* first half */
-                float x2 = vec[d + half];     /* second half */
+                float x1 = tmp[d];           /* first half */
+                float x2 = vec[d + half];    /* second half */
                 vec[d]         = x1 * c[d]         - x2 * sn[d];
                 vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
             }
