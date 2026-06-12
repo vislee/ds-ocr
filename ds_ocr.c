@@ -502,6 +502,7 @@ ds_ctx_t *ds_load(const char *model_dir) {
     /* Initialize config */
     init_config(&ctx->config, version);
     snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", model_dir);
+    snprintf(ctx->vis_tokenizer.model_dir, sizeof(ctx->vis_tokenizer.model_dir), "%s", model_dir);
 
     /* Open safetensors files */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
@@ -700,60 +701,42 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         }
 
         if (!use_crop) {
-            /* Small image (both dims <= 768): process as 1 local crop + 1 global view.
-             * Python always processes both: patches (768x768) and image_ori (1024x1024).
-             * For small images, dynamic_preprocess returns 1 crop (768x768 padded).
-             * Then the global view is padded to 1024x1024 separately. */
+            /* Small image (both dims <= 768): Python only processes the global view
+             * at 1024x1024. No local crops. tokenized_image = 256+1 = 257 tokens.
+             * global_local_features = [global_features(256), view_seperator(1)] */
             if (ds_verbose >= 1)
-                fprintf(stderr, "Small image %dx%d: 1 crop (768x768) + global (1024x1024)\n",
+                fprintf(stderr, "Small image %dx%d: global only (1024x1024)\n",
                         width, height);
-
-            /* Local: pad to 768x768 */
-            ds_image_t *local_img = ds_image_pad(&img, 768, 127);
-            if (!local_img) return NULL;
-
-            int n_sam_tokens;
-            float *sam_tokens = ds_sam_forward_image(ctx, local_img, &n_sam_tokens, NULL);
-            ds_image_free(local_img);
-            if (!sam_tokens) return NULL;
-
-            int n_enc_tokens;
-            float *local_enc = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
-                                                      &n_enc_tokens, 144,
-                                                      ctx->vis_tokenizer.causal_query_768_embeddings);
-            free(sam_tokens);
-            if (!local_enc) {
-                fprintf(stderr, "Encoder forward failed for small local image\n");
-                return NULL;
-            }
 
             /* Global: pad to 1024x1024 */
             ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
-            if (!global_img) { free(local_enc); return NULL; }
+            if (!global_img) return NULL;
 
+            int n_sam_tokens;
             float *global_sam = ds_sam_forward_image(ctx, global_img, &n_sam_tokens, NULL);
             ds_image_free(global_img);
-            if (!global_sam) { free(local_enc); return NULL; }
+            if (!global_sam) return NULL;
 
             int n_global_enc;
             float *global_enc = ds_encoder_forward_v2(ctx, global_sam, n_sam_tokens,
                                                        &n_global_enc, 256,
                                                        ctx->vis_tokenizer.causal_query_embeddings);
             free(global_sam);
-            if (!global_enc) { free(local_enc); return NULL; }
+            if (!global_enc) {
+                fprintf(stderr, "Encoder forward failed for global image\n");
+                return NULL;
+            }
 
-            /* Concat: [local(144), global(256), view_sep(1)] */
-            n_encoder_tokens = n_enc_tokens + n_global_enc + 1;
+            /* Concat: [global(256), view_sep(1)] */
+            n_encoder_tokens = n_global_enc + 1;
             encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
-            memcpy(encoder_output, local_enc, n_enc_tokens * hidden * sizeof(float));
-            memcpy(encoder_output + n_enc_tokens * hidden, global_enc, n_global_enc * hidden * sizeof(float));
+            memcpy(encoder_output, global_enc, n_global_enc * hidden * sizeof(float));
             if (ctx->vis_tokenizer.view_seperator) {
-                memcpy(encoder_output + (n_enc_tokens + n_global_enc) * hidden,
+                memcpy(encoder_output + n_global_enc * hidden,
                        ctx->vis_tokenizer.view_seperator, hidden * sizeof(float));
             } else {
-                memset(encoder_output + (n_enc_tokens + n_global_enc) * hidden, 0, hidden * sizeof(float));
+                memset(encoder_output + n_global_enc * hidden, 0, hidden * sizeof(float));
             }
-            free(local_enc);
             free(global_enc);
         } else {
             /* Large image: multi-crop encoding */

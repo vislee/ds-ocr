@@ -447,7 +447,36 @@ static void sam_layer_forward(float *out, const float *x,
         int needed_size = 2 * seq_h - 1;  /* 2*48-1=95 for 768x768 */
 
         if (needed_size != stored_size) {
-            /* Linear interpolation of rel_pos from stored_size → needed_size.
+            /* Try loading precomputed rel_pos from model_dir first */
+            char rp_h_path[1024], rp_w_path[1024];
+            snprintf(rp_h_path, sizeof(rp_h_path), "%s/rel_pos_h_layer%d_size%d.bin",
+                     vt->model_dir, layer_idx, needed_size);
+            snprintf(rp_w_path, sizeof(rp_w_path), "%s/rel_pos_w_layer%d_size%d.bin",
+                     vt->model_dir, layer_idx, needed_size);
+            FILE *rfh = fopen(rp_h_path, "rb");
+            FILE *rfw = fopen(rp_w_path, "rb");
+            if (rfh && rfw) {
+                interp_rel_h = (float *)malloc(needed_size * head_dim * sizeof(float));
+                interp_rel_w = (float *)malloc(needed_size * head_dim * sizeof(float));
+                size_t rh_read = fread(interp_rel_h, sizeof(float), needed_size * head_dim, rfh);
+                size_t rw_read = fread(interp_rel_w, sizeof(float), needed_size * head_dim, rfw);
+                fclose(rfh); rfh = NULL;
+                fclose(rfw); rfw = NULL;
+                if ((int)rh_read == needed_size * head_dim && (int)rw_read == needed_size * head_dim) {
+                    eff_rel_h = interp_rel_h;
+                    eff_rel_w = interp_rel_w;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "Loaded precomputed rel_pos for layer %d from %s\n",
+                                layer_idx, rp_h_path);
+                    goto rel_pos_done;
+                }
+                free(interp_rel_h); free(interp_rel_w);
+                interp_rel_h = interp_rel_w = NULL;
+            }
+            if (rfh) fclose(rfh);
+            if (rfw) fclose(rfw);
+
+            /* Fallback: linear interpolation of rel_pos from stored_size → needed_size.
              * Matches Python: F.interpolate(rel_pos.reshape(1,L,-1).permute(0,2,1),
              *                                size=needed_size, mode='linear')
              * rel_pos shape: [stored_size, head_dim] → interpolate each dim independently */
@@ -475,6 +504,9 @@ static void sam_layer_forward(float *out, const float *x,
             eff_rel_w = interp_rel_w;
         }
     }
+
+    rel_pos_done:
+    ; /* label target for precomputed rel_pos skip */
 
     /* Attention */
     float *attn_out = (float *)calloc(seq_len * dim, sizeof(float));
@@ -807,12 +839,12 @@ static float *sam_downsample_forward(const float *spatial, int h, int w,
  * ======================================================================== */
 
 /* Cubic interpolation kernel (used by bicubic)
- * Matches scipy/PIL bicubic with a=-0.75 (not a=-1 as in PyTorch default)
- * But F.interpolate with antialias=True uses a=-0.75, while without it uses a=-1.
- * Python code: F.interpolate(mode='bicubic', antialias=True) → uses a=-0.75
+ * PyTorch F.interpolate(bicubic, antialias=True) uses Keys cubic with a=-0.5.
+ * This matches PIL/Pillow BICUBIC default behavior.
+ * Previously we used a=-0.75 which was incorrect.
  */
 static float bicubic_weight(float x) {
-    const float a = -0.75f;
+    const float a = -0.5f;
     float ax = fabsf(x);
     if (ax <= 1.0f) {
         return (a + 2.0f) * ax * ax * ax - (a + 3.0f) * ax * ax + 1.0f;
@@ -862,13 +894,15 @@ static float *bicubic_interpolate_2d(const float *src, int src_h, int src_w,
                     int y_clamped = sy0 + ky;
                     if (y_clamped < 0) y_clamped = 0;
                     if (y_clamped >= src_h) y_clamped = src_h - 1;
-                    float wy = bicubic_weight((float)ky - (sy - sy0) * fminf(y_scale, 1.0f));
+                    float dy = (float)(sy0 + ky) - sy;
+                    float wy = bicubic_weight(dy * fminf(y_scale, 1.0f));
 
                     for (int kx = -x_support; kx <= x_support; kx++) {
                         int x_clamped = sx0 + kx;
                         if (x_clamped < 0) x_clamped = 0;
                         if (x_clamped >= src_w) x_clamped = src_w - 1;
-                        float wx = bicubic_weight((float)kx - (sx - sx0) * fminf(x_scale, 1.0f));
+                        float dx = (float)(sx0 + kx) - sx;
+                        float wx = bicubic_weight(dx * fminf(x_scale, 1.0f));
 
                         float w = wx * wy;
                         val += w * src[(y_clamped * src_w + x_clamped) * embed_dim + d];
@@ -1046,32 +1080,27 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         float *interp_pos = NULL;
 
         if (tgt_grid != src_grid) {
-            /* Check for precomputed pos_embed override (avoids C interpolation mismatch) */
-            const char *pe_file = getenv("DS_SAM_POSEMBED_FILE");
-            if (pe_file) {
-                FILE *pf = fopen(pe_file, "rb");
-                if (pf) {
-                    interp_pos = (float *)malloc(tgt_grid * tgt_grid * DS_SAM_EMBED_DIM * sizeof(float));
-                    size_t nread = fread(interp_pos, sizeof(float),
-                                          tgt_grid * tgt_grid * DS_SAM_EMBED_DIM, pf);
-                    fclose(pf);
-                    if ((int)nread == tgt_grid * tgt_grid * DS_SAM_EMBED_DIM) {
-                        pos_embed = interp_pos;
-                        /* Verify first values match file content */
-                        fprintf(stderr, "Loaded precomputed pos_embed from %s (%dx%d), first3=[%.6f,%.6f,%.6f]\n",
-                                pe_file, tgt_grid, tgt_grid,
-                                interp_pos[0], interp_pos[1], interp_pos[2]);
-                    } else {
-                        fprintf(stderr, "Warning: DS_SAM_POSEMBED_FILE size mismatch, using interpolation\n");
-                        free(interp_pos);
-                        interp_pos = interpolate_pos_embed(pos_embed, src_grid, tgt_grid, DS_SAM_EMBED_DIM);
-                        pos_embed = interp_pos;
-                    }
+            /* Try loading precomputed pos_embed from model_dir (avoids C interpolation mismatch) */
+            char pe_path[1024];
+            snprintf(pe_path, sizeof(pe_path), "%s/pos_embed_%dx%d.bin", vt->model_dir, tgt_grid, tgt_grid);
+            FILE *pf = fopen(pe_path, "rb");
+            if (pf) {
+                interp_pos = (float *)malloc(tgt_grid * tgt_grid * DS_SAM_EMBED_DIM * sizeof(float));
+                size_t nread = fread(interp_pos, sizeof(float),
+                                      tgt_grid * tgt_grid * DS_SAM_EMBED_DIM, pf);
+                fclose(pf);
+                if ((int)nread == tgt_grid * tgt_grid * DS_SAM_EMBED_DIM) {
+                    pos_embed = interp_pos;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "Loaded precomputed pos_embed from %s (%dx%d)\n",
+                                pe_path, tgt_grid, tgt_grid);
                 } else {
+                    free(interp_pos);
                     interp_pos = interpolate_pos_embed(pos_embed, src_grid, tgt_grid, DS_SAM_EMBED_DIM);
                     pos_embed = interp_pos;
                 }
             } else {
+                /* Fallback to C bicubic interpolation */
                 interp_pos = interpolate_pos_embed(pos_embed, src_grid, tgt_grid, DS_SAM_EMBED_DIM);
                 pos_embed = interp_pos;
             }

@@ -184,6 +184,9 @@ typedef struct {
     /* Causal flow query embeddings (V2 only) */
     float *causal_query_embeddings;     /* [256, 896] for 1024x1024 input */
     float *causal_query_768_embeddings; /* [144, 896] for 768x768 input */
+
+    /* Model directory for loading precomputed interpolation files */
+    char model_dir[512];
 } ds_visual_tokenizer_t;
 
 /* ========================================================================
