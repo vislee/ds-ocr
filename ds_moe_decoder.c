@@ -518,6 +518,23 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         ds_bf16_matvec_pub(logits, x, dec->tok_embeddings_bf16, NULL, hidden, vocab);
     }
 
+    /* Debug: print top-5 logits for first few decode steps */
+    if (getenv("DS_DUMP_DECODER") && ctx->kv_cache_len < 670) {
+        int _top5_ids[5]; float _top5_vals[5];
+        for (int i = 0; i < 5; i++) { _top5_ids[i] = -1; _top5_vals[i] = -1e30f; }
+        for (int i = 0; i < vocab; i++) {
+            for (int j = 0; j < 5; j++) {
+                if (logits[i] > _top5_vals[j]) {
+                    for (int k = 4; k > j; k--) { _top5_vals[k] = _top5_vals[k-1]; _top5_ids[k] = _top5_ids[k-1]; }
+                    _top5_vals[j] = logits[i]; _top5_ids[j] = i; break;
+                }
+            }
+        }
+        fprintf(stderr, "Decode step kv=%d logits top-5: ", ctx->kv_cache_len);
+        for (int i = 0; i < 5; i++) fprintf(stderr, "[%d:%.2f] ", _top5_ids[i], _top5_vals[i]);
+        fprintf(stderr, "\n");
+    }
+
     /* Apply repetition penalty */
     float rp = ctx->repeat_penalty;
     if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {

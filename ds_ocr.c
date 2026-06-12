@@ -1164,19 +1164,29 @@ prompt_construction:
         }
 
         /* Apply Python model's masked_scatter layout:
-         * All 857 image positions (pos 1-857) are filled with local_enc[0:857].
-         * Encoder output layout: [local_crops(864), global(256), sep(1)] after projector.
-         * So encoder_output[0:864] = local features (n_local_enc=864 tokens).
-         * We only use local_enc[0:n_img_tokens] = local_enc[0:857].
-         * Global and sep are dropped (they don't fit in 857 positions). */
+         *
+         * Python constructs: tokenized_image = [global(256), sep(1), local(N)]
+         * These become True positions in images_seq_mask.
+         * Source for masked_scatter = cat([local_features, global_features, view_sep])
+         * So source = [local(n_local_enc), global(n_global_enc), sep(1)].
+         *
+         * masked_scatter fills True positions IN ORDER with source elements:
+         *   pos 0..255 (global slots)  <- source[0:256]  = local[0:256]
+         *   pos 256   (sep slot)       <- source[256]    = local[256]
+         *   pos 257..(n_img_tokens-1)  <- source[257:n_img_tokens]
+         *     = if n_img_tokens <= n_local_enc: local[257:n_img_tokens]
+         *     = if n_img_tokens >  n_local_enc: local[257:n_local_enc] + global[0:n_img_tokens-n_local_enc]
+         *
+         * Since encoder_output layout = [local, global, sep], we can simply copy
+         * encoder_output[0:n_img_tokens] which matches source[0:n_img_tokens]. */
         float *enc = encoder_output;
         int img_pos = pos;  /* starts at 1 (after BOS) */
 
-        /* Copy local_enc[0:n_img_tokens] = enc[0:857] into image positions 1-857 */
-        int n_copy = n_img_tokens < n_local_enc ? n_img_tokens : n_local_enc;
+        /* Copy source[0:n_img_tokens] = enc[0:n_img_tokens] into image positions */
+        int n_copy = n_img_tokens < n_encoder_tokens ? n_img_tokens : n_encoder_tokens;
         memcpy(input_embeds + img_pos * hidden, enc, n_copy * hidden * sizeof(float));
         img_pos += n_copy;
-        /* If n_img_tokens > n_local_enc (shouldn't happen with image_size=640),
+        /* If n_img_tokens > n_encoder_tokens (shouldn't happen),
          * remaining positions stay zero. */
         pos = img_pos;
 

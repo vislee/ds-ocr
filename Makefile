@@ -142,5 +142,11 @@ ds_moe_decoder.o: ds_moe_decoder.c ds_moe_decoder.h ds_kernels.h ds_safetensors.
 ds_tokenizer.o: ds_tokenizer.c ds_tokenizer.h
 ds_safetensors.o: ds_safetensors.c ds_safetensors.h
 main.o: main.c ds_ocr.h ds_kernels.h
+ifeq ($(UNAME_S),Darwin)
 ds_platform_ocr.o: ds_platform_ocr.m ds_platform_ocr.h
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
+else
+ds_platform_ocr.o: ds_platform_ocr.c ds_platform_ocr.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+endif
 test.o: test.c ds_ocr.h ds_kernels.h ds_safetensors.h ds_tokenizer.h ds_image.h

@@ -74,9 +74,9 @@ A pure C implementation of [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSee
                     │  MoE Decoder        │
                     │  DeepSeek3B-MoE     │
                     │  12 layers          │
-                    │  prefix: BOS + 857  │
-                    │  image + 4 text     │
-                    │  = 862 tokens       │
+                    │  Standard MHA       │
+                    │  (LLaMA-style RoPE) │
+                    │  10 heads, 10 KV    │
                     └─────────┬───────────┘
                               ▼
                           Text Output
@@ -129,8 +129,8 @@ DeepSeek-OCR V2 uses a multi-crop strategy for **all images** (including small o
 - **Layer 0**: Dense FFN (SwiGLU, intermediate=6848)
 - **Layers 1-11**: MoE — 64 routed experts (top-6) + 2 shared experts
 - MoE expert intermediate size = 896 (NOT 1536)
-- **Per-head Q/K RMSNorm** (not per-layer)
-- **RoPE**: Llama-style split-half (not interleaved), applied after Q/K RMSNorm
+- **Attention**: Standard MHA with LLaMA-style RoPE (use_mla=False, despite config suggesting MLA)
+- **KV heads = Q heads = 10** (NOT GQA; kv_lora_rank=None in config)
 - BOS=0, EOS=1 (not 1/2)
 
 ## Building
@@ -269,7 +269,8 @@ ds-ocr/
 ├── ds_kernels_avx.c          # x86 AVX2/AVX-512 optimized kernels
 ├── ds_safetensors.h/c        # Multi-shard safetensors reader (BF16 + FP32)
 ├── ds_image.h/c              # Image loading + preprocessing (via stb_image)
-├── ds_tokenizer.h/c          # Qwen2 BPE tokenizer (GPT-2 byte-level)
+├── ds_tokenizer.h/c          # Qwen2 BPE tokenizer (GPT-2 byte-level) + added_tokens
+├── ds_platform_ocr.h/c/m   # macOS Vision OCR bridge (.m=ObjC, .c=Linux stub)
 ├── ds_dump.h                 # Tensor dump utilities (debug, env: DS_DUMP_TENSORS)
 ├── main.c                    # CLI entry point
 ├── test.c                    # Test suite (run: make test)
@@ -376,9 +377,9 @@ Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 | **Encoder** | ✅ Working | ⚠️ Precision drift (SAM 12-layer corr 0.9997→0.994, amplified by DeepEncoder) |
 | **Projector** | ✅ Working | ✅ Working (linear 896→1280) |
 | **MoE Decoder** | ✅ Working | ✅ Verified (LLaMA-style RoPE, layer 0 attn_out corr=1.0 vs Python) |
-| **Tokenizer** | ✅ Working | ✅ Working (BPE encode verified, matches Python) |
+| **Tokenizer** | ✅ Working | ✅ Working (BPE encode + added_tokens decode verified, HTML table tags decoded) |
 | **Multi-crop** | N/A | ✅ Working (dynamic_preprocess, 6 crops + 1 global) |
-| **End-to-end OCR** | ✅ | ⚠️ Correct with Python encoder; C encoder has precision drift (SAM resize) |
+| **End-to-end OCR** | ✅ | ⚠️ Correct with Python encoder; C encoder has precision drift (SAM resize) → produces plausible first tokens but degrades after ~20 tokens |
 
 ### Precision Analysis (V2)
 
@@ -402,6 +403,7 @@ However, float32 arithmetic accumulates ~0.6% error across 12 SAM layers (corr: 
 
 1. **SAM input precision**: C uses stb_image resize (likely bilinear) while Python uses PIL bicubic with antialias. This causes pixel differences (max_diff ~0.086) that amplify through 12 SAM layers (225× magnification), degrading encoder output. With Python encoder output, decoder produces correct OCR text.
 2. **Encoding speed**: SAM+Encoder per crop ~5s (down from ~40s via BLAS attention + block rel_pos). Full V2 pipeline ~35s.
+3. **Decoder output quality**: First ~20 tokens are plausible (e.g., `<table>ParameterValue`), but output degrades into repetitive numbers/garbage due to encoder precision drift. This is structural — float32 in a 36-layer pipeline accumulates ~0.6% error.
 
 ## Model Support
 
@@ -419,7 +421,7 @@ However, float32 arithmetic accumulates ~0.6% error across 12 SAM layers (corr: 
 | MoE routing | Scatter/gather on GPU | Sequential expert evaluation |
 | Position embeddings | Dynamic computation | Precomputed RoPE tables (LLaMA rotate_half style) |
 | Image resize | PIL BICUBIC (antialias) | Antialias bicubic (filter expansion for downsampling) |
-| Tokenizer | HuggingFace tokenizers | Custom BPE (GPT-2 byte-level) |
+| Tokenizer | HuggingFace tokenizers | Custom BPE (GPT-2 byte-level) + added_tokens (HTML table tags) |
 | Dependencies | PyTorch, transformers, etc. | Only BLAS + stb_image |
 
 ## Credits

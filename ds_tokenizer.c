@@ -690,6 +690,80 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         }
     }
 
+    /* Load added_tokens from tokenizer.json (special tokens like <image>, <td>, etc.)
+     * These are in a top-level "added_tokens" array, separate from the vocab object. */
+    {
+        int n_added = 0;
+        const char *at = json;
+        /* Find "added_tokens" key */
+        while (*at) {
+            const char *found = strstr(at, "\"added_tokens\"");
+            if (!found) break;
+            /* Verify it's a top-level key (preceded by { or ,) */
+            const char *before = found - 1;
+            while (before > json && (*before == ' ' || *before == '\t' || *before == '\n' || *before == '\r'))
+                before--;
+            if (*before == '{' || *before == ',') {
+                at = found + strlen("\"added_tokens\"");
+                skip_ws(&at);
+                if (*at == ':') {
+                    at++;
+                    skip_ws(&at);
+                    if (*at == '[') {
+                        at++; /* skip [ */
+                        while (*at && *at != ']') {
+                            skip_ws(&at);
+                            if (*at == ']') break;
+                            if (*at == ',') { at++; continue; }
+                            if (*at != '{') { at++; continue; }
+                            at++; /* skip { */
+                            char at_content[4096] = {0};
+                            int64_t at_id = -1;
+                            while (*at && *at != '}') {
+                                skip_ws(&at);
+                                if (*at == '}') break;
+                                if (*at == ',') { at++; continue; }
+                                char at_key[256];
+                                if (parse_json_string(&at, at_key, sizeof(at_key)) != 0) { at++; continue; }
+                                skip_ws(&at);
+                                if (*at != ':') break;
+                                at++;
+                                skip_ws(&at);
+                                if (strcmp(at_key, "id") == 0) {
+                                    at_id = parse_json_int(&at);
+                                } else if (strcmp(at_key, "content") == 0) {
+                                    parse_json_string(&at, at_content, sizeof(at_content));
+                                } else {
+                                    /* Skip value: string, number, bool, null */
+                                    if (*at == '"') { char tmp[4096]; parse_json_string(&at, tmp, sizeof(tmp)); }
+                                    else if (*at == '-' || (*at >= '0' && *at <= '9')) parse_json_int(&at);
+                                    else { while (*at && *at != ',' && *at != '}') at++; }
+                                }
+                            }
+                            if (*at == '}') at++;
+                            if (at_id >= 0 && at_id < vocab_size && at_content[0]) {
+                                free(tok->id_to_text[(int)at_id]);
+                                free(tok->id_to_bpe[(int)at_id]);
+                                tok->id_to_bpe[(int)at_id] = strdup(at_content);
+                                /* Special tokens are stored as-is (not byte-level encoded) */
+                                tok->id_to_text[(int)at_id] = strdup(at_content);
+                                /* Update vocab_map for encoding */
+                                map_insert((str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap,
+                                           at_content, (int)at_id);
+                                n_added++;
+                            }
+                        }
+                    }
+                    break; /* processed added_tokens */
+                }
+            }
+            at = found + 1;
+        }
+        if (ds_verbose >= 1 && n_added > 0) {
+            fprintf(stderr, "Tokenizer: loaded %d added_tokens\n", n_added);
+        }
+    }
+
     char merges_path[1024];
     if (derive_merges_path(vocab_json_path, merges_path, sizeof(merges_path)) == 0) {
         if (load_merges_map(tok, merges_path) != 0 && ds_verbose >= 2) {
