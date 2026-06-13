@@ -70,14 +70,20 @@ static void layer_norm_2d(float *out, const float *in,
  * q_coords, k_coords: coordinates within the window
  * Returns bias value for this head and (q,k) pair
  */
+/* V2 rel_pos bias: computed as dot product between query and rel_pos embedding.
+ * Python's add_decomposed_rel_pos: bias = q @ Rh[idx] + q @ Rw[idx]
+ * rel_pos shape: [2*rel_size-1, head_dim], shared across heads.
+ * q_val: the query vector for this head at position (qy, qx), shape [head_dim].
+ * Returns: sum_d(q_val[d] * rel_pos[idx, d])
+ */
 static float get_rel_pos_v2(const float *rel_pos, int head_dim,
+                             const float *q_val,
                              int q_coord, int k_coord, int rel_size) {
     int rel_offset = q_coord - k_coord + rel_size - 1;
     if (rel_offset < 0 || rel_offset >= 2 * rel_size - 1) return 0.0f;
-    /* V2: shape [2*rel_size-1, head_dim] */
     const float *rp = rel_pos + rel_offset * head_dim;
     float sum = 0.0f;
-    for (int d = 0; d < head_dim; d++) sum += rp[d];
+    for (int d = 0; d < head_dim; d++) sum += q_val[d] * rp[d];  /* dot product */
     return sum;
 }
 
@@ -93,29 +99,38 @@ static float get_rel_pos_v1(const float *rel_pos, int n_heads, int head_dim,
 }
 
 /* Add relative position embedding to attention scores
- * V1: rel_pos_h/w shape [n_heads, head_dim, 2*window_h/w-1]
  * V2: rel_pos_h/w shape [2*window_h/w-1, head_dim] (shared across heads)
+ *   bias = sum_d(q[h, qi, d] * Rh[qi-ki+size-1, d]) + sum_d(q[h, qi, d] * Rw[qi-ki+size-1, d])
+ *   This is the decomposed relative position encoding from SAM/DeepSeek-OCR.
+ * V1: rel_pos_h/w shape [n_heads, head_dim, 2*window_h/w-1]
+ *   (Not used in V2 — kept for backward compat)
+ *
+ * q: query tensor, shape [n_heads * seq_len * head_dim] in (heads, seq, dim) layout
+ *    For V2: q[h * seq_len * head_dim + qi * head_dim + d]
  */
 static void add_rel_pos_bias(float *attn_scores, int n_heads,
                               int q_h, int q_w, int k_h, int k_w,
                               const float *rel_pos_h, const float *rel_pos_w,
-                              int head_dim, int is_v2) {
+                              int head_dim, int is_v2,
+                              const float *q) {
+    int seq_len = q_h * q_w;
     for (int h = 0; h < n_heads; h++) {
-        for (int qi = 0; qi < q_h * q_w; qi++) {
+        for (int qi = 0; qi < seq_len; qi++) {
             int qy = qi / q_w;
             int qx = qi % q_w;
+            const float *q_val = q + (size_t)h * seq_len * head_dim + qi * head_dim;
             for (int ki = 0; ki < k_h * k_w; ki++) {
                 int ky = ki / k_w;
                 int kx = ki % k_w;
                 float bias;
                 if (is_v2) {
-                    bias = get_rel_pos_v2(rel_pos_h, head_dim, qy, ky, q_h)
-                         + get_rel_pos_v2(rel_pos_w, head_dim, qx, kx, q_w);
+                    bias = get_rel_pos_v2(rel_pos_h, head_dim, q_val, qy, ky, q_h)
+                         + get_rel_pos_v2(rel_pos_w, head_dim, q_val, qx, kx, q_w);
                 } else {
                     bias = get_rel_pos_v1(rel_pos_h, n_heads, head_dim, qy, ky, q_h, h)
                          + get_rel_pos_v1(rel_pos_w, n_heads, head_dim, qx, kx, q_w, h);
                 }
-                attn_scores[(size_t)h * q_h * q_w * k_h * k_w + qi * k_h * k_w + ki] += bias;
+                attn_scores[(size_t)h * seq_len * seq_len + qi * seq_len + ki] += bias;
             }
         }
     }

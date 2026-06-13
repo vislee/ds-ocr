@@ -717,6 +717,19 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             ds_image_free(global_img);
             if (!global_sam) return NULL;
 
+            /* Dump SAM tokens and encoder output for debugging (DS_DUMP_DIR env var) */
+            {
+                const char *dump_dir = getenv("DS_DUMP_DIR");
+                if (dump_dir) {
+                    char path[512];
+                    int sam_dim = ctx->config.sam_ds2_dim;  /* 896 for V2 */
+                    snprintf(path, sizeof(path), "%s/sam_tokens_global.bin", dump_dir);
+                    FILE *f = fopen(path, "wb");
+                    if (f) { fwrite(global_sam, sizeof(float), n_sam_tokens * sam_dim, f); fclose(f);
+                        if (ds_verbose >= 1) fprintf(stderr, "Dumped SAM tokens (%d x %d) to %s\n", n_sam_tokens, sam_dim, path); }
+                }
+            }
+
             int n_global_enc;
             float *global_enc = ds_encoder_forward_v2(ctx, global_sam, n_sam_tokens,
                                                        &n_global_enc, 256,
@@ -738,6 +751,18 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 memset(encoder_output + n_global_enc * hidden, 0, hidden * sizeof(float));
             }
             free(global_enc);
+
+            /* Dump encoder output for debugging (DS_DUMP_DIR env var) */
+            {
+                const char *dump_dir = getenv("DS_DUMP_DIR");
+                if (dump_dir) {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/encoder_output_global.bin", dump_dir);
+                    FILE *f = fopen(path, "wb");
+                    if (f) { fwrite(encoder_output, sizeof(float), n_encoder_tokens * hidden, f); fclose(f);
+                        if (ds_verbose >= 1) fprintf(stderr, "Dumped encoder output (%d) to %s\n", n_encoder_tokens, path); }
+                }
+            }
         } else {
             /* Large image: multi-crop encoding */
             if (ds_verbose >= 1)
