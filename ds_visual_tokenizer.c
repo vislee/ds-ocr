@@ -702,35 +702,51 @@ static void sam_layer_forward(float *out, const float *x,
 #endif
         }
 
-        free(scores);
     } else {
-        /* Window attention: partition into windows (with padding), attend within each */
+        /* Window attention: partition into windows (with padding), attend within each.
+         * Python's order: norm1 -> pad -> window_partition -> QKV -> attn -> window_unpartition
+         * We must pad x_norm first, then compute QKV on the padded data,
+         * so that padded positions get QKV(0) = qkv_b (non-zero), matching Python.
+         * Previously we computed QKV on unpadded data then padded Q/K/V with zeros,
+         * which caused real tokens near the padding boundary to have different
+         * attention scores (diff max=0.209 at Block 0). */
         int n_windows, padded_h, padded_w;
-        float *win_Q = window_partition_pad(Q, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
-        float *win_K = window_partition_pad(K, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
-        float *win_V = window_partition_pad(V, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
-
+        float *padded_x = window_partition_pad(x_norm, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
         int win_tokens = win_size * win_size;
+
         float *win_attn = (float *)calloc((size_t)n_windows * win_tokens * dim, sizeof(float));
 
         for (int w = 0; w < n_windows; w++) {
-            float *wq = win_Q + (size_t)w * win_tokens * dim;
-            float *wk = win_K + (size_t)w * win_tokens * dim;
-            float *wv = win_V + (size_t)w * win_tokens * dim;
-            float *wout = win_attn + (size_t)w * win_tokens * dim;
+            float *wx = padded_x + (size_t)w * win_tokens * dim;
 
-            window_attn_forward(wout, wq, wk, wv, win_tokens, n_heads, head_dim,
+            /* QKV projection for this window (on padded data, matching Python) */
+            float *wqkv = (float *)malloc((size_t)win_tokens * 3 * dim * sizeof(float));
+            ds_linear(wqkv, wx, qkv_w, qkv_b, win_tokens, dim, 3 * dim);
+
+            float *wQ = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
+            float *wK = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
+            float *wV = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
+            for (int s = 0; s < win_tokens; s++) {
+                memcpy(wQ + s * dim, wqkv + s * 3 * dim, dim * sizeof(float));
+                memcpy(wK + s * dim, wqkv + s * 3 * dim + dim, dim * sizeof(float));
+                memcpy(wV + s * dim, wqkv + s * 3 * dim + 2 * dim, dim * sizeof(float));
+            }
+            free(wqkv);
+
+            float *wout = win_attn + (size_t)w * win_tokens * dim;
+            window_attn_forward(wout, wQ, wK, wV, win_tokens, n_heads, head_dim,
                                 rel_h, rel_w, win_size, win_size);
+
+            free(wQ); free(wK); free(wV);
         }
+        free(padded_x);
 
         /* Unpartition back to full sequence (removes padding) */
         window_unpartition_pad(attn_out, seq_h, seq_w, win_size, dim, padded_h, padded_w, win_attn);
-
-        free(win_Q); free(win_K); free(win_V); free(win_attn);
+        free(win_attn);
     }
 
     free(Q); free(K); free(V);
-
     /* Output projection + residual */
     float *proj_out = (float *)malloc(seq_len * dim * sizeof(float));
     ds_linear(proj_out, attn_out, proj_w, proj_b, seq_len, dim, dim);
@@ -787,11 +803,34 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
     ds_conv2d(conv1_out, spatial, vt->sam_neck_conv1_weight, vt->sam_neck_conv1_bias,
               c_in, c_mid, h, w, 1, 1, 1, 0);
 
+    /* DUMP: after conv1 */
+    if (getenv("DS_DUMP_SAM_LAYERS")) {
+        FILE *f = fopen("dump/c_neck_after_conv1.bin", "wb");
+        if (f) { fwrite(conv1_out, sizeof(float), c_mid * spatial_sz, f); fclose(f); }
+        /* DUMP: conv1 weight for debugging */
+        f = fopen("dump/c_neck_conv1_weight.bin", "wb");
+        if (f) { fwrite(vt->sam_neck_conv1_weight, sizeof(float), 256 * 768 * 1 * 1, f); fclose(f); }
+        /* DUMP: conv2 weight for debugging */
+        f = fopen("dump/c_neck_conv2_weight.bin", "wb");
+        if (f) { fwrite(vt->sam_neck_conv2_weight, sizeof(float), 256 * 256 * 3 * 3, f); fclose(f); }
+        /* DUMP: ln1 weight/bias */
+        f = fopen("dump/c_neck_ln1_weight.bin", "wb");
+        if (f) { fwrite(vt->sam_neck_ln1_weight, sizeof(float), 256, f); fclose(f); }
+        f = fopen("dump/c_neck_ln1_bias.bin", "wb");
+        if (f) { fwrite(vt->sam_neck_ln1_bias, sizeof(float), 256, f); fclose(f); }
+    }
+
     /* LayerNorm2d after conv1 */
     float *ln1_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
     layer_norm_2d(ln1_out, conv1_out, vt->sam_neck_ln1_weight, vt->sam_neck_ln1_bias,
                   c_mid, spatial_sz);
     free(conv1_out);
+
+    /* DUMP: after ln1 */
+    if (getenv("DS_DUMP_SAM_LAYERS")) {
+        FILE *f = fopen("dump/c_neck_after_ln1.bin", "wb");
+        if (f) { fwrite(ln1_out, sizeof(float), c_mid * spatial_sz, f); fclose(f); }
+    }
 
     /* Neck conv2: [256, h, w] → [256, h, w]
      * V1: 1×1 conv, no padding
@@ -804,12 +843,19 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
         ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
                   c_mid, c_mid, h, w, 1, 1, 1, 0);
     }
+    free(ln1_out);
+
+    /* DUMP: after conv2 */
+    if (getenv("DS_DUMP_SAM_LAYERS")) {
+        FILE *f = fopen("dump/c_neck_after_conv2.bin", "wb");
+        if (f) { fwrite(conv2_out, sizeof(float), c_mid * spatial_sz, f); fclose(f); }
+    }
 
     /* LayerNorm2d after conv2 */
     float *ln2_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
     layer_norm_2d(ln2_out, conv2_out, vt->sam_neck_ln2_weight, vt->sam_neck_ln2_bias,
                   c_mid, spatial_sz);
-    free(conv2_out); free(ln1_out);
+    free(conv2_out);
 
     return ln2_out;
 }
@@ -1192,6 +1238,14 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     float *neck_out = sam_neck_forward(spatial, grid_h, grid_w, vt);
     free(spatial);
 
+    /* Dump neck output for debugging */
+    if (getenv("DS_DUMP_SAM_LAYERS")) {
+        char fname[256];
+        snprintf(fname, sizeof(fname), "dump/c_sam_crop%d_neck_out.bin", _sam_call_idx);
+        FILE *f = fopen(fname, "wb");
+        if (f) { fwrite(neck_out, sizeof(float), 256 * n_patches, f); fclose(f); }
+    }
+
     /* SAM downsample: [256, H, W] -> [512, H/2, W/2] -> [ds2_dim, H/4, W/4] */
     int ds_h, ds_w;
     int ds2_dim = cfg->sam_ds2_dim;
@@ -1199,6 +1253,14 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     free(neck_out);
 
     int ds_spatial = ds_h * ds_w;
+
+    /* Dump downsample output for debugging */
+    if (getenv("DS_DUMP_SAM_LAYERS")) {
+        char fname[256];
+        snprintf(fname, sizeof(fname), "dump/c_sam_crop%d_downsample_out.bin", _sam_call_idx);
+        FILE *f = fopen(fname, "wb");
+        if (f) { fwrite(ds_out, sizeof(float), ds2_dim * ds_spatial, f); fclose(f); }
+    }
 
     /* Convert [ds2_dim, ds_h*ds_w] -> [ds_h*ds_w, ds2_dim] for downstream use */
     float *tokens = (float *)malloc(ds_spatial * ds2_dim * sizeof(float));
@@ -1230,6 +1292,7 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
 float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
                              int *out_n_tokens, float **out_patch_embeds) {
     if (!img || !img->pixels) return NULL;
+    g_sam_is_v2 = (ctx->config.model_version == 2);
     float *image_chw = ds_image_to_float_chw(img);
     if (!image_chw) return NULL;
 

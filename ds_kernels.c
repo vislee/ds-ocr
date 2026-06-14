@@ -872,6 +872,21 @@ void ds_conv2d(float *out, const float *in, const float *weight, const float *bi
     float *cols = (float *)malloc((size_t)patch_size * spatial_out * sizeof(float));
     im2col(in, cols, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
 
+    /* DEBUG: dump im2col for any 3x3 s1 conv with c_in=256 */
+    {
+        static int _conv2d_call_count = 0;
+        _conv2d_call_count++;
+        if (getenv("DS_DUMP_CONV2_IM2COL")) {
+            fprintf(stderr, "[DUMP] ds_conv2d call #%d: c_in=%d c_out=%d h=%d w=%d kh=%d kw=%d s=%d p=%d h_out=%d w_out=%d\n",
+                    _conv2d_call_count, c_in, c_out, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
+            if (c_in == 256 && c_out == 256 && kh == 3 && stride == 1 && padding == 1) {
+                FILE *df = fopen("dump/c_conv2_im2col.bin", "wb");
+                if (df) { fwrite(cols, sizeof(float), (size_t)patch_size * spatial_out, df); fclose(df); }
+                fprintf(stderr, "[DUMP] *** neck conv2 im2col saved: %d x %d ***\n", patch_size, spatial_out);
+            }
+        }
+    }
+
     /* GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] = out[c_out, spatial_out] */
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,

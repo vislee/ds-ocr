@@ -112,8 +112,11 @@ DeepSeek-OCR V2 uses a multi-crop strategy for **all images** (including small o
 - **12 transformer blocks** with window attention (window_size=14)
 - **Global attention** at layers [2, 5, 8, 11] (full bidirectional)
 - **Fused QKV** projection (not separate Q/K/V)
+- **Window attention**: pad→partition→QKV→attn→unpartition (matching Python's order; padded positions get non-zero QKV from bias)
 - **Relative position embeddings** (`rel_pos_h`, `rel_pos_w`)
-- **Neck**: 2×(Conv2d 1×1 + LayerNorm2d): 768→256→256
+- **Neck**:
+  - V1: 2×(Conv2d 1×1 + LayerNorm2d): 768→256→256
+  - V2: Conv2d(768→256, 1×1) + LN + Conv2d(256→256, 3×3, s1, p1) + LN
 - **Downsample (V1)**: net_2 Conv2d(256→512, k3, s2, p1) + net_3 Conv2d(512→1024, k3, s2, p1)
 - **Downsample (V2)**: net_2 Conv2d(256→512, k3, s2, p1) + net_3 Conv2d(512→896, k3, s2, p1)
 
@@ -289,7 +292,9 @@ The engine supports various `DS_*` environment variables for debugging and devel
 | `DS_DUMP_TENSORS` | Enable tensor dumping at key pipeline stages |
 | `DS_DUMP_FIRST_CROP` | Dump only the first crop's SAM output |
 | `DS_DUMP_PATCH_EMBED` | Dump SAM patch embedding output |
-| `DS_DUMP_SAM_LAYERS` | Dump per-layer SAM attention/output (crop 0 only) |
+| `DS_DUMP_SAM_LAYERS` | Dump per-layer SAM attention/output + neck + downsample (crop 0 only) |
+| `DS_DUMP_CONV2_IM2COL` | Dump im2col buffers from ds_conv2d (for neck conv debug) |
+| `DS_DUMP_DIR` | Custom directory for SAM/encoder dump output |
 | `DS_SAM_POSEMBED_FILE` | Override SAM position embedding (skip interpolation) |
 | `DS_DUMP_ENCODER` | Dump encoder output |
 | `DS_DUMP_INPUT_EMBEDS` | Dump final input embeddings (after projector) |
@@ -300,6 +305,7 @@ The engine supports various `DS_*` environment variables for debugging and devel
 | `DS_SKIP_ENCODER` | Skip encoder, load embeddings from file |
 | `DS_LOAD_INPUT_EMBEDS` | Load Python reference inputs_embeds for decoder debugging |
 | `DS_LOAD_ENCODER_OUTPUT` | Load Python reference encoder output (skip SAM+encoder) |
+| `DS_LOAD_ENC_INPUT` | Load Python reference encoder input per crop (skip SAM, keep encoder) |
 | `DS_LOAD_SAM_TOKENS` | Load Python reference SAM tokens (skip SAM, keep encoder) |
 | `DS_LOAD_PIL_PIXELS` | Load PIL-preprocessed pixels from dump/ (bypass C resize) |
 | `DS_BF16_CACHE_MB` | Set BF16 weight cache size (MB) |
@@ -373,8 +379,8 @@ Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 
 | Component | V1 | V2 |
 |-----------|----|----|
-| **SAM Vision Tokenizer** | ✅ Working | ✅ Verified (patch_embed corr=1.0, all block components match Python) |
-| **Encoder** | ✅ Working | ⚠️ Precision drift (SAM 12-layer corr 0.9997→0.994, amplified by DeepEncoder) |
+| **SAM Vision Tokenizer** | ✅ Working | ✅ Verified (patch_embed corr=1.0, all block components match Python, window pad-order fixed) |
+| **Encoder** | ✅ Working | ⚠️ Precision drift (SAM 12-layer corr still <1.0 due to BF16 weights + float32 accumulation, amplified by DeepEncoder) |
 | **Projector** | ✅ Working | ✅ Working (linear 896→1280) |
 | **MoE Decoder** | ✅ Working | ✅ Verified (LLaMA-style RoPE, layer 0 attn_out corr=1.0 vs Python) |
 | **Tokenizer** | ✅ Working | ✅ Working (BPE encode + added_tokens decode verified, HTML table tags decoded) |
@@ -401,10 +407,11 @@ However, float32 arithmetic accumulates ~0.6% error across 12 SAM layers (corr: 
 
 ### Known Issues (V2)
 
-1. **SAM encoder precision**: C's SAM+Encoder produces different output from Python due to BF16 weight quantization and numerical accumulation differences in QK^T matmul (BLAS sgemm vs PyTorch SDPA). After pos_embed diff=0.059 (BF16), Block 0 diff=0.209, final SAM diff=2.4, total encoder diff=1.85. This amplifies through the decoder into garbage output. **Using Python-generated encoder output via `DS_LOAD_ENCODER_OUTPUT` produces correct OCR text** (verified: "Hello World 123" ✓).
+1. **SAM encoder precision**: C's SAM+Encoder produces different output from Python due to BF16 weight quantization and numerical accumulation differences in QK^T matmul (BLAS sgemm vs PyTorch SDPA). The window attention pad-order fix (pad→QKV instead of QKV→zero-pad) reduced Block 0 diff from 0.209, but residual float32 accumulation drift remains across 12 layers. This amplifies through the 24-layer DeepEncoder and into the decoder. **Using Python-generated encoder output via `DS_LOAD_ENCODER_OUTPUT` produces correct OCR text** (verified: "Hello World 123" ✓).
 2. **Encoding speed**: SAM+Encoder per crop ~5s (down from ~40s via BLAS attention + block rel_pos). Full V2 pipeline ~35s. With Python encoder cache: ~10s for Python preprocessing + ~2s for C decoder.
 3. **Python encoder cache**: Use `gen_encoder_cache.py` to precompute encoder output from Python, then load via `DS_LOAD_ENCODER_OUTPUT=encoder_cache/image.bin ./ds_ocr ...`. This provides production-quality OCR output while the C encoder precision is being improved.
 4. **Precomputed tensors**: To reduce interpolation errors, the C code auto-loads `pos_embed_48x48.bin` and `rel_pos_*_size95.bin` from the model directory (generated by Python). If these files are missing, C falls back to its own bicubic interpolation (now fixed: a=-0.5 Keys cubic + correct antialias operator precedence).
+5. **Window attention pad-order**: Previously computed QKV on unpadded data then zero-padded Q/K/V before window attention. This mismatched Python (which pads input first, then computes QKV on padded data so padding tokens get non-zero QKV from bias). Fixed in current code — window attention now pads `x_norm` first, then computes QKV per window, matching Python's behavior and reducing boundary token attention errors.
 
 ## Model Support
 
@@ -418,9 +425,10 @@ However, float32 arithmetic accumulates ~0.6% error across 12 SAM layers (corr: 
 | Feature | Python (PyTorch) | This Implementation (C) |
 |---------|-------------------|------------------------|
 | Weight format | Full FP32/BF16 tensors | Memory-mapped BF16 (zero-copy) |
-| Attention | FlashAttention / SDPA | Online softmax (no O(seq²) memory) |
+| Attention | FlashAttention / SDPA | Online softmax (no O(seq²) memory), window attn: pad→QKV→attn (matches Python) |
 | MoE routing | Scatter/gather on GPU | Sequential expert evaluation |
 | Position embeddings | Dynamic computation | Precomputed RoPE tables (LLaMA rotate_half style) |
+| SAM Neck conv2 | 1×1 conv (V1) / 3×3 conv (V2) | V2: 3×3 s1 p1 conv (controlled by `g_sam_is_v2`) |
 | Image resize | PIL BICUBIC (antialias) | Antialias bicubic (filter expansion for downsampling) |
 | Tokenizer | HuggingFace tokenizers | Custom BPE (GPT-2 byte-level) + added_tokens (HTML table tags) |
 | Dependencies | PyTorch, transformers, etc. | Only BLAS + stb_image |
