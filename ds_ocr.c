@@ -474,7 +474,7 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->max_new_tokens = 4096;
     ctx->temperature = 0.0f; /* Greedy by default */
     ctx->repeat_penalty = 1.0f; /* No penalty by default */
-    ctx->no_repeat_ngram_size = 20; /* Match Python default */
+    ctx->no_repeat_ngram_size = 35; /* Match Python eval_mode default */
 
     return 0;
 }
@@ -1337,21 +1337,49 @@ prompt_construction:
      * logits. We do the same: prefill prefix_len tokens, then use prefill logits
      * for first generated token, then decode subsequent tokens. */
     int first_token = -1;
+    const char *slow_prefill = getenv("DS_SLOW_PREFILL");
     if (prefix_len > 1) {
-        ds_decoder_prefill(ctx, input_embeds, prefix_len);
-        /* Use prefill logits for first token selection */
-        if (ctx->dec_logits) {
-            float *logits = ctx->dec_logits;
-            int vocab = cfg->vocab_size;
-            /* Simple argmax for first token */
-            float best_val = -1e30f;
-            int best_id = 0;
-            for (int i = 0; i < vocab; i++) {
-                if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
-            }
-            first_token = best_id;
+        if (slow_prefill) {
+            /* Token-by-token prefill: process each prefix token individually
+             * using the single-token decode path. This is slow but avoids
+             * potential bugs in batched prefill. */
             if (ds_verbose >= 1)
-                fprintf(stderr, "Prefill first token=%d (from prefill logits, %.3f)\n", first_token, best_val);
+                fprintf(stderr, "Slow prefill: %d tokens one-by-one...\n", prefix_len);
+            for (int i = 0; i < prefix_len; i++) {
+                memcpy(dec_input, input_embeds + i * hidden, hidden * sizeof(float));
+                int tok = ds_decoder_forward(ctx, dec_input);
+                if (i == prefix_len - 1) {
+                    /* Last prefix token — use its logits for first generated token */
+                    if (ctx->dec_logits) {
+                        float *logits = ctx->dec_logits;
+                        int vocab = cfg->vocab_size;
+                        float best_val = -1e30f;
+                        int best_id = 0;
+                        for (int v = 0; v < vocab; v++) {
+                            if (logits[v] > best_val) { best_val = logits[v]; best_id = v; }
+                        }
+                        first_token = best_id;
+                    }
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "Slow prefill done, first token=%d\n", first_token);
+                }
+            }
+        } else {
+            ds_decoder_prefill(ctx, input_embeds, prefix_len);
+            /* Use prefill logits for first token selection */
+            if (ctx->dec_logits) {
+                float *logits = ctx->dec_logits;
+                int vocab = cfg->vocab_size;
+                /* Simple argmax for first token */
+                float best_val = -1e30f;
+                int best_id = 0;
+                for (int i = 0; i < vocab; i++) {
+                    if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
+                }
+                first_token = best_id;
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "Prefill first token=%d (from prefill logits, %.3f)\n", first_token, best_val);
+            }
         }
     } else {
         /* Single token: use it directly */
