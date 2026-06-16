@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 
 int ds_verbose = 1;
+int g_dump_crop_id = -1;  /* Crop ID for per-crop dumps */
 
 /* ========================================================================
  * Timing Helper
@@ -713,9 +714,38 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             if (!global_img) return NULL;
 
             int n_sam_tokens;
+            g_dump_crop_id = 6;  /* Global crop uses ID 6 */
             float *global_sam = ds_sam_forward_image(ctx, global_img, &n_sam_tokens, NULL);
             ds_image_free(global_img);
             if (!global_sam) return NULL;
+
+            /* Override global SAM tokens with Python reference if DS_LOAD_SAM_ALL set */
+            {
+                const char *load_sam_all = getenv("DS_LOAD_SAM_ALL");
+                if (load_sam_all) {
+                    char auto_path[512];
+                    snprintf(auto_path, sizeof(auto_path), "%s6.bin", load_sam_all);
+                    FILE *sf = fopen(auto_path, "rb");
+                    if (sf) {
+                        int n_read = (int)fread(global_sam, sizeof(float), n_sam_tokens * 896, sf);
+                        fclose(sf);
+                        fprintf(stderr, "DS_LOAD_SAM: global crop loaded %d floats from %s (expected %d)\n",
+                                n_read, auto_path, n_sam_tokens * 896);
+                    } else {
+                        /* Try python_sam_global.bin as fallback */
+                        snprintf(auto_path, sizeof(auto_path), "%sglobal.bin", load_sam_all);
+                        FILE *sf2 = fopen(auto_path, "rb");
+                        if (sf2) {
+                            int n_read = (int)fread(global_sam, sizeof(float), n_sam_tokens * 896, sf2);
+                            fclose(sf2);
+                            fprintf(stderr, "DS_LOAD_SAM: global crop loaded %d floats from %s (expected %d)\n",
+                                    n_read, auto_path, n_sam_tokens * 896);
+                        } else {
+                            fprintf(stderr, "Warning: DS_LOAD_SAM_ALL global not found (tried crop6 and global)\n");
+                        }
+                    }
+                }
+            }
 
             /* Dump SAM tokens and encoder output for debugging (DS_DUMP_DIR env var) */
             {
@@ -774,6 +804,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             int local_token_count = 0;
 
             for (int i = 0; i < n_crops; i++) {  /* all are 768x768 local crops */
+                g_dump_crop_id = i;  /* Set crop ID for per-crop tensor dumps */
                 if (ds_verbose >= 1)
                     fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
 
@@ -787,25 +818,37 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                     goto cleanup_crops;
                 }
 
-                /* Dump SAM output for first crop if DS_DUMP_TENSORS set */
-                if (i == 0 && getenv("DS_DUMP_TENSORS")) {
-                    FILE *df = fopen("dump/local_crop0_sam_output.bin", "wb");
+                /* Dump SAM output for each crop if DS_DUMP_TENSORS set */
+                if (getenv("DS_DUMP_TENSORS")) {
+                    char sam_path[256];
+                    snprintf(sam_path, sizeof(sam_path), "dump/c_sam_crop%d.bin", i);
+                    FILE *df = fopen(sam_path, "wb");
                     if (df) { fwrite(sam_tokens, sizeof(float), n_sam_tokens * 896, df); fclose(df); }
                 }
 
-                /* Optional: override SAM tokens with Python reference for encoder-only debugging.
-                 * DS_LOAD_SAM_TOKENS=dump/py_sam_tokens_crop0.bin loads [144, 896] float32 */
-                if (i == 0) {
-                    const char *load_sam = getenv("DS_LOAD_SAM_TOKENS");
-                    if (load_sam) {
-                        FILE *sf = fopen(load_sam, "rb");
+                /* Override SAM tokens with Python reference for encoder-only debugging.
+                 * DS_LOAD_SAM_TOKENS=dump/py_sam_tokens_crop0.bin loads [144, 896] float32 (crop 0 only)
+                 * DS_LOAD_SAM_ALL=dump/python_sam_crop loads [144, 896] per crop (appends {i}.bin) */
+                {
+                    const char *load_sam_all = getenv("DS_LOAD_SAM_ALL");
+                    const char *load_sam = (i == 0) ? getenv("DS_LOAD_SAM_TOKENS") : NULL;
+                    const char *path_to_load = NULL;
+                    char auto_path[512];
+                    if (load_sam_all) {
+                        snprintf(auto_path, sizeof(auto_path), "%s%d.bin", load_sam_all, i);
+                        path_to_load = auto_path;
+                    } else if (load_sam) {
+                        path_to_load = load_sam;
+                    }
+                    if (path_to_load) {
+                        FILE *sf = fopen(path_to_load, "rb");
                         if (sf) {
                             int n_read = (int)fread(sam_tokens, sizeof(float), n_sam_tokens * 896, sf);
                             fclose(sf);
-                            fprintf(stderr, "DS_LOAD_SAM_TOKENS: loaded %d floats from %s (expected %d)\n",
-                                    n_read, load_sam, n_sam_tokens * 896);
+                            fprintf(stderr, "DS_LOAD_SAM: crop %d loaded %d floats from %s (expected %d)\n",
+                                    i, n_read, path_to_load, n_sam_tokens * 896);
                         } else {
-                            fprintf(stderr, "Warning: DS_LOAD_SAM_TOKENS=%s not found\n", load_sam);
+                            fprintf(stderr, "Warning: DS_LOAD_SAM %s not found\n", path_to_load);
                         }
                     }
                 }
@@ -858,6 +901,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
              * We need to pad the original image to 1024x1024 separately. */
             if (ds_verbose >= 1)
                 fprintf(stderr, "Encoding global image (1024x1024)\n");
+                g_dump_crop_id = 6;  /* Global crop uses ID 6 */
 
             ds_image_t *global_img = NULL;
             if (pil_pixels) {
@@ -907,6 +951,29 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 fprintf(stderr, "SAM forward failed for global image\n");
                 free(local_features);
                 goto cleanup_crops;
+            }
+
+            /* Override global SAM tokens with Python reference if DS_LOAD_SAM_ALL set */
+            {
+                const char *load_sam_all = getenv("DS_LOAD_SAM_ALL");
+                if (load_sam_all) {
+                    char auto_path[512];
+                    /* Try crop6 first, then global */
+                    snprintf(auto_path, sizeof(auto_path), "%s6.bin", load_sam_all);
+                    FILE *sf = fopen(auto_path, "rb");
+                    if (!sf) {
+                        snprintf(auto_path, sizeof(auto_path), "%sglobal.bin", load_sam_all);
+                        sf = fopen(auto_path, "rb");
+                    }
+                    if (sf) {
+                        int n_read = (int)fread(global_sam_tokens, sizeof(float), n_global_sam_tokens * 896, sf);
+                        fclose(sf);
+                        fprintf(stderr, "DS_LOAD_SAM: global crop loaded %d floats from %s (expected %d)\n",
+                                n_read, auto_path, n_global_sam_tokens * 896);
+                    } else {
+                        fprintf(stderr, "Warning: DS_LOAD_SAM_ALL global not found\n");
+                    }
+                }
             }
 
             int n_global_enc_tokens;

@@ -37,3 +37,5 @@ AGENTS.md
 # OS files
 .DS_Store
 encoder_cache/
+CLAUDE.md
+*.jpg

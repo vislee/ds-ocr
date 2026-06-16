@@ -16,6 +16,7 @@
 
 /* Global dump flag, checked once at startup */
 static int g_dump_tensors = -1;  /* -1 = not yet checked */
+extern int g_dump_crop_id;       /* Crop ID for per-crop dumps, -1 = no crop prefix. Defined in ds_ocr.c */
 
 static int ds_dump_enabled(void) {
     if (g_dump_tensors == -1) {
@@ -66,7 +67,10 @@ static void ds_dump_tensor(const char *name, const float *data, int n,
 
     /* Also write binary .bin file for exact comparison */
     char fname[256];
-    snprintf(fname, sizeof(fname), "dump/%s.bin", name);
+    if (g_dump_crop_id >= 0)
+        snprintf(fname, sizeof(fname), "dump/crop%d_%s.bin", g_dump_crop_id, name);
+    else
+        snprintf(fname, sizeof(fname), "dump/%s.bin", name);
     FILE *f = fopen(fname, "wb");
     if (f) {
         fwrite(data, sizeof(float), n, f);

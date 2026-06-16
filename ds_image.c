@@ -12,8 +12,63 @@
 #include <string.h>
 #include <math.h>
 
+#if defined(__APPLE__) && defined(USE_APPLE_VISION)
+#include <CoreGraphics/CoreGraphics.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <ImageIO/ImageIO.h>
+#endif
+
 ds_image_t *ds_image_load(const char *path) {
-    int w, h, channels;
+#if defined(__APPLE__) && defined(USE_APPLE_VISION)
+    /* Use CoreGraphics for image loading — matches PIL's JPEG/PNG decoder */
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), FALSE);
+    if (!url) goto fallback_stb;
+    CGImageSourceRef source = CGImageSourceCreateWithURL(url, NULL);
+    CFRelease(url);
+    if (!source) goto fallback_stb;
+    CGImageRef cg_img = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!cg_img) goto fallback_stb;
+
+    int w = (int)CGImageGetWidth(cg_img);
+    int h = (int)CGImageGetHeight(cg_img);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) { CGImageRelease(cg_img); goto fallback_stb; }
+
+    /* Create RGBA bitmap */
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, cs,
+        kCGImageAlphaNoneSkipLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { CGImageRelease(cg_img); goto fallback_stb; }
+
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg_img);
+    unsigned char *rgba = (unsigned char *)CGBitmapContextGetData(ctx);
+
+    /* Convert RGBA → RGB */
+    unsigned char *rgb = (unsigned char *)malloc(w * h * 3);
+    if (!rgb) { CGContextRelease(ctx); CGImageRelease(cg_img); return NULL; }
+    for (int i = 0; i < w * h; i++) {
+        rgb[i*3+0] = rgba[i*4+0];
+        rgb[i*3+1] = rgba[i*4+1];
+        rgb[i*3+2] = rgba[i*4+2];
+    }
+    CGContextRelease(ctx);
+    CGImageRelease(cg_img);
+
+    ds_image_t *img = (ds_image_t *)calloc(1, sizeof(ds_image_t));
+    if (!img) { free(rgb); return NULL; }
+    img->pixels = rgb;
+    img->width = w;
+    img->height = h;
+    img->channels = 3;
+    img->owns_stb = 0;
+    if (ds_verbose >= 2)
+        fprintf(stderr, "Loaded image (CG): %s (%dx%d)\n", path, w, h);
+    return img;
+
+fallback_stb:
+#endif
+    { int w, h, channels;
     unsigned char *data = stbi_load(path, &w, &h, &channels, 3); /* Force 3 channels (RGB) */
     if (!data) {
         fprintf(stderr, "ds_image_load: failed to load '%s': %s\n", path, stbi_failure_reason());
@@ -33,6 +88,7 @@ ds_image_t *ds_image_load(const char *path) {
         fprintf(stderr, "Loaded image: %s (%dx%d, %d channels)\n", path, w, h, channels);
 
     return img;
+    }
 }
 
 /* Bicubic interpolation kernel (Keys cubic, a=-0.5).
@@ -107,32 +163,84 @@ static inline float ds_bicuberp_aa(const unsigned char *src, int src_w, int src_
 ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_height) {
     if (!img || !img->pixels) return NULL;
 
+#if defined(__APPLE__) && defined(USE_APPLE_VISION)
+    /* Use CoreGraphics for high-quality resize matching PIL bicubic. */
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (cs) {
+        /* Create source image from raw RGB pixels */
+        unsigned char *rgba_src = (unsigned char *)malloc(img->width * img->height * 4);
+        if (rgba_src) {
+            for (int i = 0; i < img->width * img->height; i++) {
+                rgba_src[i*4+0] = img->pixels[i*3+0];
+                rgba_src[i*4+1] = img->pixels[i*3+1];
+                rgba_src[i*4+2] = img->pixels[i*3+2];
+                rgba_src[i*4+3] = 255;
+            }
+            CGContextRef src_ctx = CGBitmapContextCreate(NULL, img->width, img->height, 8,
+                img->width * 4, cs, kCGImageAlphaNoneSkipLast);
+            if (src_ctx) {
+                memcpy(CGBitmapContextGetData(src_ctx), rgba_src, img->width * img->height * 4);
+                CGImageRef src_img = CGBitmapContextCreateImage(src_ctx);
+                CGContextRelease(src_ctx);
+                if (src_img) {
+                    CGContextRef dst_ctx = CGBitmapContextCreate(NULL, target_width, target_height, 8,
+                        target_width * 4, cs, kCGImageAlphaNoneSkipLast);
+                    if (dst_ctx) {
+                        CGContextSetInterpolationQuality(dst_ctx, kCGInterpolationHigh);
+                        CGContextDrawImage(dst_ctx, CGRectMake(0, 0, target_width, target_height), src_img);
+                        CGImageRef dst_img = CGBitmapContextCreateImage(dst_ctx);
+                        CGContextRelease(dst_ctx);
+                        CGImageRelease(src_img);
+                        if (dst_img) {
+                            CFDataRef data = CGDataProviderCopyData(CGImageGetDataProvider(dst_img));
+                            const unsigned char *ptr = CFDataGetBytePtr(data);
+                            size_t bpr = CGImageGetBytesPerRow(dst_img);
+                            unsigned char *out = (unsigned char *)malloc(target_width * target_height * 3);
+                            if (out) {
+                                for (int y = 0; y < target_height; y++)
+                                    for (int x = 0; x < target_width; x++) {
+                                        int si = (int)(y * bpr + x * 4);
+                                        out[(y*target_width+x)*3+0] = ptr[si+0];
+                                        out[(y*target_width+x)*3+1] = ptr[si+1];
+                                        out[(y*target_width+x)*3+2] = ptr[si+2];
+                                    }
+                                CFRelease(data); CGImageRelease(dst_img); CGColorSpaceRelease(cs); free(rgba_src);
+                                ds_image_t *r = (ds_image_t *)calloc(1, sizeof(ds_image_t));
+                                if (!r) { free(out); return NULL; }
+                                r->pixels = out; r->width = target_width; r->height = target_height;
+                                r->channels = 3; r->owns_stb = 0;
+                                return r;
+                            }
+                            CFRelease(data); CGImageRelease(dst_img);
+                        }
+                    }
+                    CGImageRelease(src_img);
+                }
+            }
+            free(rgba_src);
+        }
+        CGColorSpaceRelease(cs);
+    }
+    /* CG failed, fall through to custom bicubic */
+#endif
+    /* Fallback: custom bicubic (less accurate vs PIL) */
     unsigned char *out = (unsigned char *)malloc(target_width * target_height * 3);
     if (!out) return NULL;
 
     float x_scale = (float)img->width / target_width;
     float y_scale = (float)img->height / target_height;
-
-    /* Antialias scale factors: min(1.0, dst/src).
-     * For upsampling (scale >= 1): factor = 1.0, standard 4x4 bicubic.
-     * For downsampling (scale < 1): factor < 1.0, wider kernel to avoid aliasing. */
-    float x_aa_factor = (float)target_width / (float)img->width;   /* min(1, dst/src) */
+    float x_aa_factor = (float)target_width / (float)img->width;
     float y_aa_factor = (float)target_height / (float)img->height;
     if (x_aa_factor > 1.0f) x_aa_factor = 1.0f;
     if (y_aa_factor > 1.0f) y_aa_factor = 1.0f;
 
     for (int y = 0; y < target_height; y++) {
         for (int x = 0; x < target_width; x++) {
-            /* Center-aligned coordinate mapping (matches PIL): 
-             * src = (dst + 0.5) * scale - 0.5 */
             float fx = (x + 0.5f) * x_scale - 0.5f;
             float fy = (y + 0.5f) * y_scale - 0.5f;
-
             for (int c = 0; c < 3; c++) {
-                /* Antialias bicubic interpolation — matches PIL BICUBIC default (antialias=True) */
                 float val = ds_bicuberp_aa(img->pixels, img->width, img->height, fx, fy, c,
                                            x_aa_factor, y_aa_factor);
-                /* Clamp to [0, 255] (bicubic can overshoot) */
                 if (val < 0.0f) val = 0.0f;
                 if (val > 255.0f) val = 255.0f;
                 out[(y * target_width + x) * 3 + c] = (unsigned char)(val + 0.5f);
@@ -146,8 +254,7 @@ ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_
     resized->width = target_width;
     resized->height = target_height;
     resized->channels = 3;
-    resized->owns_stb = 0;  /* pixels from malloc, use free() */
-
+    resized->owns_stb = 0;
     return resized;
 }
 

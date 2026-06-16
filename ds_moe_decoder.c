@@ -488,14 +488,33 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
             FILE *df = fopen(path, "wb");
             if (df) { fwrite(x, sizeof(float), hidden, df); fclose(df); }
         }
+
+        /* Debug: dump decode step layer outputs for first few decode steps */
+        if (getenv("DS_DUMP_DECODE_STEPS") && ctx->kv_cache_len < 865) {
+            char path[256];
+            snprintf(path, sizeof(path), "dump/c_dec_step%d_layer%d_last.bin", ctx->kv_cache_len, l);
+            FILE *df = fopen(path, "wb");
+            if (df) { fwrite(x, sizeof(float), hidden, df); fclose(df); }
+        }
     }
     free(out);
+
+    /* Debug: dump hidden state before norm for first decode steps */
+    int _step_before = ctx->kv_cache_len;
 
     /* Advance KV cache position */
     ctx->kv_cache_len++;
 
     /* Final RMSNorm */
     ds_rms_norm(x, x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
+
+    /* Debug: dump norm output for first decode steps */
+    if (getenv("DS_DUMP_DECODE_STEPS") && _step_before < 865) {
+        char path[256];
+        snprintf(path, sizeof(path), "dump/c_dec_step%d_norm_last.bin", _step_before);
+        FILE *df = fopen(path, "wb");
+        if (df) { fwrite(x, sizeof(float), hidden, df); fclose(df); }
+    }
 
     /* LM head: compute logits then sample with optional repetition penalty */
     int vocab = cfg->vocab_size;
