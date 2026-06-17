@@ -340,6 +340,7 @@ static int load_all_weights(ds_ctx_t *ctx) {
         } else {
             /* MoE for remaining layers */
             DEC_F32(gate_weight, "mlp.gate.weight");
+            DEC_BF16(gate_weight_bf16, "mlp.gate.weight");
 
             /* Routed experts */
             for (int e = 0; e < cfg->dec_n_routed_experts; e++) {
@@ -413,6 +414,7 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->dec_proj_out = (float *)malloc(hidden * sizeof(float));
     ctx->dec_expert_out = (float *)malloc(hidden * sizeof(float));
     ctx->dec_shared_out = (float *)malloc(hidden * sizeof(float));
+    ctx->dec_layer_out = (float *)malloc(hidden * sizeof(float));
     ctx->dec_gate_scores = (float *)malloc(cfg->dec_n_routed_experts * sizeof(float));
 
     /* Repetition penalty: logits buffer and token history */

@@ -288,6 +288,7 @@ typedef struct {
     /* MoE MLP (used when layer_idx >= first_k_dense) */
     /* Router gate */
     float *gate_weight;                /* [n_experts, hidden] */
+    uint16_t *gate_weight_bf16;        /* [n_experts, hidden] BF16 version for precision matching */
 
     /* Routed experts */
     struct {
@@ -354,6 +355,7 @@ typedef struct {
     float *dec_attn_out, *dec_proj_out;
     float *dec_expert_out, *dec_shared_out;
     float *dec_gate_scores;    /* [n_experts] for routing */
+    float *dec_layer_out;      /* [hidden] temp output for decoder layer forward */
 
     /* Dense FFN buffers (for layer 0) */
     float *dec_dense_gate, *dec_dense_up, *dec_dense_swiglu;

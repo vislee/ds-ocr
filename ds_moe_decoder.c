@@ -26,7 +26,8 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
                          float *shared_gate_up_buf, float *shared_swiglu_buf,
-                         float *shared_out_buf);
+                         float *shared_out_buf,
+                         float *expert_outputs_buf);
 
 /* ========================================================================
  * Dense FFN Forward Pass (SwiGLU, used for layer 0)
@@ -75,7 +76,8 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
                          float *shared_gate_up_buf, float *shared_swiglu_buf,
-                         float *shared_out_buf) {
+                         float *shared_out_buf,
+                         float *expert_outputs_buf) {
     if (layer_idx < cfg->dec_first_k_dense) {
         /* Dense FFN (SwiGLU) */
         dense_ffn_forward(output, x, layer, cfg, dense_gate_buf, dense_up_buf, dense_swiglu_buf);
@@ -86,7 +88,8 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
                     expert_gate_up_buf, expert_hidden_buf,
                     shared_gate_buf, shared_up_buf,
                     shared_gate_up_buf, shared_swiglu_buf,
-                    shared_out_buf);
+                    shared_out_buf,
+                    expert_outputs_buf);
     }
 }
 
@@ -96,7 +99,8 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
                          float *shared_gate_up_buf, float *shared_swiglu_buf,
-                         float *shared_out_buf) {
+                         float *shared_out_buf,
+                         float *expert_outputs_buf) {
     int hidden = cfg->dec_hidden;
     int moe_inter = cfg->dec_moe_inter;
     int n_experts = cfg->dec_n_routed_experts;
@@ -116,7 +120,8 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     if (scores != scores_buf) free(scores);
 
     /* Step 3: Forward through each selected routed expert */
-    float *expert_outputs = (float *)calloc(top_k * hidden, sizeof(float));
+    float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
+                            (float *)calloc(top_k * hidden, sizeof(float));
     for (int k = 0; k < top_k; k++) {
         int expert_id = top_indices[k];
         ds_expert_forward(expert_outputs + k * hidden, x,
@@ -130,7 +135,8 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
 
     /* Step 4: Combine routed expert outputs */
     ds_expert_combine(output, expert_outputs, top_indices, top_weights, top_k, hidden);
-    free(expert_outputs);
+    if (!expert_outputs_buf) free(expert_outputs);
+    else memset(expert_outputs_buf, 0, top_k * hidden * sizeof(float));
 
     /* Step 5: Add shared expert outputs (always active) */
     if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
@@ -224,18 +230,18 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     ds_rms_norm(x_norm, out, layer->post_attn_norm, 1, hidden, cfg->dec_rms_norm_eps);
 
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
-    float *mlp_out = (float *)malloc(hidden * sizeof(float));
+    float *mlp_out = ctx->dec_expert_out;  /* reuse preallocated buffer */
     mlp_forward(mlp_out, x_norm, layer, cfg, layer_idx,
                 ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                 ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                 ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
                 ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
                 ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
-                ctx->moe_shared_out_buf);
+                ctx->moe_shared_out_buf,
+                ctx->moe_expert_outputs);
 
     /* Add MLP output + residual */
     for (int i = 0; i < hidden; i++) out[i] += mlp_out[i];
-    free(mlp_out);
 }
 
 /* ========================================================================
@@ -374,7 +380,8 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                         ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
                         ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
                         ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
-                        ctx->moe_shared_out_buf);
+                        ctx->moe_shared_out_buf,
+                        ctx->moe_expert_outputs);
         }
 
         for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
@@ -476,10 +483,10 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     memcpy(x, input_embed, hidden * sizeof(float));
 
     /* Process through all layers */
-    float *out = (float *)malloc(hidden * sizeof(float));
+    float *out = ctx->dec_layer_out;
     for (int l = 0; l < cfg->dec_layers; l++) {
         decoder_layer_forward(ctx, x, out, l, ctx->kv_cache_len);
-        memcpy(x, out, hidden * sizeof(float));
+        float *tmp = x; x = out; out = tmp;  /* swap pointers, avoid memcpy */
         
         /* Debug: dump hidden state after each layer for comparison */
         if (getenv("DS_DUMP_DECODER_LAYERS")) {
@@ -497,7 +504,9 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
             if (df) { fwrite(x, sizeof(float), hidden, df); fclose(df); }
         }
     }
-    free(out);
+
+    /* After all layers, x points to the final hidden state.
+     * Due to pointer swapping, x may be either dec_x or dec_layer_out. */
 
     /* Debug: dump hidden state before norm for first decode steps */
     int _step_before = ctx->kv_cache_len;

@@ -99,6 +99,12 @@ void ds_moe_router(float *scores, const float *x, const float *gate_weight,
     ds_linear_nobias(scores, x, gate_weight, 1, hidden, n_experts);
 }
 
+void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weight_bf16,
+                          int hidden, int n_experts) {
+    /* scores[e] = gate_weight_bf16[e, hidden] @ x[hidden] (BF16 weights for precision matching) */
+    ds_linear_nobias_bf16(scores, x, gate_weight_bf16, 1, hidden, n_experts);
+}
+
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
                   int n_experts, int top_k) {
     /* Find top-K experts using simple selection */

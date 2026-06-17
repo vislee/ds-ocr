@@ -146,6 +146,8 @@ void ds_compute_2d_position_embeddings(float *pos_embed, int n_rows, int n_cols,
 /* Compute router gate scores: scores[n_experts] = gate_weight[n_experts, hidden] @ x[hidden] */
 void ds_moe_router(float *scores, const float *x, const float *gate_weight,
                    int hidden, int n_experts);
+void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weight_bf16,
+                          int hidden, int n_experts);
 
 /* Select top-K experts from gate scores. Returns expert indices and weights. */
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
