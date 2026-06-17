@@ -538,7 +538,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     }
 
     /* Debug: print top-5 logits for first few decode steps */
-    if (getenv("DS_DUMP_DECODER") && ctx->kv_cache_len < 670) {
+    if (getenv("DS_DUMP_DECODER") && ctx->kv_cache_len < 870) {
         int _top5_ids[5]; float _top5_vals[5];
         for (int i = 0; i < 5; i++) { _top5_ids[i] = -1; _top5_vals[i] = -1e30f; }
         for (int i = 0; i < vocab; i++) {

@@ -1443,9 +1443,9 @@ void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
 
 void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
                               int seq, int head_dim, float theta) {
-    /* Split-half RoPE cos/sin cache (matches Python's DeepSeek-V2):
+    /* Split-half RoPE cos/sin cache (matches LlamaAttention used by DeepSeek-OCR-2):
      * Layout: [seq, head_dim] where cos[0:half] == cos[half:end] (repeated).
-     * This matches the Python model's:
+     * Python LlamaAttention's RoPE:
      *   freqs = outer(t, inv_freq)  # [seq, half]
      *   emb = cat(freqs, freqs, dim=-1)  # [seq, dim]
      *   cos_cached = emb.cos()
@@ -1471,25 +1471,18 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
 void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
                             int seq, int n_heads, int head_dim) {
     /*
-     * LLaMA-style RoPE: rotate_half on raw Q/K (no interleaved transpose).
-     *
-     * Python's LlamaAttention uses:
-     *   rotate_half(x) = cat(-x[half:], x[:half])
-     *   q_embed = q * cos + rotate_half(q) * sin
-     *
-     * cos/sin layout: [seq, head_dim] where cos[0:half] == cos[half:end] (repeated)
-     * This matches Python's: emb = cat(freqs, freqs, dim=-1); cos = emb.cos()
+     * LLaMA-style split-half RoPE (matches LlamaAttention used by DeepSeek-OCR-2):
+     * rotate_half(x) = cat(-x[half:], x[:half])
+     * q_embed = q * cos + rotate_half(q) * sin
      *
      * For each element d in [0, half):
-     *   out[d]       = x[d] * cos[d] + (-x[d+half]) * sin[d]
-     *                = x[d] * cos[d] - x[d+half] * sin[d]
-     *   out[d+half]  = x[d+half] * cos[d+half] + x[d] * sin[d+half]
-     *                = x[d+half] * cos[d] + x[d] * sin[d]
+     *   out[d]       = x[d]*cos[d] - x[d+half]*sin[d]
+     *   out[d+half]  = x[d]*sin[d] + x[d+half]*cos[d]
+     *
+     * Note: cos[d] == cos[d+half] and sin[d] == sin[d+half] (split-half repeated)
      */
     int half = head_dim / 2;
     int hidden = n_heads * head_dim;
-
-    float *tmp = (float *)malloc(half * sizeof(float));
 
     for (int s = 0; s < seq; s++) {
         const float *c = cos_vals + s * head_dim;
@@ -1498,20 +1491,13 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
         for (int h = 0; h < n_heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-            /* Save first half before in-place modification */
-            memcpy(tmp, vec, half * sizeof(float));
-
-            /* Apply rotate_half-style RoPE:
-             * out[d]      = x[d]*cos[d] - x[d+half]*sin[d]        for d < half
-             * out[d+half] = x[d]*sin[d]   + x[d+half]*cos[d]      for d < half */
+            /* Apply split-half rotate: save first half, then update in-place */
             for (int d = 0; d < half; d++) {
-                float x1 = tmp[d];           /* first half */
-                float x2 = vec[d + half];    /* second half */
+                float x1 = vec[d];
+                float x2 = vec[d + half];
                 vec[d]         = x1 * c[d]         - x2 * sn[d];
                 vec[d + half]  = x1 * sn[d + half] + x2 * c[d + half];
             }
         }
     }
-
-    free(tmp);
 }

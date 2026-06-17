@@ -1415,8 +1415,28 @@ prompt_construction:
         } else {
             /* Decode: process current token, get next token */
             token = ds_decoder_forward(ctx, dec_input);
-            if (ds_verbose >= 2)
+            if (step < 5) {
+                /* Print top-3 logits for first decode steps */
+                float *logits = ctx->dec_logits;
+                if (logits) {
+                    int top_ids[3]; float top_vals[3];
+                    for (int i = 0; i < 3; i++) { top_ids[i] = -1; top_vals[i] = -1e30f; }
+                    for (int i = 0; i < cfg->vocab_size; i++) {
+                        for (int j = 0; j < 3; j++) {
+                            if (logits[i] > top_vals[j]) {
+                                for (int k = 2; k > j; k--) { top_vals[k] = top_vals[k-1]; top_ids[k] = top_ids[k-1]; }
+                                top_vals[j] = logits[i]; top_ids[j] = i; break;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "Step %d: token=%d, top3=[%d:%.2f,%d:%.2f,%d:%.2f]\n",
+                            step, token, top_ids[0], top_vals[0], top_ids[1], top_vals[1], top_ids[2], top_vals[2]);
+                } else {
+                    fprintf(stderr, "Step %d: token=%d (no logits)\n", step, token);
+                }
+            } else if (ds_verbose >= 2) {
                 fprintf(stderr, "Step %d: token=%d\n", step, token);
+            }
         }
 
         if (token == eos_token) {
