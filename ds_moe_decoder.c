@@ -111,7 +111,10 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     float scores_buf[DS_MAX_EXPERTS];
     float *scores = (n_experts <= DS_MAX_EXPERTS) ? scores_buf :
                     (float *)malloc(n_experts * sizeof(float));
-    ds_moe_router(scores, x, layer->gate_weight, hidden, n_experts);
+    /* Use BF16 gate weight to match Python's BF16 precision.
+     * F32 gate weight can select different experts than Python BF16,
+     * causing accuracy degradation especially for long sequences. */
+    ds_moe_router_bf16(scores, x, layer->gate_weight_bf16, hidden, n_experts);
 
     /* Step 2: Top-K expert selection */
     int top_indices[DS_MAX_EXPERTS];
@@ -400,19 +403,66 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
             free(gate_buf); free(up_buf); free(gate_up_buf); free(swiglu_buf); free(mlp_out);
         } else {
-            /* MoE MLP (layers 1-11): per-token forward for precision consistency */
+            /* MoE MLP (layers 1-11): batched BF16 gate scoring + per-token expert forward.
+             * Gate scoring uses one sgemm [seq_len, 64] for all tokens (fast + matches Python BF16).
+             * Expert forward remains per-token (same precision as decode path). */
+            int n_experts = cfg->dec_n_routed_experts;
+            int top_k = cfg->dec_top_k;
+
+            /* Batched gate scores [seq_len, n_experts] via BF16 (matches Python) */
+            float *gate_scores = (float *)malloc(seq_len * n_experts * sizeof(float));
+            ds_linear_nobias_bf16(gate_scores, x_norm, layer->gate_weight_bf16,
+                                   seq_len, hidden, n_experts);
+
             float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
             for (int s = 0; s < seq_len; s++) {
-                mlp_forward(mlp_out + s * hidden, x_norm + s * hidden, layer, cfg, l,
-                            ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
-                            ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
-                            ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
-                            ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
-                            ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
-                            ctx->moe_shared_out_buf,
-                            ctx->moe_expert_outputs);
+                /* Top-K from precomputed gate scores */
+                int top_indices[DS_MAX_EXPERTS];
+                float top_weights[DS_MAX_EXPERTS];
+                ds_moe_top_k(top_indices, top_weights,
+                             gate_scores + s * n_experts, n_experts, top_k);
+
+                /* Routed experts (per-token, same as decode path) */
+                float *expert_outputs = ctx->moe_expert_outputs;
+                for (int k = 0; k < top_k; k++) {
+                    int expert_id = top_indices[k];
+                    ds_expert_forward(expert_outputs + k * hidden,
+                                      x_norm + s * hidden,
+                                      layer->experts[expert_id].gate_weight_bf16,
+                                      layer->experts[expert_id].up_weight_bf16,
+                                      layer->experts[expert_id].down_weight_bf16,
+                                      hidden, cfg->dec_moe_inter,
+                                      ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
+                                      ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf);
+                }
+                ds_expert_combine(mlp_out + s * hidden, expert_outputs,
+                                  top_indices, top_weights, top_k, hidden);
+                memset(ctx->moe_expert_outputs, 0, top_k * hidden * sizeof(float));
+
+                /* Shared experts (per-token) */
+                if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
+                    int shared_inter = cfg->dec_n_shared_experts * cfg->dec_moe_inter;
+                    ds_linear_nobias_bf16(ctx->moe_shared_gate_buf, x_norm + s * hidden,
+                                           layer->shared_gate_weight_bf16, 1, hidden, shared_inter);
+                    ds_linear_nobias_bf16(ctx->moe_shared_up_buf, x_norm + s * hidden,
+                                           layer->shared_up_weight_bf16, 1, hidden, shared_inter);
+                    for (int i = 0; i < shared_inter; i++) {
+                        ctx->moe_shared_gate_up_buf[2 * i] = ctx->moe_shared_gate_buf[i];
+                        ctx->moe_shared_gate_up_buf[2 * i + 1] = ctx->moe_shared_up_buf[i];
+                    }
+                    ds_swiglu_multiply(ctx->moe_shared_swiglu_buf,
+                                       ctx->moe_shared_gate_up_buf, 1, shared_inter);
+                    ds_linear_nobias_bf16(ctx->moe_shared_out_buf,
+                                           ctx->moe_shared_swiglu_buf,
+                                           layer->shared_down_weight_bf16,
+                                           1, shared_inter, hidden);
+                    for (int i = 0; i < hidden; i++) {
+                        mlp_out[s * hidden + i] += ctx->moe_shared_out_buf[i];
+                    }
+                }
             }
             for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
+            free(gate_scores);
             free(mlp_out);
         }
 
