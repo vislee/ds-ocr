@@ -299,16 +299,16 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             fprintf(stderr, "Dumped layer 0 Q/K/V/x_norm for Python comparison\n");
         }
 
-        /* Compute RoPE for each position */
-        int *positions = (int *)malloc(seq_len * sizeof(int));
-        for (int i = 0; i < seq_len; i++) positions[i] = ctx->kv_cache_len + i;
-
-        float *cos_buf = (float *)malloc(seq_len * head_dim * sizeof(float));
-        float *sin_buf = (float *)malloc(seq_len * head_dim * sizeof(float));
-        ds_compute_rope_neox(cos_buf, sin_buf, positions, seq_len, head_dim, cfg->dec_rope_theta);
-        ds_apply_rope_neox(Q, cos_buf, sin_buf, seq_len, n_heads, head_dim);
-        ds_apply_rope_neox(K, cos_buf, sin_buf, seq_len, n_kv_heads, head_dim);
-        free(positions); free(cos_buf); free(sin_buf);
+        /* Apply RoPE using precomputed cache */
+        {
+            int base = ctx->kv_cache_len;
+            ds_apply_rope_neox(Q, ctx->rope_cache_cos + base * head_dim,
+                               ctx->rope_cache_sin + base * head_dim,
+                               seq_len, n_heads, head_dim);
+            ds_apply_rope_neox(K, ctx->rope_cache_cos + base * head_dim,
+                               ctx->rope_cache_sin + base * head_dim,
+                               seq_len, n_kv_heads, head_dim);
+        }
 
         /* Store K, V in cache */
         for (int s = 0; s < seq_len; s++) {
@@ -371,21 +371,50 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         /* Post-attention RMSNorm */
         ds_rms_norm(x_norm, x, layer->post_attn_norm, seq_len, hidden, cfg->dec_rms_norm_eps);
 
-        /* MLP: for prefill, process each token individually */
-        float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
-        for (int s = 0; s < seq_len; s++) {
-            mlp_forward(mlp_out + s * hidden, x_norm + s * hidden, layer, cfg, l,
-                        ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
-                        ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
-                        ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
-                        ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
-                        ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
-                        ctx->moe_shared_out_buf,
-                        ctx->moe_expert_outputs);
-        }
+        /* MLP: dense FFN for layer 0 (batched sgemm), MoE for layers 1-11 (per-token) */
+        if (l < cfg->dec_first_k_dense) {
+            /* Dense FFN (layer 0): batched via BLAS sgemm — much faster than per-token */
+            float *gate_buf = (float *)malloc(seq_len * cfg->dec_intermediate * sizeof(float));
+            float *up_buf = (float *)malloc(seq_len * cfg->dec_intermediate * sizeof(float));
+            float *gate_up_buf = (float *)malloc(seq_len * 2 * cfg->dec_intermediate * sizeof(float));
+            float *swiglu_buf = (float *)malloc(seq_len * cfg->dec_intermediate * sizeof(float));
+            float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
 
-        for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
-        free(mlp_out);
+            ds_linear_nobias_bf16(gate_buf, x_norm, layer->dense_gate_weight_bf16,
+                                   seq_len, hidden, cfg->dec_intermediate);
+            ds_linear_nobias_bf16(up_buf, x_norm, layer->dense_up_weight_bf16,
+                                   seq_len, hidden, cfg->dec_intermediate);
+
+            for (int s = 0; s < seq_len; s++) {
+                for (int i = 0; i < cfg->dec_intermediate; i++) {
+                    gate_up_buf[(size_t)s * 2 * cfg->dec_intermediate + 2 * i] =
+                        gate_buf[(size_t)s * cfg->dec_intermediate + i];
+                    gate_up_buf[(size_t)s * 2 * cfg->dec_intermediate + 2 * i + 1] =
+                        up_buf[(size_t)s * cfg->dec_intermediate + i];
+                }
+            }
+            ds_swiglu_multiply(swiglu_buf, gate_up_buf, seq_len, cfg->dec_intermediate);
+            ds_linear_nobias_bf16(mlp_out, swiglu_buf, layer->dense_down_weight_bf16,
+                                   seq_len, cfg->dec_intermediate, hidden);
+
+            for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
+            free(gate_buf); free(up_buf); free(gate_up_buf); free(swiglu_buf); free(mlp_out);
+        } else {
+            /* MoE MLP (layers 1-11): per-token forward for precision consistency */
+            float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
+            for (int s = 0; s < seq_len; s++) {
+                mlp_forward(mlp_out + s * hidden, x_norm + s * hidden, layer, cfg, l,
+                            ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
+                            ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
+                            ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
+                            ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
+                            ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
+                            ctx->moe_shared_out_buf,
+                            ctx->moe_expert_outputs);
+            }
+            for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
+            free(mlp_out);
+        }
 
         /* Debug: dump per-layer output for comparison */
         if (getenv("DS_DUMP_LAYERS")) {
