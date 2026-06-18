@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 
@@ -36,6 +37,42 @@ static double now_ms(void) {
 
 static double ds_time_sec(void) {
     return now_ms() / 1000.0;
+}
+
+/* ========================================================================
+ * Parallel crop encoding (for multi-crop SAM + encoder)
+ * ======================================================================== */
+
+typedef struct {
+    ds_ctx_t *ctx;
+    ds_image_t *crop;
+    int crop_id;
+    int tokens_per_crop;
+    float *sam_tokens;
+    int n_sam_tokens;
+    float *enc_tokens;
+    int n_enc_tokens;
+    double sam_time;
+    double enc_time;
+    int failed;
+} crop_task_t;
+
+static void *crop_worker(void *arg) {
+    crop_task_t *t = (crop_task_t *)arg;
+    double t0 = ds_time_sec();
+    t->sam_tokens = ds_sam_forward_image(t->ctx, t->crop, &t->n_sam_tokens, NULL);
+    t->sam_time = ds_time_sec() - t0;
+    if (!t->sam_tokens) { t->failed = 1; return NULL; }
+
+    double e0 = ds_time_sec();
+    t->enc_tokens = ds_encoder_forward_v2(t->ctx, t->sam_tokens, t->n_sam_tokens,
+                                           &t->n_enc_tokens, t->tokens_per_crop,
+                                           t->ctx->vis_tokenizer.causal_query_768_embeddings);
+    t->enc_time = ds_time_sec() - e0;
+    free(t->sam_tokens);
+    t->sam_tokens = NULL;
+    if (!t->enc_tokens) { t->failed = 1; return NULL; }
+    return NULL;
 }
 
 /* ========================================================================
@@ -800,102 +837,52 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             if (ds_verbose >= 1)
                 fprintf(stderr, "Multi-crop: %d local crops (768x768)\n", n_crops);
 
-            /* Step 2: Encode each local crop (768x768) */
+            /* Step 2: Encode each local crop (768x768)
+             * Parallelize across crops using threads for speed.
+             * SAM + Encoder are thread-safe (all buffers are local malloc, weights are read-only). */
             int tokens_per_crop = 144;  /* 48/4 * 48/4 = 12*12 = 144 */
             float *local_features = NULL;
             int local_token_count = 0;
 
-            for (int i = 0; i < n_crops; i++) {  /* all are 768x768 local crops */
-                g_dump_crop_id = i;  /* Set crop ID for per-crop tensor dumps */
+            /* Per-crop results for parallel encoding */
+            int n_parallel = n_crops; /* all are 768x768 local crops */
+            crop_task_t *tasks = (crop_task_t *)calloc(n_parallel, sizeof(crop_task_t));
+            pthread_t *threads = (pthread_t *)calloc(n_parallel, sizeof(pthread_t));
+
+            /* Launch parallel encoding */
+            for (int i = 0; i < n_parallel; i++) {
+                tasks[i].ctx = ctx;
+                tasks[i].crop = crops[i];
+                tasks[i].tokens_per_crop = tokens_per_crop;
                 if (ds_verbose >= 1)
                     fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
+                pthread_create(&threads[i], NULL, crop_worker, &tasks[i]);
+            }
 
-                double crop_t0 = ds_time_sec();
-
-                int n_sam_tokens;
-                float *sam_tokens = ds_sam_forward_image(ctx, crops[i], &n_sam_tokens, NULL);
-                double sam_t = ds_time_sec() - crop_t0;
-                if (!sam_tokens) {
-                    fprintf(stderr, "SAM forward failed for crop %d\n", i);
+            /* Wait for all crops and collect results */
+            for (int i = 0; i < n_parallel; i++) {
+                pthread_join(threads[i], NULL);
+                if (tasks[i].failed) {
+                    fprintf(stderr, "Encoding failed for crop %d\n", i);
+                    /* Cleanup already completed crops */
+                    for (int j = 0; j < n_parallel; j++) free(tasks[j].enc_tokens);
+                    free(tasks); free(threads);
                     goto cleanup_crops;
                 }
-
-                /* Dump SAM output for each crop if DS_DUMP_TENSORS set */
-                if (getenv("DS_DUMP_TENSORS")) {
-                    char sam_path[256];
-                    snprintf(sam_path, sizeof(sam_path), "dump/c_sam_crop%d.bin", i);
-                    FILE *df = fopen(sam_path, "wb");
-                    if (df) { fwrite(sam_tokens, sizeof(float), n_sam_tokens * 896, df); fclose(df); }
-                }
-
-                /* Override SAM tokens with Python reference for encoder-only debugging.
-                 * DS_LOAD_SAM_TOKENS=dump/py_sam_tokens_crop0.bin loads [144, 896] float32 (crop 0 only)
-                 * DS_LOAD_SAM_ALL=dump/python_sam_crop loads [144, 896] per crop (appends {i}.bin) */
-                {
-                    const char *load_sam_all = getenv("DS_LOAD_SAM_ALL");
-                    const char *load_sam = (i == 0) ? getenv("DS_LOAD_SAM_TOKENS") : NULL;
-                    const char *path_to_load = NULL;
-                    char auto_path[512];
-                    if (load_sam_all) {
-                        snprintf(auto_path, sizeof(auto_path), "%s%d.bin", load_sam_all, i);
-                        path_to_load = auto_path;
-                    } else if (load_sam) {
-                        path_to_load = load_sam;
-                    }
-                    if (path_to_load) {
-                        FILE *sf = fopen(path_to_load, "rb");
-                        if (sf) {
-                            int n_read = (int)fread(sam_tokens, sizeof(float), n_sam_tokens * 896, sf);
-                            fclose(sf);
-                            fprintf(stderr, "DS_LOAD_SAM: crop %d loaded %d floats from %s (expected %d)\n",
-                                    i, n_read, path_to_load, n_sam_tokens * 896);
-                        } else {
-                            fprintf(stderr, "Warning: DS_LOAD_SAM %s not found\n", path_to_load);
-                        }
-                    }
-                }
-
-                /* Encoder: Qwen2 with 144 causal flow queries (includes projector) */
-                double enc_t0 = ds_time_sec();
-                int n_enc_tokens;
-                float *enc_tokens = ds_encoder_forward_v2(ctx, sam_tokens, n_sam_tokens,
-                                                           &n_enc_tokens,
-                                                           tokens_per_crop,
-                                                           ctx->vis_tokenizer.causal_query_768_embeddings);
-                double enc_t = ds_time_sec() - enc_t0;
-                free(sam_tokens);
-                if (!enc_tokens) {
-                    fprintf(stderr, "Encoder forward failed for crop %d\n", i);
-                    goto cleanup_crops;
-                }
-
                 if (ds_verbose >= 1)
                     fprintf(stderr, "  crop %d: SAM %.2fs + Encoder %.2fs = %.2fs\n",
-                            i + 1, sam_t, enc_t, sam_t + enc_t);
-
-                /* Dump crop encoder output for comparison if DS_DUMP_TENSORS set */
-                if (getenv("DS_DUMP_TENSORS")) {
-                    char dump_path[256];
-                    snprintf(dump_path, sizeof(dump_path), "dump/local_crop%d_proj_output.bin", i);
-                    FILE *df = fopen(dump_path, "wb");
-                    if (df) { fwrite(enc_tokens, sizeof(float), n_enc_tokens * hidden, df); fclose(df); }
-                }
-
-                /* Quick debug: after first crop, dump and exit early */
-                if (i == 0 && getenv("DS_DUMP_FIRST_CROP")) {
-                    FILE *df = fopen("dump/c_crop0_proj_output.bin", "wb");
-                    if (df) { fwrite(enc_tokens, sizeof(float), n_enc_tokens * hidden, df); fclose(df); }
-                    fprintf(stderr, "DS_DUMP_FIRST_CROP: dumped crop 0, exiting\n");
-                    goto cleanup_crops;
-                }
+                            i + 1, tasks[i].sam_time, tasks[i].enc_time,
+                            tasks[i].sam_time + tasks[i].enc_time);
 
                 /* Append to local_features */
                 int old_count = local_token_count;
-                local_token_count += n_enc_tokens;
+                local_token_count += tasks[i].n_enc_tokens;
                 local_features = (float *)realloc(local_features, local_token_count * hidden * sizeof(float));
-                memcpy(local_features + old_count * hidden, enc_tokens, n_enc_tokens * hidden * sizeof(float));
-                free(enc_tokens);
+                memcpy(local_features + old_count * hidden, tasks[i].enc_tokens,
+                       tasks[i].n_enc_tokens * hidden * sizeof(float));
+                free(tasks[i].enc_tokens);
             }
+            free(tasks); free(threads);
 
             /* Step 3: Encode global image (1024x1024)
              * Python: global_features_1 = sam_model(image_ori) where image_ori is 1024x1024
