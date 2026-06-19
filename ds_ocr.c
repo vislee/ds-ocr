@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 
 int ds_verbose = 1;
+int ds_bf16_simulate_python = 0;  /* Set to 1 to truncate intermediate values to BF16 precision */
 int g_dump_crop_id = -1;  /* Crop ID for per-crop dumps */
 
 /* ========================================================================

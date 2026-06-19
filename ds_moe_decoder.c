@@ -409,10 +409,21 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             int n_experts = cfg->dec_n_routed_experts;
             int top_k = cfg->dec_top_k;
 
-            /* Batched gate scores [seq_len, n_experts] via BF16 (matches Python) */
+            /* Per-token BF16 gate scoring (matches Python BF16 precision + decode path) */
             float *gate_scores = (float *)malloc(seq_len * n_experts * sizeof(float));
-            ds_linear_nobias_bf16(gate_scores, x_norm, layer->gate_weight_bf16,
-                                   seq_len, hidden, n_experts);
+            for (int s = 0; s < seq_len; s++) {
+                ds_moe_router_bf16(gate_scores + s * n_experts,
+                                   x_norm + s * hidden,
+                                   layer->gate_weight_bf16, hidden, n_experts);
+            }
+
+            /* Debug: dump gate scores for last token */
+            if (getenv("DS_DUMP_GATE") && l <= 6) {
+                char path[256];
+                snprintf(path, sizeof(path), "dump/c_gate_layer%d_last.bin", l);
+                FILE *df = fopen(path, "wb");
+                if (df) { fwrite(gate_scores + (seq_len-1) * n_experts, sizeof(float), n_experts, df); fclose(df); }
+            }
 
             float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
             for (int s = 0; s < seq_len; s++) {
@@ -482,6 +493,14 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             last_mean /= hidden;
             fprintf(stderr, "  Layer %d done, last token: mean=%.4f max_abs=%.4f\n",
                     l, last_mean, last_max);
+        }
+
+        /* Debug: dump last token hidden after each prefill layer for comparison with Python */
+        if (getenv("DS_DUMP_LAYERS")) {
+            char path[256];
+            snprintf(path, sizeof(path), "dump/c_prefill_layer%d_last.bin", l);
+            FILE *df = fopen(path, "wb");
+            if (df) { fwrite(x + (seq_len-1)*hidden, sizeof(float), hidden, df); fclose(df); }
         }
 
         if (ds_verbose >= 2)

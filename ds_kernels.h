@@ -161,6 +161,13 @@ void ds_expert_forward(float *out, const float *x,
                        float *gate_buf, float *up_buf,
                        float *gate_up_buf, float *hidden_buf);
 
+void ds_expert_forward_f32(float *out, const float *x,
+                            const uint16_t *gate_bf16, const uint16_t *up_bf16,
+                            const uint16_t *down_bf16,
+                            int hidden, int intermediate,
+                            float *gate_buf, float *up_buf,
+                            float *gate_up_buf, float *hidden_buf);
+
 /* Legacy wrapper that allocates internally */
 void ds_expert_forward_legacy(float *out, const float *x,
                        const uint16_t *gate_bf16, const uint16_t *up_bf16,
@@ -196,5 +203,6 @@ int ds_get_num_cpus(void);
 
 /* Global verbose flag */
 extern int ds_verbose;
+extern int ds_bf16_simulate_python;
 
 #endif /* DS_KERNELS_H */

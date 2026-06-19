@@ -19,6 +19,16 @@
 #include <unistd.h>
 #endif
 
+/* Helper: truncate F32 to BF16 precision and back (matches Python BF16 intermediate precision) */
+static inline float ds_f32_to_bf16_to_f32(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    u = (u + 0x8000) & 0xFFFF0000u;  /* Round to nearest BF16 */
+    float r;
+    memcpy(&r, &u, sizeof(r));
+    return r;
+}
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -167,6 +177,19 @@ void ds_expert_forward(float *out, const float *x,
     ds_linear_nobias_bf16(gate_buf, x, gate_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, up_bf16, 1, hidden, intermediate);
 
+    /* Truncate gate/up to BF16 precision to match Python's BF16 matmul output.
+     * Python: BF16 × BF16 → BF16 (linear output is BF16 before next op).
+     * C:      F32 × BF16 → F32 (NEON matvec gives F32 output).
+     * Without truncation, gate_buf and up_buf have extra F32 mantissa bits
+     * that Python doesn't, causing SwiGLU results to diverge. */
+    extern int ds_bf16_simulate_python;
+    if (ds_bf16_simulate_python) {
+        for (int i = 0; i < intermediate; i++) {
+            gate_buf[i] = ds_f32_to_bf16_to_f32(gate_buf[i]);
+            up_buf[i] = ds_f32_to_bf16_to_f32(up_buf[i]);
+        }
+    }
+
     /* Fused gate+up for SwiGLU */
     for (int i = 0; i < intermediate; i++) {
         gate_up_buf[2 * i] = gate_buf[i];
@@ -176,8 +199,22 @@ void ds_expert_forward(float *out, const float *x,
     /* SwiGLU: SiLU(gate) * up */
     ds_swiglu_multiply(hidden_buf, gate_up_buf, 1, intermediate);
 
+    /* Truncate SwiGLU output to BF16 (Python's down projection input is BF16) */
+    if (ds_bf16_simulate_python) {
+        for (int i = 0; i < intermediate; i++) {
+            hidden_buf[i] = ds_f32_to_bf16_to_f32(hidden_buf[i]);
+        }
+    }
+
     /* down projection */
     ds_linear_nobias_bf16(out, hidden_buf, down_bf16, 1, intermediate, hidden);
+
+    /* Truncate final output to BF16 */
+    if (ds_bf16_simulate_python) {
+        for (int i = 0; i < hidden; i++) {
+            out[i] = ds_f32_to_bf16_to_f32(out[i]);
+        }
+    }
 }
 
 /* Backward-compatible wrapper that allocates internally */
@@ -598,6 +635,35 @@ static const float *ds_bf16_get_f32_view(const uint16_t *src, size_t n) {
     if (!scratch) return NULL;
     ds_bf16_to_f32_buf(scratch, src, n);
     return scratch;
+}
+
+/* Expert forward using F32 weights + BLAS sgemm (high precision, slower).
+ * Used for prefill when DS_USE_F32_EXPERTS is set. */
+void ds_expert_forward_f32(float *out, const float *x,
+                            const uint16_t *gate_bf16, const uint16_t *up_bf16,
+                            const uint16_t *down_bf16,
+                            int hidden, int intermediate,
+                            float *gate_buf, float *up_buf,
+                            float *gate_up_buf, float *hidden_buf) {
+    size_t n_gate = (size_t)intermediate * hidden;
+    size_t n_up = (size_t)intermediate * hidden;
+    size_t n_down = (size_t)hidden * intermediate;
+    const float *gate_f32 = ds_bf16_get_f32_view(gate_bf16, n_gate);
+    const float *up_f32 = ds_bf16_get_f32_view(up_bf16, n_up);
+    const float *down_f32 = ds_bf16_get_f32_view(down_bf16, n_down);
+    if (!gate_f32 || !up_f32 || !down_f32) {
+        ds_expert_forward(out, x, gate_bf16, up_bf16, down_bf16,
+                          hidden, intermediate, gate_buf, up_buf, gate_up_buf, hidden_buf);
+        return;
+    }
+    ds_linear_nobias(gate_buf, x, gate_f32, 1, hidden, intermediate);
+    ds_linear_nobias(up_buf, x, up_f32, 1, hidden, intermediate);
+    for (int i = 0; i < intermediate; i++) {
+        gate_up_buf[2 * i] = gate_buf[i];
+        gate_up_buf[2 * i + 1] = up_buf[i];
+    }
+    ds_swiglu_multiply(hidden_buf, gate_up_buf, 1, intermediate);
+    ds_linear_nobias(out, hidden_buf, down_f32, 1, intermediate, hidden);
 }
 
 /*

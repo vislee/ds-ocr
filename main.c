@@ -87,6 +87,7 @@ int main(int argc, char **argv) {
     }
 
     ds_verbose = verbosity;
+    ds_bf16_simulate_python = getenv("DS_BF16_SIMULATE_PYTHON") ? 1 : 0;
 
     if (use_platform_ocr) {
         char *text = ds_platform_ocr_file(input_image, platform_accurate, verbosity);
