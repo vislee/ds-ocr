@@ -116,10 +116,36 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
      * causing accuracy degradation especially for long sequences. */
     ds_moe_router_bf16(scores, x, layer->gate_weight_bf16, hidden, n_experts);
 
-    /* Step 2: Top-K expert selection */
+    /* Step 2: Softmax over all experts first, then select top-K (matching Python).
+     * Previously ds_moe_top_k did softmax over only top-K, which was wrong —
+     * the softmax values should be computed over all 64 experts before selecting. */
+    {
+        float max_s = -1e30f;
+        for (int e = 0; e < n_experts; e++)
+            if (scores[e] > max_s) max_s = scores[e];
+        float sum_exp = 0.0f;
+        for (int e = 0; e < n_experts; e++) {
+            scores[e] = expf(scores[e] - max_s);
+            sum_exp += scores[e];
+        }
+        float inv = 1.0f / sum_exp;
+        for (int e = 0; e < n_experts; e++)
+            scores[e] *= inv;
+    }
     int top_indices[DS_MAX_EXPERTS];
     float top_weights[DS_MAX_EXPERTS];
-    ds_moe_top_k(top_indices, top_weights, scores, n_experts, top_k);
+    for (int k = 0; k < top_k; k++) {
+        int best = -1; float best_score = -1e30f;
+        for (int e = 0; e < n_experts; e++) {
+            int already = 0;
+            for (int j = 0; j < k; j++)
+                if (top_indices[j] == e) { already = 1; break; }
+            if (already) continue;
+            if (scores[e] > best_score) { best_score = scores[e]; best = e; }
+        }
+        top_indices[k] = best;
+        top_weights[k] = best_score;
+    }
     if (scores != scores_buf) free(scores);
 
     /* Step 3: Forward through each selected routed expert */
@@ -427,11 +453,44 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
 
             float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
             for (int s = 0; s < seq_len; s++) {
-                /* Top-K from precomputed gate scores */
+                /* Gate scoring: softmax over ALL 64 experts first (matching Python),
+                 * then select top-K and use softmax values as weights.
+                 * Previously ds_moe_top_k did softmax over only top-K, which was wrong. */
+                float *s_scores = gate_scores + s * n_experts;
+                /* Softmax over all n_experts */
+                {
+                    float max_s = -1e30f;
+                    for (int e = 0; e < n_experts; e++)
+                        if (s_scores[e] > max_s) max_s = s_scores[e];
+                    float sum_exp = 0.0f;
+                    for (int e = 0; e < n_experts; e++) {
+                        s_scores[e] = expf(s_scores[e] - max_s);
+                        sum_exp += s_scores[e];
+                    }
+                    float inv = 1.0f / sum_exp;
+                    for (int e = 0; e < n_experts; e++)
+                        s_scores[e] *= inv;
+                }
+
+                /* Select top-K from softmax'd scores */
                 int top_indices[DS_MAX_EXPERTS];
                 float top_weights[DS_MAX_EXPERTS];
-                ds_moe_top_k(top_indices, top_weights,
-                             gate_scores + s * n_experts, n_experts, top_k);
+                for (int k = 0; k < top_k; k++) {
+                    int best = -1;
+                    float best_score = -1e30f;
+                    for (int e = 0; e < n_experts; e++) {
+                        int already = 0;
+                        for (int j = 0; j < k; j++)
+                            if (top_indices[j] == e) { already = 1; break; }
+                        if (already) continue;
+                        if (s_scores[e] > best_score) {
+                            best_score = s_scores[e];
+                            best = e;
+                        }
+                    }
+                    top_indices[k] = best;
+                    top_weights[k] = best_score;
+                }
 
                 /* Routed experts (per-token, same as decode path) */
                 float *expert_outputs = ctx->moe_expert_outputs;
