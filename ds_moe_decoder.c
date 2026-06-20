@@ -429,13 +429,15 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
             free(gate_buf); free(up_buf); free(gate_up_buf); free(swiglu_buf); free(mlp_out);
         } else {
-            /* MoE MLP (layers 1-11): batched BF16 gate scoring + per-token expert forward.
-             * Gate scoring uses one sgemm [seq_len, 64] for all tokens (fast + matches Python BF16).
-             * Expert forward remains per-token (same precision as decode path). */
+            /* MoE MLP (layers 1-11): batched gate scoring + batched shared experts
+             * + per-token routed expert forward. */
             int n_experts = cfg->dec_n_routed_experts;
             int top_k = cfg->dec_top_k;
 
-            /* Per-token BF16 gate scoring (matches Python BF16 precision + decode path) */
+            /* Batched BF16 gate scoring: per-token BF16 matvec to match decode path precision.
+             * Using ds_linear_nobias_bf16(sg==1) → BF16 matvec (matches Python BF16 gate).
+             * Batched sgemm uses F32 weights from BF16 conversion → different precision →
+             * can select different experts, causing output divergence. */
             float *gate_scores = (float *)malloc(seq_len * n_experts * sizeof(float));
             for (int s = 0; s < seq_len; s++) {
                 ds_moe_router_bf16(gate_scores + s * n_experts,
@@ -509,7 +511,7 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                                   top_indices, top_weights, top_k, hidden);
                 memset(ctx->moe_expert_outputs, 0, top_k * hidden * sizeof(float));
 
-                /* Shared experts (per-token) */
+                /* Shared experts (per-token, same as decode path) */
                 if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
                     int shared_inter = cfg->dec_n_shared_experts * cfg->dec_moe_inter;
                     ds_linear_nobias_bf16(ctx->moe_shared_gate_buf, x_norm + s * hidden,

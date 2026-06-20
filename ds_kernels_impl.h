@@ -28,8 +28,20 @@ void ds_vec_scale_inplace_neon(float *dst, float scale, int n);
 void ds_vec_axpy_inplace_neon(float *dst, const float *src, float alpha, int n);
 void ds_vec_scale_add_neon(float *dst, const float *src, float correction, int n);
 
+/* BF16 dot product variants (ARMv8.6-A FEAT_BF16, Apple M2+) */
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+void ds_bf16_matvec_fused_neon_bf16(float *y, const float *x, const uint16_t *W_bf16,
+                                      const float *bias, int in_dim, int out_dim);
+void ds_argmax_bf16_range_neon_bf16(const float *x, const uint16_t *W_bf16,
+                                       int in_dim, int start, int end,
+                                       int *best_out, float *best_val_out);
+#define ds_bf16_matvec_fused_impl ds_bf16_matvec_fused_neon_bf16
+#define ds_argmax_bf16_range_impl ds_argmax_bf16_range_neon_bf16
+#else
 #define ds_bf16_matvec_fused_impl ds_bf16_matvec_fused_neon
 #define ds_argmax_bf16_range_impl ds_argmax_bf16_range_neon
+#endif
+
 #define ds_dot_f32_impl ds_dot_f32_neon
 #define ds_vec_scale_inplace_impl ds_vec_scale_inplace_neon
 #define ds_vec_axpy_inplace_impl ds_vec_axpy_inplace_neon

@@ -2,7 +2,9 @@
 # Makefile
 
 CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native
+# Apple M2+: -mcpu=apple-m2 enables FEAT_BF16 and better scheduling
+# For Linux: use -march=native
+CFLAGS_BASE = -Wall -Wextra -O3 -mcpu=apple-m2
 LDFLAGS = -lm -lpthread
 
 # Platform detection
