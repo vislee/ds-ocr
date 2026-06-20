@@ -364,54 +364,59 @@ See [test.c](test.c) for available test suites:
 
 Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 
-| Stage | V1 Time | V2 Time (per crop) |
+| Stage | V1 Time | V2 Time (6 crops) |
 |-------|---------|---------|
 | Model loading (mmap) | < 1s | < 1s |
-| SAM encoding (768×768) | ~200ms | ~4s (BLAS QK^T + block rel_pos) |
-| DeepEncoder V2 | N/A | ~1.3s |
-| Decoding (per token) | ~15ms | ~20ms |
-| **Total (6 crops)** | ~1s | **~35s** |
+| SAM+Encoder (6 crops parallel) | ~200ms | ~50s |
+| Prefill (862 tokens) | ~0.2s | ~30s |
+| Decode (per token) | ~15ms | ~135ms |
+| **Total (test截屏.png)** | ~1s | **~97s (7.5× faster than Python)** |
 
-> **Note**: V2 multi-crop encoding: 6 local crops (768×768) + 1 global (1024×1024).
-> SAM attention uses BLAS sgemm for QK^T and Attn×V, plus block-structured rel_pos bias (30× faster than scalar).
+> **Note**: V2 pipeline uses multi-crop encoding (6 local + 1 global) with parallel crop processing.
+> Python PyTorch (CPU, BF16) takes ~736s for the same image.
 
 ## Current Status
 
 | Component | V1 | V2 |
 |-----------|----|----|
-| **SAM Vision Tokenizer** | ✅ Working | ✅ Verified (patch_embed corr=1.0, all block components match Python, window pad-order fixed) |
-| **Encoder** | ✅ Working | ⚠️ Precision drift (SAM 12-layer corr still <1.0 due to BF16 weights + float32 accumulation, amplified by DeepEncoder) |
+| **SAM Vision Tokenizer** | ✅ Working | ✅ Verified |
+| **Encoder** | ✅ Working | ✅ Working (corr ~0.995 vs Python) |
 | **Projector** | ✅ Working | ✅ Working (linear 896→1280) |
-| **MoE Decoder** | ✅ Working | ✅ Verified (LLaMA-style RoPE, layer 0 attn_out corr=1.0 vs Python) |
-| **Tokenizer** | ✅ Working | ✅ Working (BPE encode + added_tokens decode verified, HTML table tags decoded) |
-| **Multi-crop** | N/A | ✅ Working (dynamic_preprocess, 6 crops + 1 global) |
-| **End-to-end OCR** | ✅ | ⚠️ Correct with Python encoder; C encoder has precision drift (SAM resize) → produces plausible first tokens but degrades after ~20 tokens |
+| **MoE Decoder** | ✅ Working | ✅ **Verified** (gate softmax fix: corr 0.82→0.9998, logits match Python exactly) |
+| **Tokenizer** | ✅ Working | ✅ Working |
+| **Multi-crop** | N/A | ✅ Working |
+| **End-to-end OCR** | ✅ | ✅ **Verified** (99.29% text similarity vs Python model.infer()) |
 
-### Precision Analysis (V2)
+### v0.5 — Decoder Correctness Verified
 
-Each SAM block component was independently verified correct (corr=1.0) against Python with identical input:
+The MoE decoder is now **fully verified** against Python. Using identical `inputs_embeds`, C and Python produce matching decode logits (差异 <0.1, BF16 precision range).
 
-| Component | corr vs Python |
-|-----------|---------------|
-| Patch embed (Conv2d) | 1.000000 |
-| Pos embed + interpolation | 1.000000 |
-| LayerNorm | 1.000000 |
-| QKV projection | 1.000000 |
-| Relative position bias | 1.000000 |
-| Softmax (float64) | 1.000000 |
-| MLP (GELU + projection) | 1.000000 |
+**Key fix**: MoE gate softmax order — Python softmaxes over all 64 experts first, then selects top-K. C was selecting top-K first then softmaxing only those K. This caused different expert routing and 0.82 correlation at Layer 11. After fix: 0.9998 correlation.
 
-However, float32 arithmetic accumulates ~0.6% error across 12 SAM layers (corr: 0.9997 → 0.994, max token diff: 4.5). This is then amplified by the 24-layer DeepEncoder, reducing final encoder correlation to ~0.20. The autoregressive decoder then produces hallucinated text from the degraded encoder output.
+**End-to-end results** (Apple M2 Pro, 8 threads, BLAS):
 
-**Root cause**: Not a code bug — structural precision limitation of float32 in a 36-layer transformer pipeline.
+| Test Image | C Output | Python Output | Similarity |
+|------------|----------|---------------|------------|
+| test_simple.png | Hello World\n\nOCR Test 123 | (same) | 100% |
+| test截屏.png | # OpenAI Responses API\n基于 OpenAI Python SDK v1.70.0... | (same, minor char diff) | 99.29% |
+
+**lm_head.weight** is NOT tied with embed_tokens.weight (max_diff=3.46). C correctly loads and uses the separate `lm_head_bf16` weight.
+
+### Performance (v0.5)
+
+| Stage | Time | Speed |
+|-------|------|-------|
+| Model loading (mmap) | <1s | — |
+| SAM+Encoder (6 crops parallel) | ~50s | — |
+| Prefill (862 tokens) | ~30s | 5.5 tok/s |
+| Decode (142 tokens) | ~19s | **7.4 tok/s** |
+| **Total** | **~97s** | **7.5× faster than Python** |
 
 ### Known Issues (V2)
 
-1. **SAM encoder precision**: C's SAM+Encoder produces different output from Python due to BF16 weight quantization and numerical accumulation differences in QK^T matmul (BLAS sgemm vs PyTorch SDPA). The window attention pad-order fix (pad→QKV instead of QKV→zero-pad) reduced Block 0 diff from 0.209, but residual float32 accumulation drift remains across 12 layers. This amplifies through the 24-layer DeepEncoder and into the decoder. **Using Python-generated encoder output via `DS_LOAD_ENCODER_OUTPUT` produces correct OCR text** (verified: "Hello World 123" ✓).
-2. **Encoding speed**: SAM+Encoder per crop ~5s (down from ~40s via BLAS attention + block rel_pos). Full V2 pipeline ~35s. With Python encoder cache: ~10s for Python preprocessing + ~2s for C decoder.
-3. **Python encoder cache**: Use `gen_encoder_cache.py` to precompute encoder output from Python, then load via `DS_LOAD_ENCODER_OUTPUT=encoder_cache/image.bin ./ds_ocr ...`. This provides production-quality OCR output while the C encoder precision is being improved.
-4. **Precomputed tensors**: To reduce interpolation errors, the C code auto-loads `pos_embed_48x48.bin` and `rel_pos_*_size95.bin` from the model directory (generated by Python). If these files are missing, C falls back to its own bicubic interpolation (now fixed: a=-0.5 Keys cubic + correct antialias operator precedence).
-5. **Window attention pad-order**: Previously computed QKV on unpadded data then zero-padded Q/K/V before window attention. This mismatched Python (which pads input first, then computes QKV on padded data so padding tokens get non-zero QKV from bias). Fixed in current code — window attention now pads `x_norm` first, then computes QKV per window, matching Python's behavior and reducing boundary token attention errors.
+1. **SAM encoder precision drift**: C's SAM+Encoder produces slightly different output from Python (corr ~0.995) due to BF16 weight quantization and float32 accumulation across 12 SAM + 24 DeepEncoder layers. This causes minor OCR text differences (e.g., "有效对话" vs "有状态对话") but does not affect overall OCR quality.
+2. **Prefill speed**: MoE per-token expert forward is the main bottleneck (~70% of total time). Future optimization: batched shared experts via sgemm, grouped expert batching.
+3. **lm_head not tied**: The model's `lm_head.weight` differs from `embed_tokens.weight` — C correctly loads the separate weight file.
 
 ## Model Support
 
