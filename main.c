@@ -154,13 +154,14 @@ int main(int argc, char **argv) {
 
     if (verbosity >= 1) {
         double tokens_per_sec = 0.0;
-        if (ctx->perf_total_ms > 0) {
-            tokens_per_sec = (1000.0 * ctx->perf_text_tokens) / ctx->perf_total_ms;
+        if (ctx->perf_decode_ms > 0) {
+            tokens_per_sec = (1000.0 * ctx->perf_text_tokens) / ctx->perf_decode_ms;
         }
         fprintf(stderr,
-                "Inference: %.0f ms, %d text tokens (%.2f tok/s, encoding: %.0fms, decoding: %.0fms)\n",
+                "Inference: %.0f ms, %d text tokens (%.2f tok/s decode)\n"
+                "  Encoding: %.0f ms | Prefill: %.0f ms | Decode: %.0f ms\n",
                 ctx->perf_total_ms, ctx->perf_text_tokens, tokens_per_sec,
-                ctx->perf_encode_ms, ctx->perf_decode_ms);
+                ctx->perf_encode_ms, ctx->perf_prefill_ms, ctx->perf_decode_ms);
     }
 
     /* Per-layer profiler output */

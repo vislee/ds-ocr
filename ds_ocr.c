@@ -74,6 +74,25 @@ static void *crop_worker(void *arg) {
     return NULL;
 }
 
+/* Worker for global crop (1024x1024) — uses causal_query_embeddings (256 queries) */
+static void *crop_worker_global(void *arg) {
+    crop_task_t *t = (crop_task_t *)arg;
+    double t0 = ds_time_sec();
+    t->sam_tokens = ds_sam_forward_image(t->ctx, t->crop, &t->n_sam_tokens, NULL);
+    t->sam_time = ds_time_sec() - t0;
+    if (!t->sam_tokens) { t->failed = 1; return NULL; }
+
+    double e0 = ds_time_sec();
+    t->enc_tokens = ds_encoder_forward_v2(t->ctx, t->sam_tokens, t->n_sam_tokens,
+                                           &t->n_enc_tokens, t->tokens_per_crop,
+                                           t->ctx->vis_tokenizer.causal_query_embeddings);
+    t->enc_time = ds_time_sec() - e0;
+    free(t->sam_tokens);
+    t->sam_tokens = NULL;
+    if (!t->enc_tokens) { t->failed = 1; return NULL; }
+    return NULL;
+}
+
 /* ========================================================================
  * Configuration Detection
  * ======================================================================== */
@@ -855,60 +874,18 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             if (ds_verbose >= 1)
                 fprintf(stderr, "Multi-crop: %d local crops (768x768)\n", n_crops);
 
-            /* Step 2: Encode each local crop (768x768)
-             * Parallelize across crops using threads for speed.
-             * SAM + Encoder are thread-safe (all buffers are local malloc, weights are read-only). */
+            /* Step 2: Encode local crops + global image in parallel.
+             * Parallelize ALL crops (local + global) together to overlap
+             * the global SAM+Encoder with local SAM+Encoder computations.
+             * This saves ~4s (previously global was serial after local). */
             int tokens_per_crop = 144;  /* 48/4 * 48/4 = 12*12 = 144 */
             float *local_features = NULL;
             int local_token_count = 0;
 
-            /* Per-crop results for parallel encoding */
-            int n_parallel = n_crops; /* all are 768x768 local crops */
-            crop_task_t *tasks = (crop_task_t *)calloc(n_parallel, sizeof(crop_task_t));
-            pthread_t *threads = (pthread_t *)calloc(n_parallel, sizeof(pthread_t));
-
-            /* Launch parallel encoding */
-            for (int i = 0; i < n_parallel; i++) {
-                tasks[i].ctx = ctx;
-                tasks[i].crop = crops[i];
-                tasks[i].tokens_per_crop = tokens_per_crop;
-                if (ds_verbose >= 1)
-                    fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
-                pthread_create(&threads[i], NULL, crop_worker, &tasks[i]);
-            }
-
-            /* Wait for all crops and collect results */
-            for (int i = 0; i < n_parallel; i++) {
-                pthread_join(threads[i], NULL);
-                if (tasks[i].failed) {
-                    fprintf(stderr, "Encoding failed for crop %d\n", i);
-                    /* Cleanup already completed crops */
-                    for (int j = 0; j < n_parallel; j++) free(tasks[j].enc_tokens);
-                    free(tasks); free(threads);
-                    goto cleanup_crops;
-                }
-                if (ds_verbose >= 1)
-                    fprintf(stderr, "  crop %d: SAM %.2fs + Encoder %.2fs = %.2fs\n",
-                            i + 1, tasks[i].sam_time, tasks[i].enc_time,
-                            tasks[i].sam_time + tasks[i].enc_time);
-
-                /* Append to local_features */
-                int old_count = local_token_count;
-                local_token_count += tasks[i].n_enc_tokens;
-                local_features = (float *)realloc(local_features, local_token_count * hidden * sizeof(float));
-                memcpy(local_features + old_count * hidden, tasks[i].enc_tokens,
-                       tasks[i].n_enc_tokens * hidden * sizeof(float));
-                free(tasks[i].enc_tokens);
-            }
-            free(tasks); free(threads);
-
-            /* Step 3: Encode global image (1024x1024)
-             * Python: global_features_1 = sam_model(image_ori) where image_ori is 1024x1024
-             * Note: ds_dynamic_preprocess thumbnail is 768x768, NOT 1024x1024.
-             * We need to pad the original image to 1024x1024 separately. */
+            /* Prepare global image (1024x1024) for parallel encoding */
             if (ds_verbose >= 1)
                 fprintf(stderr, "Encoding global image (1024x1024)\n");
-                g_dump_crop_id = 6;  /* Global crop uses ID 6 */
+            g_dump_crop_id = 6;  /* Global crop uses ID 6 */
 
             ds_image_t *global_img = NULL;
             if (pil_pixels) {
@@ -947,57 +924,87 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 global_img = ds_image_pad(&img, 1024, 127);
             }
             if (!global_img) {
-                free(local_features);
                 goto cleanup_crops;
             }
 
-            int n_global_sam_tokens;
-            float *global_sam_tokens = ds_sam_forward_image(ctx, global_img, &n_global_sam_tokens, NULL);
-            ds_image_free(global_img);
-            if (!global_sam_tokens) {
-                fprintf(stderr, "SAM forward failed for global image\n");
-                free(local_features);
-                goto cleanup_crops;
+            /* n_parallel = n_crops local + 1 global */
+            int n_parallel = n_crops + 1;
+            crop_task_t *tasks = (crop_task_t *)calloc(n_parallel, sizeof(crop_task_t));
+            pthread_t *threads = (pthread_t *)calloc(n_parallel, sizeof(pthread_t));
+
+            /* Launch local crop encoding */
+            for (int i = 0; i < n_crops; i++) {
+                tasks[i].ctx = ctx;
+                tasks[i].crop = crops[i];
+                tasks[i].tokens_per_crop = tokens_per_crop;
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
+                pthread_create(&threads[i], NULL, crop_worker, &tasks[i]);
             }
 
-            /* Override global SAM tokens with Python reference if DS_LOAD_SAM_ALL set */
+            /* Launch global crop encoding (task index = n_crops) */
             {
-                const char *load_sam_all = getenv("DS_LOAD_SAM_ALL");
-                if (load_sam_all) {
-                    char auto_path[512];
-                    /* Try crop6 first, then global */
-                    snprintf(auto_path, sizeof(auto_path), "%s6.bin", load_sam_all);
-                    FILE *sf = fopen(auto_path, "rb");
-                    if (!sf) {
-                        snprintf(auto_path, sizeof(auto_path), "%sglobal.bin", load_sam_all);
-                        sf = fopen(auto_path, "rb");
-                    }
-                    if (sf) {
-                        int n_read = (int)fread(global_sam_tokens, sizeof(float), n_global_sam_tokens * 896, sf);
-                        fclose(sf);
-                        fprintf(stderr, "DS_LOAD_SAM: global crop loaded %d floats from %s (expected %d)\n",
-                                n_read, auto_path, n_global_sam_tokens * 896);
+                int gi = n_crops;
+                tasks[gi].ctx = ctx;
+                tasks[gi].crop = global_img;
+                tasks[gi].tokens_per_crop = 256;  /* 64/4 * 64/4 = 16*16 = 256 */
+                /* Global uses causal_query_embeddings (256 queries), not 768 version */
+                pthread_create(&threads[gi], NULL, crop_worker_global, &tasks[gi]);
+            }
+
+            /* Wait for all tasks and collect results */
+            int global_failed = 0;
+            float *global_enc_tokens = NULL;
+            int n_global_enc_tokens = 0;
+
+            for (int i = 0; i < n_parallel; i++) {
+                pthread_join(threads[i], NULL);
+                if (tasks[i].failed) {
+                    fprintf(stderr, "Encoding failed for crop %d\n", i);
+                    if (i < n_crops) {
+                        /* Local crop failed — cleanup */
+                        for (int j = 0; j < n_parallel; j++) free(tasks[j].enc_tokens);
+                        free(tasks); free(threads); free(local_features);
+                        ds_image_free(global_img);
+                        goto cleanup_crops;
                     } else {
-                        fprintf(stderr, "Warning: DS_LOAD_SAM_ALL global not found\n");
+                        /* Global crop failed */
+                        global_failed = 1;
                     }
+                    continue;
+                }
+                if (ds_verbose >= 1) {
+                    const char *crop_type = (i < n_crops) ? "local" : "global";
+                    fprintf(stderr, "  %s crop %d: SAM %.2fs + Encoder %.2fs = %.2fs\n",
+                            crop_type, (i < n_crops) ? i + 1 : 0,
+                            tasks[i].sam_time, tasks[i].enc_time,
+                            tasks[i].sam_time + tasks[i].enc_time);
+                }
+
+                if (i < n_crops) {
+                    /* Local crop result */
+                    int old_count = local_token_count;
+                    local_token_count += tasks[i].n_enc_tokens;
+                    local_features = (float *)realloc(local_features, local_token_count * hidden * sizeof(float));
+                    memcpy(local_features + old_count * hidden, tasks[i].enc_tokens,
+                           tasks[i].n_enc_tokens * hidden * sizeof(float));
+                    free(tasks[i].enc_tokens);
+                } else {
+                    /* Global crop result */
+                    global_enc_tokens = tasks[i].enc_tokens;
+                    n_global_enc_tokens = tasks[i].n_enc_tokens;
                 }
             }
+            free(tasks); free(threads);
+            ds_image_free(global_img);
 
-            int n_global_enc_tokens;
-            int global_queries = 256;  /* 64/4 * 64/4 = 16*16 = 256 */
-            float *global_enc_tokens = ds_encoder_forward_v2(ctx, global_sam_tokens, n_global_sam_tokens,
-                                                              &n_global_enc_tokens,
-                                                              global_queries,
-                                                              ctx->vis_tokenizer.causal_query_embeddings);
-            free(global_sam_tokens);
+            if (global_failed || !global_enc_tokens) {
+                fprintf(stderr, "Global image encoding failed\n");
+                free(local_features);
+                goto cleanup_crops;
+            }
 
-            /* Step 4: Concatenate [local, global, view_separator] — matches Python
-             * Python uses masked_scatter_ with source=[local, global, view_sep]
-             * into mask positions ordered [global, view_sep, local].
-             * The net effect is that embedding positions get filled with
-             * [local[0:256], local[256], local[257:864]+global[0:256]+view_sep].
-             * Since C code directly places encoder_output into embed positions,
-             * we use the same source order: [local, global, view_sep]. */
+            /* Concatenate [local, global, view_separator] */
             int view_sep = 1;
             n_encoder_tokens = local_token_count + n_global_enc_tokens + view_sep;
             encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
@@ -1392,6 +1399,7 @@ prompt_construction:
         /* Single token: use it directly */
         memcpy(dec_input, input_embeds, hidden * sizeof(float));
     }
+    double prefill_end = now_ms();
     free(input_embeds);
 
     double decode_start = now_ms();
@@ -1537,6 +1545,7 @@ prompt_construction:
     ctx->perf_total_ms = total_end - t0;
     ctx->perf_text_tokens = n_generated;
     ctx->perf_encode_ms = encode_end - encode_start;
+    ctx->perf_prefill_ms = prefill_end - encode_end;  /* prompt construction + prefill */
     ctx->perf_decode_ms = total_end - decode_start;
 
     if (ds_verbose >= 1)

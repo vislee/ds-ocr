@@ -404,8 +404,11 @@ typedef struct {
     /* Per-run performance stats */
     double perf_total_ms;
     int perf_text_tokens;
-    double perf_encode_ms;
-    double perf_decode_ms;
+    double perf_encode_ms;        /* image → encoder output (SAM + DeepEncoder) */
+    double perf_decode_ms;        /* autoregressive decode loop */
+    double perf_prefill_ms;       /* prefill (KV cache fill from encoder tokens) */
+    double perf_sam_ms;           /* SAM vision tokenizer only (for multi-crop, last crop's time) */
+    double perf_encoder_ms;       /* DeepEncoder/CLIP only */
 
     /* Per-layer profiler stats (enabled by --profile) */
     int profile_enabled;                       /* 0=off, 1=on */
