@@ -185,14 +185,17 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 # Basic OCR
 ./ds_ocr -d ./deepseek-ocr -i document.png
 
-# With options
-./ds_ocr -d ./deepseek-ocr -i doc.png -t 8 -n 2048 --temp 0.0
+# With repetition penalty (recommended for OCR: 1.01-1.03)
+./ds_ocr -d ./deepseek-ocr -i doc.png --rp 1.03
 
-# Debug mode (verbose per-layer output)
+# Silent mode — only OCR text on stdout (for piping/skill integration)
+./ds_ocr -d ./deepseek-ocr -i doc.png --rp 1.03 --silent
+
+# Profile mode — show phase timing breakdown
+./ds_ocr -d ./deepseek-ocr -i doc.png --rp 1.03 --profile
+
+# Debug mode — verbose per-layer output
 ./ds_ocr -d ./deepseek-ocr -i doc.png --debug
-
-# Silent mode (only output recognized text)
-./ds_ocr -d ./deepseek-ocr -i doc.png --silent > output.txt
 
 # macOS Vision backend (no model weights required)
 ./ds_ocr -i doc.png --vision --silent
@@ -208,10 +211,14 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | `-t <n>` | Number of threads | all CPUs |
 | `-n <n>` | Max new tokens | 4096 |
 | `--temp <f>` | Sampling temperature | 0 (greedy) |
+| `--rp <f>` | Repetition penalty (1.0 = off, try 1.01-1.1) | 1.0 |
+| `--ngram <n>` | No-repeat n-gram size (0 = off, try 20-35) | 0 |
+| `--min-tokens <n>` | Min tokens before allowing EOS | 256 |
 | `--vision` | Use macOS Vision OCR backend | off |
-| `--vision-fast` | Use macOS Vision OCR backend in fast mode | off |
+| `--vision-fast` | Use macOS Vision OCR backend (fast) | off |
+| `--profile` | Show phase-level timing breakdown | off |
 | `--debug` | Verbose debug output | off |
-| `--silent` | Only output recognition text | off |
+| `--silent` | Only output OCR text (for piping) | off |
 | `-h` | Show help | — |
 
 ### C API
@@ -364,16 +371,47 @@ See [test.c](test.c) for available test suites:
 
 Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 
-| Stage | V1 Time | V2 Time (6 crops) |
-|-------|---------|---------|
-| Model loading (mmap) | < 1s | < 1s |
-| SAM+Encoder (6 crops parallel) | ~200ms | ~50s |
-| Prefill (862 tokens) | ~0.2s | ~30s |
-| Decode (per token) | ~15ms | ~135ms |
-| **Total (test截屏.png)** | ~1s | **~97s (7.5× faster than Python)** |
+### End-to-End (ds-ocr学习.png, 6-crop V2 image)
 
-> **Note**: V2 pipeline uses multi-crop encoding (6 local + 1 global) with parallel crop processing.
-> Python PyTorch (CPU, BF16) takes ~736s for the same image.
+| Stage | v0.5 | v0.7 | **v0.8** | Optimization |
+|-------|------|------|----------|-------------|
+| Model loading (mmap) | <1s | <1s | <1s | — |
+| SAM+Encoder | ~50s | ~12s | **8.8s** | Parallel global crop |
+| Prefill (862 tokens) | ~30s | ~12s | **1.1s** | Batched MoE sgemm |
+| Decode (280 tokens) | ~19s | ~6.3s | **6.2s** | F32 KV cache + fused ops |
+| **Total** | **~97s** | **~30s** | **16s** | |
+
+> **v0.8 is 6× faster than v0.5 and 45× faster than Python PyTorch (CPU, BF16, ~736s).**
+
+### Optimization Highlights
+
+| Phase | Optimization | Speedup |
+|-------|-------------|---------|
+| **Prefill** | Batched gate scoring (sgemm all tokens × 64 experts) | 11× |
+| **Prefill** | Batched shared experts (sgemm all tokens × gate/up/down) | |
+| **Prefill** | Grouped routed experts (batch tokens per expert → sgemm) | |
+| **Encoding** | Parallel global crop with local crops (7 threads) | 1.36× |
+| **Decode** | F32 KV cache (aligned + prefetch, no BF16→F32 per step) | 1.5× |
+| **Decode** | Fused residual + RMS norm (NEON/AVX2/AVX-512) | |
+| **Decode** | Direct SwiGLU (no interleaving), fast expf | |
+
+### Profiler Output
+
+```
+$ ./ds_ocr -d model_dir -i image.png --profile
+...
+Inference: 16061 ms, 280 text tokens (45.21 tok/s decode)
+  Encoding: 8783 ms | Prefill: 1092 ms | Decode: 6185 ms
+```
+
+### Small Image (1-crop V2)
+
+| Stage | Time |
+|-------|------|
+| SAM+Encoder (1 crop + global, parallel) | ~5s |
+| Prefill (401 tokens) | ~0.3s |
+| Decode | ~5-6s |
+| **Total** | **~11s** |
 
 ## Current Status
 
@@ -382,10 +420,20 @@ Typical inference on Apple M2 Pro (8 threads, BLAS accelerated):
 | **SAM Vision Tokenizer** | ✅ Working | ✅ Verified |
 | **Encoder** | ✅ Working | ✅ Working (corr ~0.995 vs Python) |
 | **Projector** | ✅ Working | ✅ Working (linear 896→1280) |
-| **MoE Decoder** | ✅ Working | ✅ **Verified** (gate softmax fix: corr 0.82→0.9998, logits match Python exactly) |
+| **MoE Decoder** | ✅ Working | ✅ **Verified** (gate softmax fix: corr 0.82→0.9998) |
 | **Tokenizer** | ✅ Working | ✅ Working |
 | **Multi-crop** | N/A | ✅ Working |
-| **End-to-end OCR** | ✅ | ✅ **Verified** (99.29% text similarity vs Python model.infer()) |
+| **End-to-end OCR** | ✅ | ✅ **Verified** (99.29% text similarity vs Python) |
+
+### v0.8 — Batched MoE + Parallel Encoding
+
+**16s end-to-end on Apple M2 Pro** (6× faster than v0.5, 45× faster than Python):
+
+- **Batched MoE prefill** (11× speedup): All tokens processed via sgemm — gate scoring,
+  shared experts, and grouped routed experts replace per-token BF16 matvec loops
+- **Parallel global crop**: Global image encoding overlaps with local crops, saving ~4s
+- **F32 KV cache** (v0.7): Aligned + prefetch, eliminated BF16↔F32 conversion per decode step
+- **Fused kernels** (v0.7): Residual + RMS norm, direct SwiGLU, NEON RMS norm, batch decode
 
 ### v0.5 — Decoder Correctness Verified
 
@@ -393,30 +441,10 @@ The MoE decoder is now **fully verified** against Python. Using identical `input
 
 **Key fix**: MoE gate softmax order — Python softmaxes over all 64 experts first, then selects top-K. C was selecting top-K first then softmaxing only those K. This caused different expert routing and 0.82 correlation at Layer 11. After fix: 0.9998 correlation.
 
-**End-to-end results** (Apple M2 Pro, 8 threads, BLAS):
+### Known Issues
 
-| Test Image | C Output | Python Output | Similarity |
-|------------|----------|---------------|------------|
-| test_simple.png | Hello World\n\nOCR Test 123 | (same) | 100% |
-| test截屏.png | # OpenAI Responses API\n基于 OpenAI Python SDK v1.70.0... | (same, minor char diff) | 99.29% |
-
-**lm_head.weight** is NOT tied with embed_tokens.weight (max_diff=3.46). C correctly loads and uses the separate `lm_head_bf16` weight.
-
-### Performance (v0.5)
-
-| Stage | Time | Speed |
-|-------|------|-------|
-| Model loading (mmap) | <1s | — |
-| SAM+Encoder (6 crops parallel) | ~50s | — |
-| Prefill (862 tokens) | ~30s | 5.5 tok/s |
-| Decode (142 tokens) | ~19s | **7.4 tok/s** |
-| **Total** | **~97s** | **7.5× faster than Python** |
-
-### Known Issues (V2)
-
-1. **SAM encoder precision drift**: C's SAM+Encoder produces slightly different output from Python (corr ~0.995) due to BF16 weight quantization and float32 accumulation across 12 SAM + 24 DeepEncoder layers. This causes minor OCR text differences (e.g., "有效对话" vs "有状态对话") but does not affect overall OCR quality.
-2. **Prefill speed**: MoE per-token expert forward is the main bottleneck (~70% of total time). Future optimization: batched shared experts via sgemm, grouped expert batching.
-3. **lm_head not tied**: The model's `lm_head.weight` differs from `embed_tokens.weight` — C correctly loads the separate weight file.
+1. **SAM encoder precision drift**: C's SAM+Encoder produces slightly different output from Python (corr ~0.995) due to FP32 accumulation across 12 SAM + 24 DeepEncoder layers. This causes minor OCR text differences but does not affect overall quality.
+2. **lm_head not tied**: `lm_head.weight` differs from `embed_tokens.weight` — C correctly loads the separate weight.
 
 ## Model Support
 
@@ -431,7 +459,7 @@ The MoE decoder is now **fully verified** against Python. Using identical `input
 |---------|-------------------|------------------------|
 | Weight format | Full FP32/BF16 tensors | Memory-mapped BF16 (zero-copy) |
 | Attention | FlashAttention / SDPA | Online softmax (no O(seq²) memory), window attn: pad→QKV→attn (matches Python) |
-| MoE routing | Scatter/gather on GPU | Sequential expert evaluation |
+| MoE routing | Scatter/gather on GPU | Batched sgemm: grouped expert batching, shared experts in one pass |
 | Position embeddings | Dynamic computation | Precomputed RoPE tables (LLaMA rotate_half style) |
 | SAM Neck conv2 | 1×1 conv (V1) / 3×3 conv (V2) | V2: 3×3 s1 p1 conv (controlled by `g_sam_is_v2`) |
 | Image resize | PIL BICUBIC (antialias) | Antialias bicubic (filter expansion for downsampling) |

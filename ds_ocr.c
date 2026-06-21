@@ -1430,7 +1430,7 @@ prompt_construction:
         } else {
             /* Decode: process current token, get next token */
             token = ds_decoder_forward(ctx, dec_input);
-            if (step < 5) {
+            if (ds_verbose >= 3 && step < 5) {
                 /* Print top-3 logits for first decode steps */
                 float *logits = ctx->dec_logits;
                 if (logits) {
