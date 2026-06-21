@@ -30,6 +30,21 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          float *expert_outputs_buf);
 
 /* ========================================================================
+ * BF16 ↔ F32 Conversion Helpers
+ * ======================================================================== */
+
+/* Store F32 K/V into BF16 KV cache */
+static inline void ds_kv_store_bf16(uint16_t *dst, const float *src, int n) {
+    ds_f32_to_bf16_batch(dst, src, (size_t)n);
+}
+
+/* Batch convert BF16 KV cache [seq_len, kv_dim] → F32 */
+static inline void ds_kv_batch_load_bf16(float *dst, const uint16_t *src,
+                                          int seq_len, int kv_dim) {
+    ds_bf16_to_f32_batch(dst, src, (size_t)seq_len * kv_dim);
+}
+
+/* ========================================================================
  * Dense FFN Forward Pass (SwiGLU, used for layer 0)
  * ======================================================================== */
 
@@ -125,7 +140,7 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
             if (scores[e] > max_s) max_s = scores[e];
         float sum_exp = 0.0f;
         for (int e = 0; e < n_experts; e++) {
-            scores[e] = expf(scores[e] - max_s);
+            scores[e] = ds_fast_expf(scores[e] - max_s);
             sum_exp += scores[e];
         }
         float inv = 1.0f / sum_exp;
@@ -208,11 +223,15 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     int kv_dim = n_kv_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    double t_layer_start = 0, t0 = 0;
+    if (ctx->profile_enabled) t_layer_start = ds_time_sec();
+
     /* Input RMSNorm */
     float *x_norm = ctx->dec_x_norm;
     ds_rms_norm(x_norm, x, layer->input_norm, 1, hidden, cfg->dec_rms_norm_eps);
 
     /* QKV projections (fused single-token matvec) */
+    if (ctx->profile_enabled) t0 = ds_time_sec();
     float *q = ctx->dec_q;
     float *k = ctx->dec_k;
     float *v = ctx->dec_v;
@@ -235,30 +254,47 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);
     ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);
 
-    /* Store K, V in KV cache */
-    int cache_offset = ctx->kv_cache_len;
-    float *cache_k = ctx->kv_cache_k + (size_t)layer_idx * ctx->kv_cache_max * kv_dim
-                      + cache_offset * kv_dim;
-    float *cache_v = ctx->kv_cache_v + (size_t)layer_idx * ctx->kv_cache_max * kv_dim
-                      + cache_offset * kv_dim;
-    memcpy(cache_k, k, kv_dim * sizeof(float));
-    memcpy(cache_v, v, kv_dim * sizeof(float));
+    if (ctx->profile_enabled) ctx->perf_layer_qkv_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
-    /* Causal attention with GQA */
+    /* Store K, V in KV cache (F32→BF16 conversion for 2x bandwidth savings) */
+    int cache_offset = ctx->kv_cache_len;
+    uint16_t *cache_k_bf16 = ctx->kv_cache_k + (size_t)layer_idx * ctx->kv_cache_max * kv_dim
+                              + cache_offset * kv_dim;
+    uint16_t *cache_v_bf16 = ctx->kv_cache_v + (size_t)layer_idx * ctx->kv_cache_max * kv_dim
+                              + cache_offset * kv_dim;
+    ds_kv_store_bf16(cache_k_bf16, k, kv_dim);
+    ds_kv_store_bf16(cache_v_bf16, v, kv_dim);
+
+    /* Causal attention with GQA — convert entire KV cache to F32 for computation.
+     * This is more efficient than per-row BF16→F32 in the attention loop because:
+     * 1) One batch conversion amortizes overhead
+     * 2) F32 attention uses NEON FMA at full throughput
+     * 3) Memory read is sequential (cache-friendly) */
+    if (ctx->profile_enabled) t0 = ds_time_sec();
     float *attn_out = ctx->dec_attn_out;
-    ds_causal_attention(attn_out, q, ctx->kv_cache_k + (size_t)layer_idx * ctx->kv_cache_max * kv_dim,
-                        ctx->kv_cache_v + (size_t)layer_idx * ctx->kv_cache_max * kv_dim,
-                        1, cache_offset + 1, n_heads, n_kv_heads, head_dim, scale, cache_offset);
+    const uint16_t *layer_k_bf16 = ctx->kv_cache_k + (size_t)layer_idx * ctx->kv_cache_max * kv_dim;
+    const uint16_t *layer_v_bf16 = ctx->kv_cache_v + (size_t)layer_idx * ctx->kv_cache_max * kv_dim;
+    int kv_seq_len = cache_offset + 1;
+    float *k_f32 = ctx->kv_cache_k_f32;
+    float *v_f32 = ctx->kv_cache_v_f32;
+    ds_kv_batch_load_bf16(k_f32, layer_k_bf16, kv_seq_len, kv_dim);
+    ds_kv_batch_load_bf16(v_f32, layer_v_bf16, kv_seq_len, kv_dim);
+    ds_causal_attention(attn_out, q, k_f32, v_f32,
+                        1, kv_seq_len, n_heads, n_kv_heads, head_dim, scale, cache_offset);
+    if (ctx->profile_enabled) ctx->perf_layer_attn_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
     /* Output projection + residual */
+    if (ctx->profile_enabled) t0 = ds_time_sec();
     float *proj_out = ctx->dec_proj_out;
     ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, 1, q_dim, hidden);
+    if (ctx->profile_enabled) ctx->perf_layer_proj_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
     /* Post-attention RMSNorm + residual */
     for (int i = 0; i < hidden; i++) out[i] = x[i] + proj_out[i];
     ds_rms_norm(x_norm, out, layer->post_attn_norm, 1, hidden, cfg->dec_rms_norm_eps);
 
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
+    if (ctx->profile_enabled) t0 = ds_time_sec();
     float *mlp_out = ctx->dec_expert_out;  /* reuse preallocated buffer */
     mlp_forward(mlp_out, x_norm, layer, cfg, layer_idx,
                 ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
@@ -271,6 +307,11 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
 
     /* Add MLP output + residual */
     for (int i = 0; i < hidden; i++) out[i] += mlp_out[i];
+
+    if (ctx->profile_enabled) {
+        ctx->perf_layer_mlp_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
+        ctx->perf_layer_total_ms[layer_idx] = (ds_time_sec() - t_layer_start) * 1000.0;
+    }
 }
 
 /* ========================================================================
@@ -339,47 +380,52 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                                seq_len, n_kv_heads, head_dim);
         }
 
-        /* Store K, V in cache */
+        /* Store K, V in cache (F32→BF16) */
         for (int s = 0; s < seq_len; s++) {
             int pos = ctx->kv_cache_len + s;
-            float *cache_k = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim + pos * kv_dim;
-            float *cache_v = ctx->kv_cache_v + (size_t)l * ctx->kv_cache_max * kv_dim + pos * kv_dim;
-            memcpy(cache_k, K + s * kv_dim, kv_dim * sizeof(float));
-            memcpy(cache_v, V + s * kv_dim, kv_dim * sizeof(float));
+            uint16_t *cache_k_bf16 = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim + pos * kv_dim;
+            uint16_t *cache_v_bf16 = ctx->kv_cache_v + (size_t)l * ctx->kv_cache_max * kv_dim + pos * kv_dim;
+            ds_kv_store_bf16(cache_k_bf16, K + s * kv_dim, kv_dim);
+            ds_kv_store_bf16(cache_v_bf16, V + s * kv_dim, kv_dim);
         }
 
         /* Debug: dump cached K for layer 0 to verify cache layout */
         if (l == 0 && getenv("DS_DUMP_DECODER")) {
             FILE *df = fopen("dump/c_layer0_cached_K.bin", "wb");
             if (df) {
-                /* Dump from cache base, seq_len positions */
-                float *cache_base = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim;
-                fwrite(cache_base, sizeof(float), seq_len * kv_dim, df);
+                /* Convert BF16 cache back to F32 for debug dump */
+                float *cache_f32 = (float *)malloc(seq_len * kv_dim * sizeof(float));
+                const uint16_t *cache_bf16 = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim;
+                ds_kv_batch_load_bf16(cache_f32, cache_bf16, seq_len, kv_dim);
+                fwrite(cache_f32, sizeof(float), seq_len * kv_dim, df);
+                free(cache_f32);
                 fclose(df);
             }
         }
 
-        /* Causal attention (prefill all tokens) */
-        float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
-        ds_causal_attention(attn_out, Q,
-                            ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim,
-                            ctx->kv_cache_v + (size_t)l * ctx->kv_cache_max * kv_dim,
-                            seq_len, ctx->kv_cache_len + seq_len,
-                            n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len);
+        /* Causal attention (prefill all tokens) — batch convert KV cache to F32 */
+        {
+            int total_kv_len = ctx->kv_cache_len + seq_len;
+            const uint16_t *layer_k_bf16 = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim;
+            const uint16_t *layer_v_bf16 = ctx->kv_cache_v + (size_t)l * ctx->kv_cache_max * kv_dim;
+            float *k_f32 = ctx->kv_cache_k_f32;
+            float *v_f32 = ctx->kv_cache_v_f32;
+            ds_kv_batch_load_bf16(k_f32, layer_k_bf16, total_kv_len, kv_dim);
+            ds_kv_batch_load_bf16(v_f32, layer_v_bf16, total_kv_len, kv_dim);
 
-        /* Debug: dump layer 0 attn_out */
-        if (l == 0 && getenv("DS_DUMP_DECODER")) {
-            FILE *df = fopen("dump/c_layer0_attn_out.bin", "wb");
-            if (df) { fwrite(attn_out, sizeof(float), seq_len * q_dim, df); fclose(df); }
-            fprintf(stderr, "Dumped C layer 0 attn_out (%d x %d)\n", seq_len, q_dim);
+            float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
+            ds_causal_attention(attn_out, Q, k_f32, v_f32,
+                                seq_len, total_kv_len,
+                                n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len);
+
+            /* Output projection + residual */
+            float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
+            ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, seq_len, q_dim, hidden);
+            free(attn_out);
+
+            for (int i = 0; i < seq_len * hidden; i++) x[i] += proj_out[i];
+            free(proj_out);
         }
-
-        /* Output projection + residual */
-        float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
-        ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, seq_len, q_dim, hidden);
-        free(attn_out);
-
-        for (int i = 0; i < seq_len * hidden; i++) x[i] += proj_out[i];
 
         /* Debug: dump layer 0 after attention for comparison */
         if (l == 0 && getenv("DS_DUMP_DECODER")) {
@@ -394,8 +440,6 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             last_mean /= hidden;
             fprintf(stderr, "  C layer0 after_attn last token: mean=%.6f\n", last_mean);
         }
-
-        free(proj_out);
 
         /* Post-attention RMSNorm */
         ds_rms_norm(x_norm, x, layer->post_attn_norm, seq_len, hidden, cfg->dec_rms_norm_eps);
@@ -466,7 +510,7 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                         if (s_scores[e] > max_s) max_s = s_scores[e];
                     float sum_exp = 0.0f;
                     for (int e = 0; e < n_experts; e++) {
-                        s_scores[e] = expf(s_scores[e] - max_s);
+                        s_scores[e] = ds_fast_expf(s_scores[e] - max_s);
                         sum_exp += s_scores[e];
                     }
                     float inv = 1.0f / sum_exp;
@@ -695,14 +739,68 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         } else {
             token = ds_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, hidden, vocab);
         }
+        if (ctx->profile_enabled) ctx->perf_lm_head_ms += ds_time_sec() * 1000.0;
         return token;
     }
 
-    /* Compute full logits vector */
-    if (dec->lm_head_bf16) {
-        ds_bf16_matvec_pub(logits, x, dec->lm_head_bf16, NULL, hidden, vocab);
+    /* Compute full logits vector using sgemm with pre-converted F32 weights.
+     * For LM head (1280→129280), cblas_sgemm is much faster than per-row
+     * NEON BF16 dot because Accelerate's sgemm is heavily optimized. */
+    if (ctx->profile_enabled) {
+        double t_lm = ds_time_sec();
+        if (dec->lm_head_bf16) {
+            if (!ctx->lm_head_f32_ready) {
+                size_t n = (size_t)vocab * hidden;
+                ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
+                ctx->lm_head_f32_ready = 1;
+                if (ds_verbose >= 1)
+                    fprintf(stderr, "LM head: converted %zu BF16→F32 weights for sgemm (%.1f MB)\n",
+                            n, n * sizeof(float) / 1048576.0);
+            }
+            if (ctx->lm_head_f32) {
+                ds_f32_matvec_sgemm(logits, x, ctx->lm_head_f32, hidden, vocab);
+            } else {
+                ds_bf16_matvec_pub(logits, x, dec->lm_head_bf16, NULL, hidden, vocab);
+            }
+        } else {
+            /* Tied embeddings — use tok_embeddings */
+            if (!ctx->tok_emb_f32_ready) {
+                size_t n = (size_t)vocab * hidden;
+                ctx->tok_emb_f32 = ds_bf16_to_f32_alloc(dec->tok_embeddings_bf16, n);
+                ctx->tok_emb_f32_ready = 1;
+            }
+            if (ctx->tok_emb_f32) {
+                ds_f32_matvec_sgemm(logits, x, ctx->tok_emb_f32, hidden, vocab);
+            } else {
+                ds_bf16_matvec_pub(logits, x, dec->tok_embeddings_bf16, NULL, hidden, vocab);
+            }
+        }
+        ctx->perf_lm_head_ms = (ds_time_sec() - t_lm) * 1000.0;
     } else {
-        ds_bf16_matvec_pub(logits, x, dec->tok_embeddings_bf16, NULL, hidden, vocab);
+        /* Non-profile path: same sgemm optimization */
+        if (dec->lm_head_bf16) {
+            if (!ctx->lm_head_f32_ready) {
+                size_t n = (size_t)vocab * hidden;
+                ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
+                ctx->lm_head_f32_ready = 1;
+            }
+            if (ctx->lm_head_f32) {
+                ds_f32_matvec_sgemm(logits, x, ctx->lm_head_f32, hidden, vocab);
+            } else {
+                ds_bf16_matvec_pub(logits, x, dec->lm_head_bf16, NULL, hidden, vocab);
+            }
+        } else {
+            if (!ctx->tok_emb_f32_ready) {
+                size_t n = (size_t)vocab * hidden;
+                ctx->tok_emb_f32 = ds_bf16_to_f32_alloc(dec->tok_embeddings_bf16, n);
+                ctx->tok_emb_f32_ready = 1;
+            }
+            if (ctx->tok_emb_f32) {
+                ds_f32_matvec_sgemm(logits, x, ctx->tok_emb_f32, hidden, vocab);
+            } else {
+                ds_bf16_matvec_pub(logits, x, dec->tok_embeddings_bf16, NULL, hidden, vocab);
+            }
+        }
     }
 
     /* Debug: print top-5 logits for first few decode steps */

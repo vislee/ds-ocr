@@ -345,10 +345,13 @@ typedef struct {
     char model_dir[512];
 
     /* KV cache for decoder */
-    float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */
-    float *kv_cache_v;
+    /* KV cache for decoder — stored as BF16 for 2x memory bandwidth savings */
+    uint16_t *kv_cache_k;     /* [layers, max_seq, kv_heads * head_dim] in BF16 */
+    uint16_t *kv_cache_v;     /* [layers, max_seq, kv_heads * head_dim] in BF16 */
     int kv_cache_len;
     int kv_cache_max;
+    float *kv_cache_k_f32;    /* [max_seq * kv_dim] temp buffer for BF16→F32 batch conversion (attention) */
+    float *kv_cache_v_f32;
 
     /* Persistent decoder buffers (single-token generation) */
     float *dec_x, *dec_x_norm, *dec_q, *dec_k, *dec_v;
@@ -393,13 +396,31 @@ typedef struct {
     int *token_history;                /* generated token IDs for penalty */
     int token_history_len;
     int token_history_cap;
-    int no_repeat_ngram_size;          /* n-gram blocking (0=disabled, default=20) */
+    int no_repeat_ngram_size;          /* n-gram blocking (0=disabled, default=0) */
+    int min_new_tokens;               /* Min tokens before allowing EOS (0=disabled, default=256) */
 
     /* Per-run performance stats */
     double perf_total_ms;
     int perf_text_tokens;
     double perf_encode_ms;
     double perf_decode_ms;
+
+    /* Per-layer profiler stats (enabled by --profile) */
+    int profile_enabled;                       /* 0=off, 1=on */
+    double perf_layer_qkv_ms[DS_MAX_DEC_LAYERS];      /* QKV projection time per layer */
+    double perf_layer_attn_ms[DS_MAX_DEC_LAYERS];     /* Attention time per layer */
+    double perf_layer_proj_ms[DS_MAX_DEC_LAYERS];     /* Output projection time per layer */
+    double perf_layer_mlp_ms[DS_MAX_DEC_LAYERS];      /* MLP/MoE time per layer */
+    double perf_layer_total_ms[DS_MAX_DEC_LAYERS];    /* Total time per layer */
+    double perf_lm_head_ms;                           /* LM head projection time */
+    double perf_sampling_ms;                           /* Sampling/repetition penalty time */
+    int perf_decode_steps;                            /* Number of decode steps executed */
+
+    /* Pre-converted F32 weight caches for sgemm (BF16→F32, allocated on first use) */
+    float *lm_head_f32;             /* [vocab_size, hidden] F32 version of lm_head_bf16 */
+    int lm_head_f32_ready;          /* 1 = converted and ready for sgemm */
+    float *tok_emb_f32;             /* [vocab_size, hidden] F32 version of tok_embeddings_bf16 (if tied) */
+    int tok_emb_f32_ready;
 } ds_ctx_t;
 
 /* ========================================================================

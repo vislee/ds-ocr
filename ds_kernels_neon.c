@@ -9,6 +9,54 @@
 #include <arm_neon.h>
 #include <string.h>
 
+/* ========================================================================
+ * NEON-optimized BF16 → F32 batch conversion
+ * ======================================================================== */
+
+void ds_bf16_to_f32_neon(float *dst, const uint16_t *src, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t bf = vld1q_u16(src + i);
+        uint32x4_t lo = vshll_n_u16(vget_low_u16(bf), 16);
+        uint32x4_t hi = vshll_n_u16(vget_high_u16(bf), 16);
+        vst1q_f32(dst + i, vreinterpretq_f32_u32(lo));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(hi));
+    }
+    for (; i + 4 <= n; i += 4) {
+        uint16x4_t bf = vld1_u16(src + i);
+        uint32x4_t f32 = vshll_n_u16(bf, 16);
+        vst1q_f32(dst + i, vreinterpretq_f32_u32(f32));
+    }
+    for (; i < n; i++) {
+        uint32_t u = ((uint32_t)src[i]) << 16;
+        memcpy(dst + i, &u, sizeof(float));
+    }
+}
+
+/* ========================================================================
+ * NEON-optimized F32 → BF16 conversion
+ * ======================================================================== */
+
+void ds_f32_to_bf16_neon(uint16_t *dst, const float *src, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float32x4_t v0 = vld1q_f32(src + i);
+        float32x4_t v1 = vld1q_f32(src + i + 4);
+        /* Round to nearest even: add bias then shift right 16 */
+        uint32x4_t b0 = vaddq_u32(vreinterpretq_u32_f32(v0), vdupq_n_u32(0x8000));
+        uint32x4_t b1 = vaddq_u32(vreinterpretq_u32_f32(v1), vdupq_n_u32(0x8000));
+        uint16x4_t r0 = vshrn_n_u32(b0, 16);
+        uint16x4_t r1 = vshrn_n_u32(b1, 16);
+        vst1q_u16(dst + i, vcombine_u16(r0, r1));
+    }
+    for (; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, src + i, sizeof(u));
+        u = (u + 0x8000) & 0xFFFF0000u;
+        dst[i] = (uint16_t)(u >> 16);
+    }
+}
+
 void ds_bf16_matvec_fused_neon(float *y, const float *x, const uint16_t *W_bf16,
                                  const float *bias, int in_dim, int out_dim) {
     int o = 0;

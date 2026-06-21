@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 /* Maximum experts per layer (for static array sizing) */
 #define DS_MAX_EXPERTS 64
@@ -204,5 +205,54 @@ int ds_get_num_cpus(void);
 /* Global verbose flag */
 extern int ds_verbose;
 extern int ds_bf16_simulate_python;
+
+/* ========================================================================
+ * Timing Utilities
+ * ======================================================================== */
+
+/* High-resolution timer in seconds (uses gettimeofday) */
+static inline double ds_time_sec(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
+/* ========================================================================
+ * Fast Math Approximations
+ * ======================================================================== */
+
+/* Fast exp approximation (Schraudolph 1999).
+ * Relative error < 1.5%, ~5x faster than expf() on ARM NEON.
+ * Available as inline for use across translation units. */
+static inline float ds_fast_expf(float x) {
+    if (x < -88.0f) return 0.0f;
+    if (x > 88.0f) return 1e38f;
+    union { uint32_t i; float f; } u;
+    u.i = (uint32_t)(12102203.0f * x + 1064866805.0f);
+    return u.f;
+}
+
+/* ========================================================================
+ * BF16 → F32 Weight Conversion (for sgemm cache)
+ * ======================================================================== */
+
+/* Convert BF16 weights to F32 buffer. Caller must free the result. */
+float *ds_bf16_to_f32_alloc(const uint16_t *src, size_t n);
+
+/* Batched BF16→F32 conversion into pre-allocated dst */
+void ds_bf16_to_f32_convert(float *dst, const uint16_t *src, size_t n);
+
+/* NEON-optimized batch BF16↔F32 conversion (auto-dispatched) */
+void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n);
+void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n);
+
+/* ========================================================================
+ * SGEMM-accelerated matvec (for large output dims like LM head)
+ * ======================================================================== */
+
+/* y[out_dim] = W_f32[out_dim, in_dim] @ x[in_dim] using cblas_sgemm.
+ * W_f32 must be pre-converted from BF16. Thread-safe. */
+void ds_f32_matvec_sgemm(float *y, const float *x, const float *W_f32,
+                          int in_dim, int out_dim);
 
 #endif /* DS_KERNELS_H */

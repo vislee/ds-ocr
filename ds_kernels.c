@@ -41,6 +41,8 @@ static inline float ds_f32_to_bf16_to_f32(float x) {
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ds_fast_expf now provided by ds_kernels.h (inline) */
+
 /* ========================================================================
  * Thread Pool
  * ======================================================================== */
@@ -898,6 +900,72 @@ void ds_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 }
 
 /* ========================================================================
+ * BF16 → F32 Weight Conversion
+ * ======================================================================== */
+
+float *ds_bf16_to_f32_alloc(const uint16_t *src, size_t n) {
+    float *dst = (float *)malloc(n * sizeof(float));
+    if (!dst) return NULL;
+    ds_bf16_to_f32_convert(dst, src, n);
+    return dst;
+}
+
+void ds_bf16_to_f32_convert(float *dst, const uint16_t *src, size_t n) {
+    uint32_t *d = (uint32_t *)(void *)dst;
+    for (size_t i = 0; i < n; i++)
+        d[i] = ((uint32_t)src[i]) << 16;
+}
+
+/* NEON-optimized batch conversion dispatch */
+#ifdef __ARM_NEON
+extern void ds_bf16_to_f32_neon(float *dst, const uint16_t *src, size_t n);
+extern void ds_f32_to_bf16_neon(uint16_t *dst, const float *src, size_t n);
+
+void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n) {
+    ds_bf16_to_f32_neon(dst, src, n);
+}
+void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n) {
+    ds_f32_to_bf16_neon(dst, src, n);
+}
+#else
+void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n) {
+    ds_bf16_to_f32_convert(dst, src, n);
+}
+void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, src + i, sizeof(u));
+        u = (u + 0x8000) & 0xFFFF0000u;
+        dst[i] = (uint16_t)(u >> 16);
+    }
+}
+#endif
+
+/* ========================================================================
+ * SGEMM-accelerated matvec (for large output dims like LM head)
+ * ======================================================================== */
+
+void ds_f32_matvec_sgemm(float *y, const float *x, const float *W_f32,
+                          int in_dim, int out_dim) {
+#ifdef USE_BLAS
+    /* y = W_f32 @ x where W_f32 is [out_dim, in_dim], x is [in_dim], y is [out_dim]
+     * Using sgemm: y[1, out_dim] = x[1, in_dim] @ W_f32^T[in_dim, out_dim]
+     * cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+     *             M=1, N=out_dim, K=in_dim, 1.0, x, in_dim, W_f32, in_dim, 0.0, y, out_dim) */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                1, out_dim, in_dim, 1.0f, x, in_dim, W_f32, in_dim, 0.0f, y, out_dim);
+#else
+    /* Fallback: naive matvec */
+    for (int o = 0; o < out_dim; o++) {
+        const float *w_row = W_f32 + (size_t)o * in_dim;
+        float sum = 0.0f;
+        for (int k = 0; k < in_dim; k++) sum += x[k] * w_row[k];
+        y[o] = sum;
+    }
+#endif
+}
+
+/* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)
  * ======================================================================== */
 
@@ -1292,11 +1360,11 @@ static void ds_swiglu_worker(int tid, int n_threads, void *arg) {
             }
 #endif
         } else {
-            /* In-place mode (decode seq=1): keep single-pass scalar to avoid alias hazards. */
+            /* In-place mode (decode seq=1): use fast exp approximation. */
             for (int j = 0; j < inter; j++) {
                 float g = gu[2 * j];
                 float u = gu[2 * j + 1];
-                g = g / (1.0f + expf(-g)); /* SiLU */
+                g = g / (1.0f + ds_fast_expf(-g)); /* SiLU with fast exp */
                 o[j] = g * u;
             }
         }
@@ -1382,12 +1450,12 @@ void ds_bidirectional_attention(float *out, const float *Q, const float *K,
                 float score = ds_dot_f32(q_row, k_row, head_dim) * scale;
 
                 if (score > max_score) {
-                    float correction = expf(max_score - score);
+                    float correction = ds_fast_expf(max_score - score);
                     sum_exp = sum_exp * correction + 1.0f;
                     ds_vec_scale_add(o_row, v_row, correction, head_dim);
                     max_score = score;
                 } else {
-                    float wt = expf(score - max_score);
+                    float wt = ds_fast_expf(score - max_score);
                     sum_exp += wt;
                     ds_vec_axpy_inplace(o_row, v_row, wt, head_dim);
                 }
@@ -1431,12 +1499,12 @@ static void ds_causal_attention_heads(float *out, const float *Q, const float *K
                 float score = ds_dot_f32(q_row, k_row, head_dim) * scale;
 
                 if (score > max_score) {
-                    float correction = expf(max_score - score);
+                    float correction = ds_fast_expf(max_score - score);
                     sum_exp = sum_exp * correction + 1.0f;
                     ds_vec_scale_add(o_row, v_row, correction, head_dim);
                     max_score = score;
                 } else {
-                    float wt = expf(score - max_score);
+                    float wt = ds_fast_expf(score - max_score);
                     sum_exp += wt;
                     ds_vec_axpy_inplace(o_row, v_row, wt, head_dim);
                 }
@@ -1475,10 +1543,97 @@ static void ds_causal_attn_worker(int tid, int n_threads, void *arg) {
                                 t->head_dim, t->scale, t->q_offset, h0, h1);
 }
 
+/* ========================================================================
+ * Fused Decode Attention: single-token, standard MHA (no GQA)
+ * ======================================================================== */
+
+typedef struct {
+    float *out; const float *Q; const float *K; const float *V;
+    int n_heads; int head_dim; float scale; int k_end;
+} ds_dec_attn_task_t;
+
+static void ds_dec_attn_worker(int tid, int nt, void *arg) {
+    ds_dec_attn_task_t *t = (ds_dec_attn_task_t *)arg;
+    int chunk = (t->n_heads + nt - 1) / nt;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    int hidden = t->n_heads * t->head_dim;
+    for (int h = h0; h < h1; h++) {
+        const float *q = t->Q + h * t->head_dim;
+        const float *k_base = t->K + h * t->head_dim;
+        const float *v_base = t->V + h * t->head_dim;
+        float *o = t->out + h * t->head_dim;
+        float max_s = -1e30f, sum_e = 0.0f;
+        for (int d = 0; d < t->head_dim; d++) o[d] = 0.0f;
+        for (int j = 0; j < t->k_end; j++) {
+            float score = ds_dot_f32(q, k_base + j * hidden, t->head_dim) * t->scale;
+            if (score > max_s) {
+                float corr = ds_fast_expf(max_s - score);
+                sum_e = sum_e * corr + 1.0f;
+                ds_vec_scale_add(o, v_base + j * hidden, corr, t->head_dim);
+                max_s = score;
+            } else {
+                float wt = ds_fast_expf(score - max_s);
+                sum_e += wt;
+                ds_vec_axpy_inplace(o, v_base + j * hidden, wt, t->head_dim);
+            }
+        }
+        if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, t->head_dim);
+    }
+}
+
 void ds_causal_attention(float *out, const float *Q, const float *K, const float *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset) {
-    if (tp.n_threads > 1 && n_heads >= 2 && (seq_q >= 2 || seq_k >= 128)) {
+    /* Fast path: single-token decode with standard MHA (no GQA).
+     * Fused QK+softmax+VO in one pass per head, avoiding intermediate writes.
+     * This is the most common decode pattern: seq_q=1, n_kv_heads=n_heads. */
+    if (seq_q == 1 && n_heads == n_kv_heads && n_heads >= 2) {
+        int k_end = q_offset + 1;
+        if (k_end > seq_k) k_end = seq_k;
+
+        if (tp.n_threads > 1) {
+            ds_dec_attn_task_t task = {
+                .out = out, .Q = Q, .K = K, .V = V,
+                .n_heads = n_heads, .head_dim = head_dim,
+                .scale = scale, .k_end = k_end
+            };
+            ds_parallel_for(ds_dec_attn_worker, &task);
+            return;
+        }
+
+        /* Single-threaded fused decode attention */
+        int hidden = n_heads * head_dim;
+        for (int h = 0; h < n_heads; h++) {
+            const float *q = Q + h * head_dim;
+            float *o = out + h * head_dim;
+            float max_s = -1e30f, sum_e = 0.0f;
+            for (int d = 0; d < head_dim; d++) o[d] = 0.0f;
+
+            for (int j = 0; j < k_end; j++) {
+                const float *k_row = K + j * hidden + h * head_dim;
+                const float *v_row = V + j * hidden + h * head_dim;
+                float score = ds_dot_f32(q, k_row, head_dim) * scale;
+
+                if (score > max_s) {
+                    float corr = ds_fast_expf(max_s - score);
+                    sum_e = sum_e * corr + 1.0f;
+                    ds_vec_scale_add(o, v_row, corr, head_dim);
+                    max_s = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_s);
+                    sum_e += wt;
+                    ds_vec_axpy_inplace(o, v_row, wt, head_dim);
+                }
+            }
+            if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, head_dim);
+        }
+        return;
+    }
+
+    /* General path with GQA support */
+    if (tp.n_threads > 1 && n_heads >= 2) {
         ds_causal_attn_task_t task = {
             .out = out, .Q = Q, .K = K, .V = V,
             .seq_q = seq_q, .seq_k = seq_k,

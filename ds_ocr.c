@@ -36,9 +36,7 @@ static double now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
-static double ds_time_sec(void) {
-    return now_ms() / 1000.0;
-}
+/* ds_time_sec now provided by ds_kernels.h (inline) */
 
 /* ========================================================================
  * Parallel crop encoding (for multi-crop SAM + encoder)
@@ -437,10 +435,17 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->kv_cache_max = max_seq;
     ctx->kv_cache_len = 0;
 
-    size_t kv_size = (size_t)cfg->dec_layers * max_seq * kv_dim * sizeof(float);
-    ctx->kv_cache_k = (float *)calloc(1, kv_size);
-    ctx->kv_cache_v = (float *)calloc(1, kv_size);
+    /* KV cache stored as BF16 — 2x memory bandwidth savings vs F32 */
+    size_t kv_size = (size_t)cfg->dec_layers * max_seq * kv_dim * sizeof(uint16_t);
+    ctx->kv_cache_k = (uint16_t *)calloc(1, kv_size);
+    ctx->kv_cache_v = (uint16_t *)calloc(1, kv_size);
     if (!ctx->kv_cache_k || !ctx->kv_cache_v) return -1;
+
+    /* BF16→F32 conversion buffers for attention (batch convert entire K/V rows) */
+    ctx->kv_cache_k_f32 = (float *)malloc((size_t)max_seq * kv_dim * sizeof(float));
+    ctx->kv_cache_v_f32 = (float *)malloc((size_t)max_seq * kv_dim * sizeof(float));
+    if (!ctx->kv_cache_k_f32 || !ctx->kv_cache_v_f32) return -1;
+
 
     /* Single-token decoder buffers */
     ctx->dec_x = (float *)malloc(hidden * sizeof(float));
@@ -514,7 +519,11 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->max_new_tokens = 4096;
     ctx->temperature = 0.0f; /* Greedy by default */
     ctx->repeat_penalty = 1.0f; /* No penalty by default */
-    ctx->no_repeat_ngram_size = 35; /* Match Python eval_mode default */
+    ctx->no_repeat_ngram_size = 0; /* Disabled by default; ngram blocking causes premature EOS in OCR.
+                                      Use --ngram N to enable (Python: 20 non-eval, 35 eval) */
+    ctx->min_new_tokens = 256;     /* Suppress EOS for first 256 tokens to avoid premature truncation.
+                                      OCR documents often need >200 tokens; model may output EOS at
+                                      paragraph breaks. Use --min-tokens 0 to disable. */
 
     return 0;
 }
@@ -586,6 +595,8 @@ void ds_free(ds_ctx_t *ctx) {
     /* Free decoder buffers */
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+    free(ctx->kv_cache_k_f32);
+    free(ctx->kv_cache_v_f32);
     free(ctx->dec_x); free(ctx->dec_x_norm);
     free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
     free(ctx->dec_attn_out); free(ctx->dec_proj_out);
@@ -596,6 +607,8 @@ void ds_free(ds_ctx_t *ctx) {
     free(ctx->rope_inv_freq);
     free(ctx->rope_cache_cos); free(ctx->rope_cache_sin);
     free(ctx->enc_output);
+    free(ctx->lm_head_f32);
+    free(ctx->tok_emb_f32);
 
     /* Note: visual tokenizer, encoder, and decoder weight pointers
      * point into mmap'd safetensors data — they are freed when
@@ -1430,8 +1443,49 @@ prompt_construction:
         }
 
         if (token == eos_token) {
-            if (ds_verbose >= 2) fprintf(stderr, "EOS at step %d\n", step);
-            break;
+            /* Suppress premature EOS: if we haven't generated enough tokens yet,
+             * ban EOS and pick the next-best token instead.
+             * This matches Python's NoEOSTextStreamer behavior where EOS is
+             * replaced with newline and generation continues. */
+            if (step < ctx->min_new_tokens && ctx->dec_logits) {
+                float *logits = ctx->dec_logits;
+                /* Ban EOS token and find next best */
+                logits[eos_token] = -1e30f;
+                int best_id = 0;
+                float best_val = logits[0];
+                for (int i = 1; i < cfg->vocab_size; i++) {
+                    if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
+                }
+                token = best_id;
+                if (ds_verbose >= 1) {
+                    fprintf(stderr, "EOS suppressed at step %d (< min_new_tokens=%d), using token=%d instead\n",
+                            step, ctx->min_new_tokens, token);
+                }
+            } else {
+                if (ds_verbose >= 1) {
+                    /* Print top-5 logits at EOS to diagnose termination */
+                    float *logits = ctx->dec_logits;
+                    if (logits) {
+                        int top_ids[5]; float top_vals[5];
+                        for (int i = 0; i < 5; i++) { top_ids[i] = -1; top_vals[i] = -1e30f; }
+                        for (int i = 0; i < cfg->vocab_size; i++) {
+                            for (int j = 0; j < 5; j++) {
+                                if (logits[i] > top_vals[j]) {
+                                    for (int k = 4; k > j; k--) { top_vals[k] = top_vals[k-1]; top_ids[k] = top_ids[k-1]; }
+                                    top_vals[j] = logits[i]; top_ids[j] = i; break;
+                                }
+                            }
+                        }
+                        fprintf(stderr, "EOS at step %d, top5=[%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f] (EOS logit=%.4f)\n",
+                                step, top_ids[0], top_vals[0], top_ids[1], top_vals[1],
+                                top_ids[2], top_vals[2], top_ids[3], top_vals[3], top_ids[4], top_vals[4],
+                                logits[eos_token]);
+                    } else {
+                        fprintf(stderr, "EOS at step %d\n", step);
+                    }
+                }
+                break;
+            }
         }
 
         /* Record token in history for repetition penalty */
@@ -1470,6 +1524,8 @@ prompt_construction:
 
         n_generated++;
     }
+
+    ctx->perf_decode_steps = n_generated;
 
     free(dec_input);
 
