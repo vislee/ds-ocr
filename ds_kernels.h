@@ -75,6 +75,16 @@ void ds_layer_norm(float *out, const float *x, const float *weight, const float 
 void ds_rms_norm(float *out, const float *x, const float *weight,
                  int seq_len, int hidden, float eps);
 
+/* Fused residual add + RMS norm: out = x + residual, then norm_out = rms_norm(out, weight).
+ * Avoids separate loop for residual and saves one pass over the data. */
+void ds_residual_rms_norm(float *out, float *norm_out,
+                           const float *x, const float *residual,
+                           const float *weight, int hidden, float eps);
+
+/* Vector add: dst[i] = a[i] + b[i] — used for residual connections.
+ * This replaces the scalar loops in decoder_layer_forward. */
+void ds_vec_add(float *dst, const float *a, const float *b, int n);
+
 /* Per-head RMS Normalization for Q/K norms in decoder */
 void ds_rms_norm_per_head(float *x, const float *weight,
                            int seq_len, int n_heads, int head_dim, float eps);
@@ -89,6 +99,13 @@ void ds_softmax(float *x, int rows, int cols);
 
 /* out[seq,inter] = SiLU(gate_up[seq,2*inter][:,even]) * gate_up[:,odd] */
 void ds_swiglu_multiply(float *out, const float *gate_up, int seq_len, int intermediate);
+
+/* Direct SiLU(gate) * up without interleaving.
+ * gate_buf and up_buf are separate contiguous arrays (not interleaved).
+ * out[i] = SiLU(gate_buf[i]) * up_buf[i] for i in [0, intermediate).
+ * This avoids the gate_up interleaving pattern which causes non-sequential writes. */
+void ds_swiglu_direct(float *out, const float *gate_buf, const float *up_buf,
+                       int seq_len, int intermediate);
 
 /* ========================================================================
  * Attention Operations
@@ -106,13 +123,22 @@ void ds_bidirectional_attention(float *out, const float *Q, const float *K,
 /*
  * Causal attention with GQA (decoder).
  * Q: [seq_q, n_heads * head_dim]
- * K: [seq_k, n_kv_heads * head_dim]
+ * K: [seq_k, n_kv_heads * head_dim]  (stride = kv_dim between rows)
  * V: [seq_k, n_kv_heads * head_dim]
  * q_offset: global position of first query (for causal mask)
  */
 void ds_causal_attention(float *out, const float *Q, const float *K, const float *V,
                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
                           int head_dim, float scale, int q_offset);
+
+/*
+ * Causal attention with aligned KV cache stride (decoder).
+ * Same as ds_causal_attention but K/V rows are at kv_stride (≥ kv_dim) apart,
+ * allowing cache-line aligned KV cache access.
+ */
+void ds_causal_attention_aligned(float *out, const float *Q, const float *K, const float *V,
+                                   int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                   int head_dim, float scale, int q_offset, int kv_stride);
 
 /*
  * Mixed attention for DeepEncoder V2: visual tokens use bidirectional,

@@ -33,15 +33,36 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
  * BF16 ↔ F32 Conversion Helpers
  * ======================================================================== */
 
-/* Store F32 K/V into BF16 KV cache */
-static inline void ds_kv_store_bf16(uint16_t *dst, const float *src, int n) {
-    ds_f32_to_bf16_batch(dst, src, (size_t)n);
+/* ========================================================================
+ * KV Cache Access Helpers — F32 direct storage (no BF16 conversion)
+ * ======================================================================== */
+
+/* Get pointer to K cache row for a given layer and position.
+ * Cache layout: [layers][max_seq][kv_row_stride], kv_row_stride >= kv_dim. */
+static inline float *ds_kv_k_row(ds_ctx_t *ctx, int layer, int pos) {
+    int stride = ctx->_kv_row_stride;
+    return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
 }
 
-/* Batch convert BF16 KV cache [seq_len, kv_dim] → F32 */
-static inline void ds_kv_batch_load_bf16(float *dst, const uint16_t *src,
-                                          int seq_len, int kv_dim) {
-    ds_bf16_to_f32_batch(dst, src, (size_t)seq_len * kv_dim);
+static inline float *ds_kv_v_row(ds_ctx_t *ctx, int layer, int pos) {
+    int stride = ctx->_kv_row_stride;
+    return ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
+}
+
+/* Get pointer to start of K/V cache for a layer (row 0) */
+static inline float *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
+    int stride = ctx->_kv_row_stride;
+    return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride;
+}
+
+static inline float *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
+    int stride = ctx->_kv_row_stride;
+    return ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride;
+}
+
+/* Store F32 K/V directly into the aligned F32 KV cache */
+static inline void ds_kv_store_f32(float *dst, const float *src, int n) {
+    memcpy(dst, src, (size_t)n * sizeof(float));
 }
 
 /* ========================================================================
@@ -66,15 +87,11 @@ static void dense_ffn_forward(float *output, const float *x,
     ds_linear_nobias_bf16(gate_buf, x, layer->dense_gate_weight_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, layer->dense_up_weight_bf16, 1, hidden, intermediate);
 
-    /* SwiGLU: SiLU(gate) * up */
-    float *gate_up = (float *)malloc(2 * intermediate * sizeof(float));
-    for (int i = 0; i < intermediate; i++) {
-        gate_up[2 * i] = gate_buf[i];
-        gate_up[2 * i + 1] = up_buf[i];
-    }
-
-    ds_swiglu_multiply(swiglu_buf, gate_up, 1, intermediate);
-    free(gate_up);
+    /* SwiGLU: SiLU(gate) * up — direct computation without interleaving.
+     * Previously: gate_up[2*i]=gate[i], gate_up[2*i+1]=up[i], then ds_swiglu_multiply.
+     * That interleaving caused non-sequential writes (cache-unfriendly).
+     * ds_swiglu_direct computes SiLU(gate[i]) * up[i] directly. */
+    ds_swiglu_direct(swiglu_buf, gate_buf, up_buf, 1, intermediate);
 
     /* Down projection */
     ds_linear_nobias_bf16(output, swiglu_buf, layer->dense_down_weight_bf16, 1, intermediate, hidden);
@@ -189,19 +206,13 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
         ds_linear_nobias_bf16(shared_gate_buf, x, layer->shared_gate_weight_bf16, 1, hidden, shared_inter);
         ds_linear_nobias_bf16(shared_up_buf, x, layer->shared_up_weight_bf16, 1, hidden, shared_inter);
 
-        for (int i = 0; i < shared_inter; i++) {
-            shared_gate_up_buf[2 * i] = shared_gate_buf[i];
-            shared_gate_up_buf[2 * i + 1] = shared_up_buf[i];
-        }
-
-        ds_swiglu_multiply(shared_swiglu_buf, shared_gate_up_buf, 1, shared_inter);
+        /* Direct SwiGLU — no gate_up interleaving needed */
+        ds_swiglu_direct(shared_swiglu_buf, shared_gate_buf, shared_up_buf, 1, shared_inter);
 
         ds_linear_nobias_bf16(shared_out_buf, shared_swiglu_buf, layer->shared_down_weight_bf16,
                                1, shared_inter, hidden);
 
-        for (int i = 0; i < hidden; i++) {
-            output[i] += shared_out_buf[i];
-        }
+        ds_vec_add(output, output, shared_out_buf, hidden);
     }
 }
 
@@ -256,31 +267,27 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
 
     if (ctx->profile_enabled) ctx->perf_layer_qkv_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
-    /* Store K, V in KV cache (F32→BF16 conversion for 2x bandwidth savings) */
+    /* Store K, V directly into F32 KV cache (no BF16 conversion needed).
+     * This eliminates the per-step batch BF16→F32 conversion that previously
+     * dominated attention time (O(seq_len) conversion per decode step). */
     int cache_offset = ctx->kv_cache_len;
-    uint16_t *cache_k_bf16 = ctx->kv_cache_k + (size_t)layer_idx * ctx->kv_cache_max * kv_dim
-                              + cache_offset * kv_dim;
-    uint16_t *cache_v_bf16 = ctx->kv_cache_v + (size_t)layer_idx * ctx->kv_cache_max * kv_dim
-                              + cache_offset * kv_dim;
-    ds_kv_store_bf16(cache_k_bf16, k, kv_dim);
-    ds_kv_store_bf16(cache_v_bf16, v, kv_dim);
+    float *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);
+    float *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);
+    ds_kv_store_f32(cache_k_row, k, kv_dim);
+    ds_kv_store_f32(cache_v_row, v, kv_dim);
 
-    /* Causal attention with GQA — convert entire KV cache to F32 for computation.
-     * This is more efficient than per-row BF16→F32 in the attention loop because:
-     * 1) One batch conversion amortizes overhead
-     * 2) F32 attention uses NEON FMA at full throughput
-     * 3) Memory read is sequential (cache-friendly) */
+    /* Causal attention — read directly from F32 KV cache (zero conversion).
+     * The cache is aligned and contiguous for optimal sequential read.
+     * K/V rows are at stride _kv_row_stride (≥ kv_dim, aligned to 64 bytes). */
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *attn_out = ctx->dec_attn_out;
-    const uint16_t *layer_k_bf16 = ctx->kv_cache_k + (size_t)layer_idx * ctx->kv_cache_max * kv_dim;
-    const uint16_t *layer_v_bf16 = ctx->kv_cache_v + (size_t)layer_idx * ctx->kv_cache_max * kv_dim;
+    float *k_base = ds_kv_k_layer(ctx, layer_idx);
+    float *v_base = ds_kv_v_layer(ctx, layer_idx);
     int kv_seq_len = cache_offset + 1;
-    float *k_f32 = ctx->kv_cache_k_f32;
-    float *v_f32 = ctx->kv_cache_v_f32;
-    ds_kv_batch_load_bf16(k_f32, layer_k_bf16, kv_seq_len, kv_dim);
-    ds_kv_batch_load_bf16(v_f32, layer_v_bf16, kv_seq_len, kv_dim);
-    ds_causal_attention(attn_out, q, k_f32, v_f32,
-                        1, kv_seq_len, n_heads, n_kv_heads, head_dim, scale, cache_offset);
+    int kv_stride = ctx->_kv_row_stride;
+    ds_causal_attention_aligned(attn_out, q, k_base, v_base,
+                                1, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                                scale, cache_offset, kv_stride);
     if (ctx->profile_enabled) ctx->perf_layer_attn_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
     /* Output projection + residual */
@@ -289,9 +296,10 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, 1, q_dim, hidden);
     if (ctx->profile_enabled) ctx->perf_layer_proj_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
-    /* Post-attention RMSNorm + residual */
-    for (int i = 0; i < hidden; i++) out[i] = x[i] + proj_out[i];
-    ds_rms_norm(x_norm, out, layer->post_attn_norm, 1, hidden, cfg->dec_rms_norm_eps);
+    /* Post-attention: fused residual add + RMS norm.
+     * This combines out = x + proj_out and norm_out = rms_norm(out, weight)
+     * into a single operation, eliminating one pass over hidden=1280 elements. */
+    ds_residual_rms_norm(out, x_norm, x, proj_out, layer->post_attn_norm, hidden, cfg->dec_rms_norm_eps);
 
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
     if (ctx->profile_enabled) t0 = ds_time_sec();
@@ -305,8 +313,8 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
                 ctx->moe_shared_out_buf,
                 ctx->moe_expert_outputs);
 
-    /* Add MLP output + residual */
-    for (int i = 0; i < hidden; i++) out[i] += mlp_out[i];
+    /* Add MLP output + residual (SIMD vector add) */
+    ds_vec_add(out, out, mlp_out, hidden);
 
     if (ctx->profile_enabled) {
         ctx->perf_layer_mlp_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
@@ -380,50 +388,33 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                                seq_len, n_kv_heads, head_dim);
         }
 
-        /* Store K, V in cache (F32→BF16) */
+        /* Store K, V directly into F32 KV cache (no BF16 conversion) */
         for (int s = 0; s < seq_len; s++) {
             int pos = ctx->kv_cache_len + s;
-            uint16_t *cache_k_bf16 = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim + pos * kv_dim;
-            uint16_t *cache_v_bf16 = ctx->kv_cache_v + (size_t)l * ctx->kv_cache_max * kv_dim + pos * kv_dim;
-            ds_kv_store_bf16(cache_k_bf16, K + s * kv_dim, kv_dim);
-            ds_kv_store_bf16(cache_v_bf16, V + s * kv_dim, kv_dim);
+            float *cache_k_row = ds_kv_k_row(ctx, l, pos);
+            float *cache_v_row = ds_kv_v_row(ctx, l, pos);
+            ds_kv_store_f32(cache_k_row, K + s * kv_dim, kv_dim);
+            ds_kv_store_f32(cache_v_row, V + s * kv_dim, kv_dim);
         }
 
-        /* Debug: dump cached K for layer 0 to verify cache layout */
-        if (l == 0 && getenv("DS_DUMP_DECODER")) {
-            FILE *df = fopen("dump/c_layer0_cached_K.bin", "wb");
-            if (df) {
-                /* Convert BF16 cache back to F32 for debug dump */
-                float *cache_f32 = (float *)malloc(seq_len * kv_dim * sizeof(float));
-                const uint16_t *cache_bf16 = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim;
-                ds_kv_batch_load_bf16(cache_f32, cache_bf16, seq_len, kv_dim);
-                fwrite(cache_f32, sizeof(float), seq_len * kv_dim, df);
-                free(cache_f32);
-                fclose(df);
-            }
-        }
-
-        /* Causal attention (prefill all tokens) — batch convert KV cache to F32 */
+        /* Causal attention (prefill all tokens) — read directly from F32 KV cache */
         {
             int total_kv_len = ctx->kv_cache_len + seq_len;
-            const uint16_t *layer_k_bf16 = ctx->kv_cache_k + (size_t)l * ctx->kv_cache_max * kv_dim;
-            const uint16_t *layer_v_bf16 = ctx->kv_cache_v + (size_t)l * ctx->kv_cache_max * kv_dim;
-            float *k_f32 = ctx->kv_cache_k_f32;
-            float *v_f32 = ctx->kv_cache_v_f32;
-            ds_kv_batch_load_bf16(k_f32, layer_k_bf16, total_kv_len, kv_dim);
-            ds_kv_batch_load_bf16(v_f32, layer_v_bf16, total_kv_len, kv_dim);
+            float *k_base = ds_kv_k_layer(ctx, l);
+            float *v_base = ds_kv_v_layer(ctx, l);
+            int kv_stride = ctx->_kv_row_stride;
 
             float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
-            ds_causal_attention(attn_out, Q, k_f32, v_f32,
+            ds_causal_attention_aligned(attn_out, Q, k_base, v_base,
                                 seq_len, total_kv_len,
-                                n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len);
+                                n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
 
             /* Output projection + residual */
             float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
             ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, seq_len, q_dim, hidden);
             free(attn_out);
 
-            for (int i = 0; i < seq_len * hidden; i++) x[i] += proj_out[i];
+            ds_vec_add(x, x, proj_out, seq_len * hidden);
             free(proj_out);
         }
 
@@ -449,7 +440,6 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             /* Dense FFN (layer 0): batched via BLAS sgemm — much faster than per-token */
             float *gate_buf = (float *)malloc(seq_len * cfg->dec_intermediate * sizeof(float));
             float *up_buf = (float *)malloc(seq_len * cfg->dec_intermediate * sizeof(float));
-            float *gate_up_buf = (float *)malloc(seq_len * 2 * cfg->dec_intermediate * sizeof(float));
             float *swiglu_buf = (float *)malloc(seq_len * cfg->dec_intermediate * sizeof(float));
             float *mlp_out = (float *)malloc(seq_len * hidden * sizeof(float));
 
@@ -458,20 +448,13 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             ds_linear_nobias_bf16(up_buf, x_norm, layer->dense_up_weight_bf16,
                                    seq_len, hidden, cfg->dec_intermediate);
 
-            for (int s = 0; s < seq_len; s++) {
-                for (int i = 0; i < cfg->dec_intermediate; i++) {
-                    gate_up_buf[(size_t)s * 2 * cfg->dec_intermediate + 2 * i] =
-                        gate_buf[(size_t)s * cfg->dec_intermediate + i];
-                    gate_up_buf[(size_t)s * 2 * cfg->dec_intermediate + 2 * i + 1] =
-                        up_buf[(size_t)s * cfg->dec_intermediate + i];
-                }
-            }
-            ds_swiglu_multiply(swiglu_buf, gate_up_buf, seq_len, cfg->dec_intermediate);
+            /* Direct SwiGLU — no gate_up interleaving needed */
+            ds_swiglu_direct(swiglu_buf, gate_buf, up_buf, seq_len, cfg->dec_intermediate);
             ds_linear_nobias_bf16(mlp_out, swiglu_buf, layer->dense_down_weight_bf16,
                                    seq_len, cfg->dec_intermediate, hidden);
 
-            for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
-            free(gate_buf); free(up_buf); free(gate_up_buf); free(swiglu_buf); free(mlp_out);
+            ds_vec_add(x, x, mlp_out, seq_len * hidden);
+            free(gate_buf); free(up_buf); free(swiglu_buf); free(mlp_out);
         } else {
             /* MoE MLP (layers 1-11): batched gate scoring + batched shared experts
              * + per-token routed expert forward. */
@@ -562,19 +545,14 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                                            layer->shared_gate_weight_bf16, 1, hidden, shared_inter);
                     ds_linear_nobias_bf16(ctx->moe_shared_up_buf, x_norm + s * hidden,
                                            layer->shared_up_weight_bf16, 1, hidden, shared_inter);
-                    for (int i = 0; i < shared_inter; i++) {
-                        ctx->moe_shared_gate_up_buf[2 * i] = ctx->moe_shared_gate_buf[i];
-                        ctx->moe_shared_gate_up_buf[2 * i + 1] = ctx->moe_shared_up_buf[i];
-                    }
-                    ds_swiglu_multiply(ctx->moe_shared_swiglu_buf,
-                                       ctx->moe_shared_gate_up_buf, 1, shared_inter);
+                    ds_swiglu_direct(ctx->moe_shared_swiglu_buf,
+                                      ctx->moe_shared_gate_buf,
+                                      ctx->moe_shared_up_buf, 1, shared_inter);
                     ds_linear_nobias_bf16(ctx->moe_shared_out_buf,
                                            ctx->moe_shared_swiglu_buf,
                                            layer->shared_down_weight_bf16,
                                            1, shared_inter, hidden);
-                    for (int i = 0; i < hidden; i++) {
-                        mlp_out[s * hidden + i] += ctx->moe_shared_out_buf[i];
-                    }
+                    ds_vec_add(mlp_out + s * hidden, mlp_out + s * hidden, ctx->moe_shared_out_buf, hidden);
                 }
             }
             for (int i = 0; i < seq_len * hidden; i++) x[i] += mlp_out[i];
@@ -900,6 +878,196 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     }
 
     return token;
+}
+
+/* ========================================================================
+ * Batch Decode: process N tokens through all layers at once.
+ * Each token attends to all prior KV cache + prior tokens in batch.
+ * Uses batched matvec (sgemm) for QKV projections and LM head,
+ * shared KV cache reads across all N tokens per layer.
+ * ======================================================================== */
+
+void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
+                                int n_tokens, int *tokens_out) {
+    ds_moe_decoder_t *dec = &ctx->decoder;
+    ds_config_t *cfg = &ctx->config;
+    int hidden = cfg->dec_hidden;
+    int n_heads = cfg->dec_heads;
+    int n_kv_heads = cfg->dec_kv_heads;
+    int head_dim = cfg->dec_head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int kv_stride = ctx->_kv_row_stride;
+
+    /* Allocate batch buffers */
+    float *x = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
+    float *x_norm = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
+    float *Q = (float *)malloc((size_t)n_tokens * q_dim * sizeof(float));
+    float *K = (float *)malloc((size_t)n_tokens * kv_dim * sizeof(float));
+    float *V = (float *)malloc((size_t)n_tokens * kv_dim * sizeof(float));
+    float *attn_out = (float *)malloc((size_t)n_tokens * q_dim * sizeof(float));
+    float *proj_out = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
+
+    memcpy(x, input_embeds, (size_t)n_tokens * hidden * sizeof(float));
+
+    for (int l = 0; l < cfg->dec_layers; l++) {
+        ds_dec_layer_t *layer = &dec->layers[l];
+        int cache_offset = ctx->kv_cache_len;
+
+        /* Input RMSNorm (batched) */
+        ds_rms_norm(x_norm, x, layer->input_norm, n_tokens, hidden, cfg->dec_rms_norm_eps);
+
+        /* QKV projections — batched sgemm for all n_tokens at once.
+         * This is the key advantage: one sgemm call instead of n_tokens separate matvecs. */
+        ds_linear_nobias_bf16(Q, x_norm, layer->wq_weight_bf16, n_tokens, hidden, q_dim);
+        ds_linear_nobias_bf16(K, x_norm, layer->wk_weight_bf16, n_tokens, hidden, kv_dim);
+        ds_linear_nobias_bf16(V, x_norm, layer->wv_weight_bf16, n_tokens, hidden, kv_dim);
+
+        /* Per-head Q/K RMSNorm (optional) */
+        if (layer->q_norm_weight)
+            ds_rms_norm_per_head(Q, layer->q_norm_weight, n_tokens, n_heads, head_dim, cfg->dec_rms_norm_eps);
+        if (layer->k_norm_weight)
+            ds_rms_norm_per_head(K, layer->k_norm_weight, n_tokens, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
+
+        /* RoPE */
+        ds_apply_rope_neox(Q, ctx->rope_cache_cos + cache_offset * head_dim,
+                           ctx->rope_cache_sin + cache_offset * head_dim,
+                           n_tokens, n_heads, head_dim);
+        ds_apply_rope_neox(K, ctx->rope_cache_cos + cache_offset * head_dim,
+                           ctx->rope_cache_sin + cache_offset * head_dim,
+                           n_tokens, n_kv_heads, head_dim);
+
+        /* Store K, V in F32 cache */
+        for (int s = 0; s < n_tokens; s++) {
+            int pos = cache_offset + s;
+            ds_kv_store_f32(ds_kv_k_row(ctx, l, pos), K + s * kv_dim, kv_dim);
+            ds_kv_store_f32(ds_kv_v_row(ctx, l, pos), V + s * kv_dim, kv_dim);
+        }
+
+        /* Causal attention — batched, with aligned stride */
+        {
+            int total_kv_len = cache_offset + n_tokens;
+            float *k_base = ds_kv_k_layer(ctx, l);
+            float *v_base = ds_kv_v_layer(ctx, l);
+            ds_causal_attention_aligned(attn_out, Q, k_base, v_base,
+                                n_tokens, total_kv_len,
+                                n_heads, n_kv_heads, head_dim, scale, cache_offset, kv_stride);
+
+            /* Output projection */
+            ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, n_tokens, q_dim, hidden);
+        }
+
+        /* Residual add + post-attention RMSNorm (fused) */
+        for (int s = 0; s < n_tokens; s++) {
+            float *x_s = x + s * hidden;
+            float *xn_s = x_norm + s * hidden;
+            float *po_s = proj_out + s * hidden;
+            ds_residual_rms_norm(x_s, xn_s, x_s, po_s, layer->post_attn_norm, hidden, cfg->dec_rms_norm_eps);
+        }
+
+        /* MLP */
+        if (l < cfg->dec_first_k_dense) {
+            /* Dense FFN — batched sgemm */
+            float *gate_buf = (float *)malloc((size_t)n_tokens * cfg->dec_intermediate * sizeof(float));
+            float *up_buf = (float *)malloc((size_t)n_tokens * cfg->dec_intermediate * sizeof(float));
+            float *swiglu_buf = (float *)malloc((size_t)n_tokens * cfg->dec_intermediate * sizeof(float));
+            float *mlp_out = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
+
+            ds_linear_nobias_bf16(gate_buf, x_norm, layer->dense_gate_weight_bf16,
+                                   n_tokens, hidden, cfg->dec_intermediate);
+            ds_linear_nobias_bf16(up_buf, x_norm, layer->dense_up_weight_bf16,
+                                   n_tokens, hidden, cfg->dec_intermediate);
+            ds_swiglu_direct(swiglu_buf, gate_buf, up_buf, n_tokens, cfg->dec_intermediate);
+            ds_linear_nobias_bf16(mlp_out, swiglu_buf, layer->dense_down_weight_bf16,
+                                   n_tokens, cfg->dec_intermediate, hidden);
+
+            for (int s = 0; s < n_tokens; s++) {
+                ds_vec_add(x + s * hidden, x + s * hidden, mlp_out + s * hidden, hidden);
+            }
+            free(gate_buf); free(up_buf); free(swiglu_buf); free(mlp_out);
+        } else {
+            /* MoE — per-token (same as decode path, no batch benefit for MoE routing) */
+            for (int s = 0; s < n_tokens; s++) {
+                float *mlp_out = ctx->dec_expert_out;
+                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, l,
+                            ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
+                            ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
+                            ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
+                            ctx->moe_shared_gate_buf, ctx->moe_shared_up_buf,
+                            ctx->moe_shared_gate_up_buf, ctx->moe_shared_swiglu_buf,
+                            ctx->moe_shared_out_buf,
+                            ctx->moe_expert_outputs);
+                ds_vec_add(x + s * hidden, x + s * hidden, mlp_out, hidden);
+            }
+        }
+    }
+
+    /* Advance KV cache */
+    ctx->kv_cache_len += n_tokens;
+
+    /* Final RMSNorm + LM head for each token */
+    float *norm_buf = (float *)malloc(hidden * sizeof(float));
+    for (int s = 0; s < n_tokens; s++) {
+        ds_rms_norm(norm_buf, x + s * hidden, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
+
+        int token;
+        if (ctx->dec_logits) {
+            if (dec->lm_head_bf16) {
+                if (!ctx->lm_head_f32_ready) {
+                    size_t n = (size_t)cfg->vocab_size * hidden;
+                    ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
+                    ctx->lm_head_f32_ready = 1;
+                }
+                ds_f32_matvec_sgemm(ctx->dec_logits, norm_buf, ctx->lm_head_f32, hidden, cfg->vocab_size);
+            } else {
+                if (!ctx->tok_emb_f32_ready) {
+                    size_t n = (size_t)cfg->vocab_size * hidden;
+                    ctx->tok_emb_f32 = ds_bf16_to_f32_alloc(dec->tok_embeddings_bf16, n);
+                    ctx->tok_emb_f32_ready = 1;
+                }
+                ds_f32_matvec_sgemm(ctx->dec_logits, norm_buf, ctx->tok_emb_f32, hidden, cfg->vocab_size);
+            }
+
+            /* Apply repetition penalty */
+            float rp = ctx->repeat_penalty;
+            if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
+                for (int i = 0; i < ctx->token_history_len; i++) {
+                    int tid = ctx->token_history[i];
+                    if (tid >= 0 && tid < cfg->vocab_size) {
+                        ctx->dec_logits[tid] = (ctx->dec_logits[tid] > 0) ?
+                            ctx->dec_logits[tid] / rp : ctx->dec_logits[tid] * rp;
+                    }
+                }
+            }
+
+            /* Argmax */
+            token = 0;
+            float best = ctx->dec_logits[0];
+            for (int i = 1; i < cfg->vocab_size; i++) {
+                if (ctx->dec_logits[i] > best) { best = ctx->dec_logits[i]; token = i; }
+            }
+        } else {
+            if (dec->lm_head_bf16)
+                token = ds_argmax_matvec_bf16(norm_buf, dec->lm_head_bf16, hidden, cfg->vocab_size);
+            else
+                token = ds_argmax_matvec_bf16(norm_buf, dec->tok_embeddings_bf16, hidden, cfg->vocab_size);
+        }
+        tokens_out[s] = token;
+    }
+    free(norm_buf);
+
+    /* Record all tokens in history */
+    if (ctx->token_history) {
+        for (int s = 0; s < n_tokens; s++) {
+            if (ctx->token_history_len < ctx->token_history_cap) {
+                ctx->token_history[ctx->token_history_len++] = tokens_out[s];
+            }
+        }
+    }
+
+    free(x); free(x_norm); free(Q); free(K); free(V);
+    free(attn_out); free(proj_out);
 }
 
 /* ========================================================================

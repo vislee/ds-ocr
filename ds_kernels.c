@@ -192,14 +192,11 @@ void ds_expert_forward(float *out, const float *x,
         }
     }
 
-    /* Fused gate+up for SwiGLU */
-    for (int i = 0; i < intermediate; i++) {
-        gate_up_buf[2 * i] = gate_buf[i];
-        gate_up_buf[2 * i + 1] = up_buf[i];
-    }
-
-    /* SwiGLU: SiLU(gate) * up */
-    ds_swiglu_multiply(hidden_buf, gate_up_buf, 1, intermediate);
+    /* Fused gate+up for SwiGLU — use ds_swiglu_direct to avoid interleaving.
+     * Previously: gate_up_buf[2*i] = gate[i], gate_up_buf[2*i+1] = up[i],
+     * then ds_swiglu_multiply. The interleaving is cache-unfriendly.
+     * ds_swiglu_direct computes SiLU(gate[i]) * up[i] directly. */
+    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);
 
     /* Truncate SwiGLU output to BF16 (Python's down projection input is BF16) */
     if (ds_bf16_simulate_python) {
@@ -660,11 +657,7 @@ void ds_expert_forward_f32(float *out, const float *x,
     }
     ds_linear_nobias(gate_buf, x, gate_f32, 1, hidden, intermediate);
     ds_linear_nobias(up_buf, x, up_f32, 1, hidden, intermediate);
-    for (int i = 0; i < intermediate; i++) {
-        gate_up_buf[2 * i] = gate_buf[i];
-        gate_up_buf[2 * i + 1] = up_buf[i];
-    }
-    ds_swiglu_multiply(hidden_buf, gate_up_buf, 1, intermediate);
+    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);
     ds_linear_nobias(out, hidden_buf, down_f32, 1, intermediate, hidden);
 }
 
@@ -1200,6 +1193,16 @@ void ds_rms_norm(float *out, const float *x, const float *weight,
         acc128 = _mm_hadd_ps(acc128, acc128);
         float sum_sq = _mm_cvtss_f32(acc128);
         for (; i < hidden; i++) sum_sq += x_row[i] * x_row[i];
+#elif defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+        int i = 0;
+        for (; i + 8 <= hidden; i += 8) {
+            float32x4_t v0 = vld1q_f32(x_row + i), v1 = vld1q_f32(x_row + i + 4);
+            acc0 = vfmaq_f32(acc0, v0, v0);
+            acc1 = vfmaq_f32(acc1, v1, v1);
+        }
+        float sum_sq = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; i < hidden; i++) sum_sq += x_row[i] * x_row[i];
 #else
         float sum_sq = 0.0f;
         for (int i = 0; i < hidden; i++) {
@@ -1224,6 +1227,21 @@ void ds_rms_norm(float *out, const float *x, const float *weight,
             __m256 vx = _mm256_loadu_ps(x_row + j);
             __m256 vw = _mm256_loadu_ps(weight + j);
             _mm256_storeu_ps(out_row + j, _mm256_mul_ps(_mm256_mul_ps(vx, vw), scale));
+        }
+        for (; j < hidden; j++) out_row[j] = x_row[j] * rms_inv * weight[j];
+#elif defined(__ARM_NEON)
+        float32x4_t s = vdupq_n_f32(rms_inv);
+        int j = 0;
+        for (; j + 8 <= hidden; j += 8) {
+            float32x4_t vx0 = vld1q_f32(x_row + j), vx1 = vld1q_f32(x_row + j + 4);
+            float32x4_t vw0 = vld1q_f32(weight + j), vw1 = vld1q_f32(weight + j + 4);
+            vst1q_f32(out_row + j, vmulq_f32(vmulq_f32(vx0, vw0), s));
+            vst1q_f32(out_row + j + 4, vmulq_f32(vmulq_f32(vx1, vw1), s));
+        }
+        for (; j + 4 <= hidden; j += 4) {
+            float32x4_t vx = vld1q_f32(x_row + j);
+            float32x4_t vw = vld1q_f32(weight + j);
+            vst1q_f32(out_row + j, vmulq_f32(vmulq_f32(vx, vw), s));
         }
         for (; j < hidden; j++) out_row[j] = x_row[j] * rms_inv * weight[j];
 #else
@@ -1296,6 +1314,113 @@ void ds_rms_norm_per_head(float *x, const float *weight,
 #endif
         }
     }
+}
+
+/* ========================================================================
+ * Fused Residual Add + RMS Norm (NEON/AVX optimized)
+ * out = x + residual,  norm_out = rms_norm(out, weight)
+ * One pass for add + compute sum_sq, then second pass for norm.
+ * Saves one full hidden-dim loop vs separate add then norm.
+ * ======================================================================== */
+
+void ds_residual_rms_norm(float *out, float *norm_out,
+                           const float *x, const float *residual,
+                           const float *weight, int hidden, float eps) {
+#if defined(__ARM_NEON)
+    float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 8 <= hidden; i += 8) {
+        float32x4_t x0 = vld1q_f32(x + i), x1 = vld1q_f32(x + i + 4);
+        float32x4_t r0 = vld1q_f32(residual + i), r1 = vld1q_f32(residual + i + 4);
+        float32x4_t s0 = vaddq_f32(x0, r0), s1 = vaddq_f32(x1, r1);
+        vst1q_f32(out + i, s0);
+        vst1q_f32(out + i + 4, s1);
+        acc0 = vfmaq_f32(acc0, s0, s0);
+        acc1 = vfmaq_f32(acc1, s1, s1);
+    }
+    float sum_sq = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < hidden; i++) {
+        out[i] = x[i] + residual[i];
+        sum_sq += out[i] * out[i];
+    }
+    float rms_inv = 1.0f / sqrtf(sum_sq / hidden + eps);
+    float32x4_t s = vdupq_n_f32(rms_inv);
+    int j = 0;
+    for (; j + 8 <= hidden; j += 8) {
+        float32x4_t v0 = vld1q_f32(out + j), v1 = vld1q_f32(out + j + 4);
+        float32x4_t w0 = vld1q_f32(weight + j), w1 = vld1q_f32(weight + j + 4);
+        vst1q_f32(norm_out + j, vmulq_f32(vmulq_f32(v0, w0), s));
+        vst1q_f32(norm_out + j + 4, vmulq_f32(vmulq_f32(v1, w1), s));
+    }
+    for (; j < hidden; j++) norm_out[j] = out[j] * rms_inv * weight[j];
+#elif defined(__AVX512F__) && defined(__FMA__)
+    __m512 accv = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= hidden; i += 16) {
+        __m512 sv = _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(residual + i));
+        _mm512_storeu_ps(out + i, sv);
+        accv = _mm512_fmadd_ps(sv, sv, accv);
+    }
+    float sum_sq = _mm512_reduce_add_ps(accv);
+    for (; i < hidden; i++) { out[i] = x[i] + residual[i]; sum_sq += out[i] * out[i]; }
+    float rms_inv = 1.0f / sqrtf(sum_sq / hidden + eps);
+    __m512 scale = _mm512_set1_ps(rms_inv);
+    int j = 0;
+    for (; j + 16 <= hidden; j += 16) {
+        __m512 v = _mm512_loadu_ps(out + j), w = _mm512_loadu_ps(weight + j);
+        _mm512_storeu_ps(norm_out + j, _mm512_mul_ps(_mm512_mul_ps(v, w), scale));
+    }
+    for (; j < hidden; j++) norm_out[j] = out[j] * rms_inv * weight[j];
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 accv = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= hidden; i += 8) {
+        __m256 sv = _mm256_add_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(residual + i));
+        _mm256_storeu_ps(out + i, sv);
+        accv = _mm256_fmadd_ps(sv, sv, accv);
+    }
+    __m128 a128 = _mm_add_ps(_mm256_castps256_ps128(accv), _mm256_extractf128_ps(accv, 1));
+    a128 = _mm_hadd_ps(a128, a128); a128 = _mm_hadd_ps(a128, a128);
+    float sum_sq = _mm_cvtss_f32(a128);
+    for (; i < hidden; i++) { out[i] = x[i] + residual[i]; sum_sq += out[i] * out[i]; }
+    float rms_inv = 1.0f / sqrtf(sum_sq / hidden + eps);
+    __m256 scale = _mm256_set1_ps(rms_inv);
+    int j = 0;
+    for (; j + 8 <= hidden; j += 8) {
+        __m256 v = _mm256_loadu_ps(out + j), w = _mm256_loadu_ps(weight + j);
+        _mm256_storeu_ps(norm_out + j, _mm256_mul_ps(_mm256_mul_ps(v, w), scale));
+    }
+    for (; j < hidden; j++) norm_out[j] = out[j] * rms_inv * weight[j];
+#else
+    float sum_sq = 0.0f;
+    for (int i = 0; i < hidden; i++) { out[i] = x[i] + residual[i]; sum_sq += out[i] * out[i]; }
+    float rms_inv = 1.0f / sqrtf(sum_sq / hidden + eps);
+    for (int i = 0; i < hidden; i++) norm_out[i] = out[i] * rms_inv * weight[i];
+#endif
+}
+
+/* Vector add: dst[i] = a[i] + b[i] — SIMD-optimized residual connection */
+void ds_vec_add(float *dst, const float *a, const float *b, int n) {
+#if defined(__ARM_NEON)
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(dst + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+        vst1q_f32(dst + i + 4, vaddq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4)));
+    }
+    for (; i < n; i++) dst[i] = a[i] + b[i];
+#elif defined(__AVX512F__)
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        _mm512_storeu_ps(dst + i, _mm512_add_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+    for (; i < n; i++) dst[i] = a[i] + b[i];
+#elif defined(__AVX2__)
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    for (; i < n; i++) dst[i] = a[i] + b[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] = a[i] + b[i];
+#endif
 }
 
 /* ========================================================================
@@ -1383,6 +1508,65 @@ void ds_swiglu_multiply(float *out, const float *gate_up, int seq_len, int inter
         ds_parallel_for(ds_swiglu_worker, &task);
     } else {
         ds_swiglu_worker(0, 1, &task);
+    }
+}
+
+/* ========================================================================
+ * Direct SwiGLU: SiLU(gate) * up without interleaving
+ * Eliminates the gate_up_buf interleaving pattern which causes
+ * non-sequential writes: gate_up[2*i] = gate[i], gate_up[2*i+1] = up[i].
+ * Instead, compute SiLU(gate[i]) * up[i] directly from separate buffers.
+ * ======================================================================== */
+
+typedef struct {
+    float *out;
+    const float *gate;
+    const float *up;
+    int seq_len;
+    int intermediate;
+} ds_swiglu_direct_task_t;
+
+static void ds_swiglu_direct_worker(int tid, int n_threads, void *arg) {
+    ds_swiglu_direct_task_t *t = (ds_swiglu_direct_task_t *)arg;
+    int chunk = (t->seq_len + n_threads - 1) / n_threads;
+    int s0 = tid * chunk;
+    int s1 = s0 + chunk;
+    if (s1 > t->seq_len) s1 = t->seq_len;
+    if (s0 >= s1) return;
+
+    int inter = t->intermediate;
+    for (int s = s0; s < s1; s++) {
+        const float *g = t->gate + (size_t)s * inter;
+        const float *u = t->up + (size_t)s * inter;
+        float *o = t->out + (size_t)s * inter;
+#if defined(__APPLE__) && defined(USE_BLAS)
+        /* Vectorized exp(-g) using Accelerate vForce — fastest on Apple Silicon. */
+        for (int j = 0; j < inter; j++) o[j] = -g[j];
+        int n = inter;
+        vvexpf(o, o, &n);
+        for (int j = 0; j < inter; j++) {
+            o[j] = (g[j] / (1.0f + o[j])) * u[j];
+        }
+#else
+        /* Fast exp approximation — avoids expf() overhead on non-Accelerate. */
+        for (int j = 0; j < inter; j++) {
+            o[j] = (g[j] / (1.0f + ds_fast_expf(-g[j]))) * u[j];
+        }
+#endif
+    }
+}
+
+void ds_swiglu_direct(float *out, const float *gate_buf, const float *up_buf,
+                       int seq_len, int intermediate) {
+    ds_swiglu_direct_task_t task = {
+        .out = out, .gate = gate_buf, .up = up_buf,
+        .seq_len = seq_len, .intermediate = intermediate
+    };
+
+    if (tp.n_threads > 1 && seq_len >= 2 && intermediate >= 256) {
+        ds_parallel_for(ds_swiglu_direct_worker, &task);
+    } else {
+        ds_swiglu_direct_worker(0, 1, &task);
     }
 }
 
@@ -1647,6 +1831,203 @@ void ds_causal_attention(float *out, const float *Q, const float *K, const float
     ds_causal_attention_heads(out, Q, K, V,
                                 seq_q, seq_k, n_heads, n_kv_heads,
                                 head_dim, scale, q_offset, 0, n_heads);
+}
+
+/* ========================================================================
+ * Aligned KV Cache Attention: same logic but with kv_stride for aligned
+ * cache access. K/V base pointers point to row 0; each subsequent row
+ * is at base + j * kv_stride. This supports the cache-line aligned
+ * F32 KV cache layout where kv_stride ≥ kv_dim.
+ * ======================================================================== */
+
+static void ds_causal_attention_heads_aligned(float *out, const float *Q,
+                                                const float *K, const float *V,
+                                                int seq_q, int seq_k,
+                                                int n_heads, int n_kv_heads,
+                                                int head_dim, float scale,
+                                                int q_offset, int kv_stride,
+                                                int head_start, int head_end) {
+    int heads_per_kv = n_heads / n_kv_heads;
+    int q_hidden = n_heads * head_dim;
+
+    for (int h = head_start; h < head_end; h++) {
+        int kv_h = h / heads_per_kv;
+
+        for (int i = 0; i < seq_q; i++) {
+            const float *q_row = Q + i * q_hidden + h * head_dim;
+            float *o_row = out + i * q_hidden + h * head_dim;
+            int global_pos = q_offset + i;
+            int k_end = global_pos + 1;
+            if (k_end > seq_k) k_end = seq_k;
+
+            float max_score = -1e30f;
+            float sum_exp = 0.0f;
+            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+
+            for (int j = 0; j < k_end; j++) {
+                const float *k_row = K + j * kv_stride + kv_h * head_dim;
+                const float *v_row = V + j * kv_stride + kv_h * head_dim;
+
+                /* Software prefetch next K/V rows for sequential access pattern.
+                 * Prefetch 2 rows ahead to hide L2 cache latency (~10ns on Apple M2). */
+                if (j + 2 < k_end) {
+                    __builtin_prefetch(K + (j + 2) * kv_stride + kv_h * head_dim, 0, 1);
+                    __builtin_prefetch(V + (j + 2) * kv_stride + kv_h * head_dim, 0, 1);
+                }
+
+                float score = ds_dot_f32(q_row, k_row, head_dim) * scale;
+
+                if (score > max_score) {
+                    float correction = ds_fast_expf(max_score - score);
+                    sum_exp = sum_exp * correction + 1.0f;
+                    ds_vec_scale_add(o_row, v_row, correction, head_dim);
+                    max_score = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_score);
+                    sum_exp += wt;
+                    ds_vec_axpy_inplace(o_row, v_row, wt, head_dim);
+                }
+            }
+
+            if (sum_exp > 0.0f) {
+                float inv_sum = 1.0f / sum_exp;
+                ds_vec_scale_inplace(o_row, inv_sum, head_dim);
+            }
+        }
+    }
+}
+
+/* Aligned decode attention task with kv_stride */
+typedef struct {
+    float *out; const float *Q; const float *K; const float *V;
+    int n_heads; int head_dim; float scale; int k_end; int kv_stride;
+} ds_dec_attn_aligned_task_t;
+
+static void ds_dec_attn_aligned_worker(int tid, int nt, void *arg) {
+    ds_dec_attn_aligned_task_t *t = (ds_dec_attn_aligned_task_t *)arg;
+    int chunk = (t->n_heads + nt - 1) / nt;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    for (int h = h0; h < h1; h++) {
+        const float *q = t->Q + h * t->head_dim;
+        const float *k_base = t->K + h * t->head_dim;
+        const float *v_base = t->V + h * t->head_dim;
+        float *o = t->out + h * t->head_dim;
+        float max_s = -1e30f, sum_e = 0.0f;
+        for (int d = 0; d < t->head_dim; d++) o[d] = 0.0f;
+        for (int j = 0; j < t->k_end; j++) {
+            const float *k_row = k_base + j * t->kv_stride;
+            const float *v_row = v_base + j * t->kv_stride;
+            /* Prefetch 2 rows ahead */
+            if (j + 2 < t->k_end) {
+                __builtin_prefetch(k_base + (j + 2) * t->kv_stride, 0, 1);
+                __builtin_prefetch(v_base + (j + 2) * t->kv_stride, 0, 1);
+            }
+            float score = ds_dot_f32(q, k_row, t->head_dim) * t->scale;
+            if (score > max_s) {
+                float corr = ds_fast_expf(max_s - score);
+                sum_e = sum_e * corr + 1.0f;
+                ds_vec_scale_add(o, v_row, corr, t->head_dim);
+                max_s = score;
+            } else {
+                float wt = ds_fast_expf(score - max_s);
+                sum_e += wt;
+                ds_vec_axpy_inplace(o, v_row, wt, t->head_dim);
+            }
+        }
+        if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, t->head_dim);
+    }
+}
+
+typedef struct {
+    float *out; const float *Q; const float *K; const float *V;
+    int seq_q, seq_k; int n_heads, n_kv_heads;
+    int head_dim; float scale; int q_offset; int kv_stride;
+} ds_causal_attn_aligned_task_t;
+
+static void ds_causal_attn_aligned_worker(int tid, int n_threads, void *arg) {
+    ds_causal_attn_aligned_task_t *t = (ds_causal_attn_aligned_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    if (h0 >= h1) return;
+
+    ds_causal_attention_heads_aligned(t->out, t->Q, t->K, t->V,
+                                        t->seq_q, t->seq_k, t->n_heads, t->n_kv_heads,
+                                        t->head_dim, t->scale, t->q_offset, t->kv_stride,
+                                        h0, h1);
+}
+
+void ds_causal_attention_aligned(float *out, const float *Q, const float *K, const float *V,
+                                   int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                   int head_dim, float scale, int q_offset, int kv_stride) {
+    /* Fast path: single-token decode with standard MHA (no GQA). */
+    if (seq_q == 1 && n_heads == n_kv_heads && n_heads >= 2) {
+        int k_end = q_offset + 1;
+        if (k_end > seq_k) k_end = seq_k;
+
+        if (tp.n_threads > 1) {
+            ds_dec_attn_aligned_task_t task = {
+                .out = out, .Q = Q, .K = K, .V = V,
+                .n_heads = n_heads, .head_dim = head_dim,
+                .scale = scale, .k_end = k_end, .kv_stride = kv_stride
+            };
+            ds_parallel_for(ds_dec_attn_aligned_worker, &task);
+            return;
+        }
+
+        /* Single-threaded fused decode attention with aligned stride */
+        for (int h = 0; h < n_heads; h++) {
+            const float *q = Q + h * head_dim;
+            const float *k_base = K + h * head_dim;
+            const float *v_base = V + h * head_dim;
+            float *o = out + h * head_dim;
+            float max_s = -1e30f, sum_e = 0.0f;
+            for (int d = 0; d < head_dim; d++) o[d] = 0.0f;
+
+            for (int j = 0; j < k_end; j++) {
+                const float *k_row = k_base + j * kv_stride;
+                const float *v_row = v_base + j * kv_stride;
+                if (j + 2 < k_end) {
+                    __builtin_prefetch(k_base + (j + 2) * kv_stride, 0, 1);
+                    __builtin_prefetch(v_base + (j + 2) * kv_stride, 0, 1);
+                }
+                float score = ds_dot_f32(q, k_row, head_dim) * scale;
+                if (score > max_s) {
+                    float corr = ds_fast_expf(max_s - score);
+                    sum_e = sum_e * corr + 1.0f;
+                    ds_vec_scale_add(o, v_row, corr, head_dim);
+                    max_s = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_s);
+                    sum_e += wt;
+                    ds_vec_axpy_inplace(o, v_row, wt, head_dim);
+                }
+            }
+            if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, head_dim);
+        }
+        return;
+    }
+
+    /* General path with GQA support + aligned stride */
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        ds_causal_attn_aligned_task_t task = {
+            .out = out, .Q = Q, .K = K, .V = V,
+            .seq_q = seq_q, .seq_k = seq_k,
+            .n_heads = n_heads, .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim, .scale = scale, .q_offset = q_offset,
+            .kv_stride = kv_stride
+        };
+        ds_parallel_for(ds_causal_attn_aligned_worker, &task);
+        return;
+    }
+
+    ds_causal_attention_heads_aligned(out, Q, K, V,
+                                        seq_q, seq_k, n_heads, n_kv_heads,
+                                        head_dim, scale, q_offset, kv_stride,
+                                        0, n_heads);
 }
 
 /* ========================================================================

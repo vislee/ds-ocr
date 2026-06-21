@@ -430,21 +430,27 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     int kv_dim = n_kv_heads * head_dim;
     int intermediate = cfg->dec_intermediate;
 
-    /* KV cache: [layers, max_seq, kv_dim] */
-    int max_seq = 4096; /* Max sequence length for KV cache */
+    /* KV cache: [layers, max_seq, kv_dim] stored as F32, cache-line aligned.
+     * Using F32 directly avoids the per-step BF16→F32 batch conversion that
+     * previously dominated attention time (reconverting entire cache each step).
+     * Memory is 2x larger but the bandwidth savings from eliminating conversion
+     * and the sequential read performance gain more than compensate. */
+    int max_seq = 4096;
     ctx->kv_cache_max = max_seq;
     ctx->kv_cache_len = 0;
 
-    /* KV cache stored as BF16 — 2x memory bandwidth savings vs F32 */
-    size_t kv_size = (size_t)cfg->dec_layers * max_seq * kv_dim * sizeof(uint16_t);
-    ctx->kv_cache_k = (uint16_t *)calloc(1, kv_size);
-    ctx->kv_cache_v = (uint16_t *)calloc(1, kv_size);
-    if (!ctx->kv_cache_k || !ctx->kv_cache_v) return -1;
+    /* Each row: kv_dim floats. Align each layer's cache start to 64 bytes.
+     * Row stride = kv_dim rounded up to multiple of 16 floats (64 bytes). */
+    int kv_row_stride = (kv_dim + 15) & ~15;  /* aligned row stride */
+    size_t kv_layer_size = (size_t)max_seq * kv_row_stride * sizeof(float);
+    size_t kv_total = (size_t)cfg->dec_layers * kv_layer_size;
 
-    /* BF16→F32 conversion buffers for attention (batch convert entire K/V rows) */
-    ctx->kv_cache_k_f32 = (float *)malloc((size_t)max_seq * kv_dim * sizeof(float));
-    ctx->kv_cache_v_f32 = (float *)malloc((size_t)max_seq * kv_dim * sizeof(float));
-    if (!ctx->kv_cache_k_f32 || !ctx->kv_cache_v_f32) return -1;
+    /* posix_memalign for 64-byte alignment (cache line) */
+    if (posix_memalign((void **)&ctx->kv_cache_k, 64, kv_total) != 0) return -1;
+    if (posix_memalign((void **)&ctx->kv_cache_v, 64, kv_total) != 0) return -1;
+    memset(ctx->kv_cache_k, 0, kv_total);
+    memset(ctx->kv_cache_v, 0, kv_total);
+    ctx->_kv_row_stride = kv_row_stride;  /* store for attention access */
 
 
     /* Single-token decoder buffers */
@@ -592,11 +598,9 @@ void ds_free(ds_ctx_t *ctx) {
         multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
     }
 
-    /* Free decoder buffers */
+    /* Free decoder buffers (posix_memalign requires free(), not custom allocator) */
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
-    free(ctx->kv_cache_k_f32);
-    free(ctx->kv_cache_v_f32);
     free(ctx->dec_x); free(ctx->dec_x_norm);
     free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
     free(ctx->dec_attn_out); free(ctx->dec_proj_out);

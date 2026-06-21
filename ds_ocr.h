@@ -344,14 +344,16 @@ typedef struct {
     void *safetensors;         /* multi_safetensors_t* */
     char model_dir[512];
 
-    /* KV cache for decoder */
-    /* KV cache for decoder — stored as BF16 for 2x memory bandwidth savings */
-    uint16_t *kv_cache_k;     /* [layers, max_seq, kv_heads * head_dim] in BF16 */
-    uint16_t *kv_cache_v;     /* [layers, max_seq, kv_heads * head_dim] in BF16 */
+    /* KV cache for decoder — stored as F32 with cache-line alignment for direct
+     * attention access. Previous design used BF16 storage + per-step batch
+     * conversion, but that reconverted the ENTIRE cache every decode step
+     * (O(seq_len) BF16→F32 work per layer), which dominated attention time.
+     * F32 storage doubles memory but eliminates all per-step conversion. */
+    float *kv_cache_k;       /* [layers, max_seq, kv_dim] aligned F32 */
+    float *kv_cache_v;       /* [layers, max_seq, kv_dim] aligned F32 */
     int kv_cache_len;
     int kv_cache_max;
-    float *kv_cache_k_f32;    /* [max_seq * kv_dim] temp buffer for BF16→F32 batch conversion (attention) */
-    float *kv_cache_v_f32;
+    int _kv_row_stride;      /* kv_dim rounded up to 16-float alignment for cache line access */
 
     /* Persistent decoder buffers (single-token generation) */
     float *dec_x, *dec_x_norm, *dec_q, *dec_k, *dec_v;
@@ -474,6 +476,14 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len);
 
 /* Decoder forward (single token, uses KV cache, returns greedy token) */
 int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed);
+
+/* Decoder forward for N tokens at once (batch decode with causal masking).
+ * Each token attends to all prior tokens in the cache + prior tokens in the batch.
+ * Returns token IDs for all N tokens. The caller provides N input embeddings.
+ * tokens_out must be pre-allocated with space for n_tokens ints.
+ * This amortizes KV cache reads across all tokens in the batch. */
+void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
+                                int n_tokens, int *tokens_out);
 
 /* Global verbose flag */
 extern int ds_verbose;
