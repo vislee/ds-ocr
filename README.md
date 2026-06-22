@@ -1,40 +1,42 @@
-# ds-ocr — DeepSeek-OCR 纯 C 推理引擎
+# ds-ocr — DeepSeek-OCR Pure C Inference Engine
 
-[DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR) 的纯 C 推理实现，架构模式参照 [antirez/qwen-asr](https://github.com/antirez/qwen-asr)。
+[中文文档](README_zh.md)
 
-- **零外部依赖** — 仅需 BLAS（Accelerate/OpenBLAS）+ stb_image.h
-- **零拷贝权重加载** — mmap BF16 safetensors，按需转 F32
-- **平台优化内核** — NEON / AVX2 / AVX-512 / scalar 自动调度
+A pure C inference implementation of [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR), following the architecture patterns of [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
 
-## 快速开始
+- **Zero external dependencies** — only BLAS (Accelerate/OpenBLAS) + stb_image.h
+- **Zero-copy weight loading** — mmap BF16 safetensors, on-the-fly F32 conversion
+- **Platform-optimized kernels** — NEON / AVX2 / AVX-512 / scalar auto-dispatch
+
+## Quick Start
 
 ```bash
-# 1. 下载模型权重（需要 huggingface_hub）
+# 1. Download model weights (requires huggingface_hub)
 ./download_model.sh ./deepseek-ocr
 
-# 2. 编译（macOS 默认用 Accelerate BLAS）
+# 2. Build (macOS defaults to Accelerate BLAS)
 make blas
 
-# 3. 运行 OCR
+# 3. Run OCR
 ./ds_ocr -d ./deepseek-ocr -i document.png --rp 1.03
 ```
 
-> Linux 用户：`make blas` 自动检测 OpenBLAS。跨平台编译见 [Building](#building)。
+> Linux: `make blas` auto-detects OpenBLAS. See [Building](#building) for cross-compilation.
 
-## 性能
+## Performance
 
-Apple M2 Pro（8 线程，BLAS 加速），6-crop V2 图像：
+Apple M2 Pro (8 threads, BLAS), 6-crop V2 image:
 
-| 阶段 | v0.5 | v0.8 | 优化手段 |
-|------|------|------|---------|
-| SAM+Encoder | ~50s | **8.8s** | 并行 global crop |
-| Prefill（862 tokens） | ~30s | **1.1s** | 批量 MoE sgemm |
-| Decode（280 tokens） | ~19s | **6.2s** | F32 KV cache + 融合内核 |
-| **总计** | **~97s** | **16s** | |
+| Stage | v0.5 | v0.8 | Optimization |
+|-------|------|------|-------------|
+| SAM+Encoder | ~50s | **8.8s** | Parallel global crop |
+| Prefill (862 tokens) | ~30s | **1.1s** | Batched MoE sgemm |
+| Decode (280 tokens) | ~19s | **6.2s** | F32 KV cache + fused kernels |
+| **Total** | **~97s** | **16s** | |
 
-**v0.8 = 6× v0.5 = 45× Python PyTorch（CPU BF16 ~736s）**
+**v0.8 = 6× v0.5 = 45× Python PyTorch (CPU BF16 ~736s)**
 
-小图（1-crop V2）总耗时 ~11s。
+Small images (1-crop V2): ~11s total.
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
@@ -42,7 +44,7 @@ Inference: 16061 ms, 280 text tokens (45.21 tok/s decode)
   Encoding: 8783 ms | Prefill: 1092 ms | Decode: 6185 ms
 ```
 
-## 架构
+## Architecture
 
 ```
 DeepSeek-OCR V1                           DeepSeek-OCR V2
@@ -78,58 +80,58 @@ Projector (2048→1280)                     │
                Text Output
 ```
 
-### 模型参数
+### Model Parameters
 
-| 组件 | V1 | V2 | 参数量 |
-|------|----|----|--------|
+| Component | V1 | V2 | Params |
+|-----------|----|----|--------|
 | SAM Vision Tokenizer | ViT-B | ViT-B | ~86M |
 | Encoder | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | ~300M / ~500M |
 | Projector | 2048→1280 | 896→1280 (linear) | ~2.6M / ~1.1M |
 | MoE Decoder | DeepSeek3B-MoE | DeepSeek3B-MoE | ~3B (570M active) |
 
-### 关键架构细节
+### Key Architecture Details
 
 <details>
 <summary>SAM Vision Tokenizer</summary>
 
-- 12 transformer blocks，window attention（window_size=14），全局注意力在 layer [2,5,8,11]
-- Fused QKV 投影，相对位置嵌入（rel_pos_h, rel_pos_w）
-- Neck：V1 为 2×(Conv1×1+LN)，V2 为 Conv1×1+LN+Conv3×3+LN
-- Downsample：net_2(256→512, k3, s2) + net_3(512→1024/896, k3, s2)
+- 12 transformer blocks, window attention (window_size=14), global attention at layers [2,5,8,11]
+- Fused QKV projection, relative position embeddings (rel_pos_h, rel_pos_w)
+- Neck: V1 uses 2×(Conv1×1+LN), V2 uses Conv1×1+LN+Conv3×3+LN
+- Downsample: net_2(256→512, k3, s2) + net_3(512→1024/896, k3, s2)
 
 </details>
 
 <details>
 <summary>DeepEncoder V2</summary>
 
-- Qwen2-0.5B 架构，24 层，hidden=896，14 MHA heads，2 KV heads（GQA）
-- Causal flow queries：每 crop 144 queries，masked_scatter 到 image_size=640 的 857 个位置
-- 学习式绝对位置编码（非 RoPE）
-- 权重前缀：`model.qwen2_model.model.model.layers.*`
+- Qwen2-0.5B architecture, 24 layers, hidden=896, 14 MHA heads, 2 KV heads (GQA)
+- Causal flow queries: 144 queries per crop, masked_scatter to image_size=640's 857 positions
+- Learned absolute position embeddings (not RoPE)
+- Weight prefix: `model.qwen2_model.model.model.layers.*`
 
 </details>
 
 <details>
 <summary>MoE Decoder</summary>
 
-- 12 层，hidden=1280，10 heads，head_dim=128
-- Layer 0: Dense FFN（SwiGLU, intermediate=6848）
-- Layer 1-11: 64 routed experts (top-6) + 2 shared experts，expert intermediate=896
-- Standard MHA + LLaMA-style RoPE（非 MLA，kv_heads=q_heads=10）
+- 12 layers, hidden=1280, 10 heads, head_dim=128
+- Layer 0: Dense FFN (SwiGLU, intermediate=6848)
+- Layer 1-11: 64 routed experts (top-6) + 2 shared experts, expert intermediate=896
+- Standard MHA + LLaMA-style RoPE (not MLA, kv_heads=q_heads=10)
 - BOS=0, EOS=1
 
 </details>
 
 <details>
-<summary>V2 Multi-Crop 预处理</summary>
+<summary>V2 Multi-Crop Preprocessing</summary>
 
-1. `find_closest_aspect_ratio()` 选择最优 crop ratio（最小 aspect diff，面积 tie-breaker）
-2. 大图（如 1938×1210）→ ratio (3,2) → 6 local crops of 768×768
-3. 小图（双维 ≤768）→ ratio (1,1) → 1 local crop of 768×768
-4. Global view: `ImageOps.pad()` → 1024×1024（始终存在）
+1. `find_closest_aspect_ratio()` selects optimal crop ratio (min aspect diff, area tie-breaker)
+2. Large image (e.g. 1938×1210) → ratio (3,2) → 6 local crops of 768×768
+3. Small image (both dims ≤768) → ratio (1,1) → 1 local crop of 768×768
+4. Global view: `ImageOps.pad()` → 1024×1024 (always present)
 5. SAM: N local + 1 global → [896,12,12] / [896,16,16]
 6. Token layout (image_size=640): num_queries=10 → 857 image slots
-7. masked_scatter: 1121→857 (截断超出部分)
+7. masked_scatter: 1121→857 (truncate overflow)
 8. Prefix: BOS(1) + 857 image + 4 text ("\nFree OCR.") = 862 tokens
 
 </details>
@@ -137,13 +139,13 @@ Projector (2048→1280)                     │
 ## Building
 
 ```bash
-make blas           # BLAS 加速（推荐）
-make debug          # AddressSanitizer 调试构建
-make clean          # 清理
-make info           # 查看构建配置
+make blas           # BLAS-accelerated (recommended)
+make debug          # AddressSanitizer debug build
+make clean          # Clean artifacts
+make info           # Show build config
 ```
 
-### 跨平台编译
+### Cross-Compilation
 
 ```bash
 # ARM64 (Apple Silicon)
@@ -153,45 +155,45 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch arm64 -DUSE_BLAS -DACCELERATE_NEW_LAP
 make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LAPACK"
 ```
 
-## 使用
+## Usage
 
 ### CLI
 
 ```bash
-# 基础 OCR
+# Basic OCR
 ./ds_ocr -d ./deepseek-ocr -i document.png
 
-# 推荐参数：repetition penalty 1.01-1.03
+# Recommended: repetition penalty 1.01-1.03
 ./ds_ocr -d ./deepseek-ocr -i doc.png --rp 1.03
 
-# 静默模式：仅输出 OCR 文本（适合管道/skill 集成）
+# Silent mode: OCR text only (pipe/skill integration)
 ./ds_ocr -d ./deepseek-ocr -i doc.png --rp 1.03 --silent
 
-# 性能分析
+# Profiling
 ./ds_ocr -d ./deepseek-ocr -i doc.png --rp 1.03 --profile
 
-# macOS Vision OCR（不需要模型权重）
+# macOS Vision OCR (no model weights needed)
 ./ds_ocr -i doc.png --vision --silent
 ./ds_ocr -i doc.png --vision-fast --silent
 ```
 
-### CLI 选项
+### CLI Options
 
-| 选项 | 说明 | 默认 |
-|------|------|------|
-| `-d <dir>` | 模型目录 | 必需 |
-| `-i <file>` | 输入图片 | 必需 |
-| `-t <n>` | 线程数 | 全部 CPU |
-| `-n <n>` | 最大生成 token 数 | 4096 |
-| `--temp <f>` | 采样温度 | 0（贪心） |
-| `--rp <f>` | 重复惩罚（1.0=关闭, 推荐 1.01-1.1） | 1.0 |
-| `--ngram <n>` | 禁止重复 n-gram（0=关闭, 推荐 20-35） | 0 |
-| `--min-tokens <n>` | 最少生成 token 数（阻止提前 EOS） | 256 |
-| `--vision` | macOS Vision OCR 后端 | 关闭 |
-| `--vision-fast` | macOS Vision OCR 后端（快速） | 关闭 |
-| `--profile` | 阶段级耗时分析 | 关闭 |
-| `--debug` | 详细调试输出 | 关闭 |
-| `--silent` | 仅输出 OCR 文本 | 关闭 |
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-d <dir>` | Model directory | Required |
+| `-i <file>` | Input image | Required |
+| `-t <n>` | Thread count | All CPUs |
+| `-n <n>` | Max generated tokens | 4096 |
+| `--temp <f>` | Sampling temperature | 0 (greedy) |
+| `--rp <f>` | Repetition penalty (1.0=off, rec 1.01-1.1) | 1.0 |
+| `--ngram <n>` | No-repeat n-gram (0=off, rec 20-35) | 0 |
+| `--min-tokens <n>` | Min generated tokens (prevent early EOS) | 256 |
+| `--vision` | macOS Vision OCR backend | Off |
+| `--vision-fast` | macOS Vision OCR backend (fast) | Off |
+| `--profile` | Per-stage timing | Off |
+| `--debug` | Verbose debug output | Off |
+| `--silent` | OCR text output only | Off |
 
 ### C API
 
@@ -204,22 +206,22 @@ if (!ctx) { /* handle error */ }
 ctx->max_new_tokens = 2048;
 ctx->temperature    = 0.0f;  /* greedy */
 
-/* 流式回调（可选） */
+/* Stream callback (optional) */
 ds_set_token_callback(ctx, my_callback, userdata);
 
-/* 从文件识别 */
+/* Recognize from file */
 char *text = ds_recognize(ctx, "document.png");
 printf("Result: %s\n", text);
 free(text);
 
-/* 从原始像素识别 */
+/* Recognize from raw pixels */
 char *text2 = ds_recognize_image(ctx, rgb_pixels, width, height, 3);
 free(text2);
 
 ds_free(ctx);
 ```
 
-流式回调：
+Stream callback:
 
 ```c
 void my_callback(const char *piece, void *userdata) {
@@ -228,84 +230,85 @@ void my_callback(const char *piece, void *userdata) {
 }
 ```
 
-## 项目结构
+## Project Structure
 
 ```
 ds-ocr/
-├── ds_ocr.h/c                 # 公共 API + 模型加载 + 识别主流程
-├── ds_visual_tokenizer.h/c    # SAM ViT-B（window attn, rel pos, neck, downsample）
+├── ds_ocr.h/c                 # Public API + model loading + recognition pipeline
+├── ds_visual_tokenizer.h/c    # SAM ViT-B (window attn, rel pos, neck, downsample)
 ├── ds_deep_encoder.h/c        # CLIP ViT-L/14 (V1) + DeepEncoder V2 (Qwen2-0.5B)
-├── ds_moe_decoder.h/c         # MoE decoder（dense L0 + MoE L1-11）
-├── ds_kernels.h/c              # 数学内核 API + 线程池 + 分发
-├── ds_kernels_impl.h           # 架构分发宏 (NEON/AVX/generic)
-├── ds_kernels_generic.c        # 标量回退
-├── ds_kernels_neon.c           # ARM NEON 优化（含 BF16 dot product）
-├── ds_kernels_avx.c            # x86 AVX2/AVX-512 优化
-├── ds_safetensors.h/c          # 多分片 safetensors 读取（BF16 + FP32）
-├── ds_image.h/c                # 图片加载 + 预处理（stb_image + bicubic resize）
+├── ds_moe_decoder.h/c         # MoE decoder (dense L0 + MoE L1-11)
+├── ds_kernels.h/c              # Math kernel API + thread pool + dispatch
+├── ds_kernels_impl.h           # Architecture dispatch macros (NEON/AVX/generic)
+├── ds_kernels_generic.c        # Scalar fallback
+├── ds_kernels_neon.c           # ARM NEON optimizations (incl. BF16 dot product)
+├── ds_kernels_avx.c            # x86 AVX2/AVX-512 optimizations
+├── ds_safetensors.h/c          # Multi-shard safetensors reader (BF16 + FP32)
+├── ds_image.h/c                # Image loading + preprocessing (stb_image + bicubic resize)
 ├── ds_tokenizer.h/c            # Qwen2 BPE tokenizer + added_tokens
-├── ds_platform_ocr.h/c/m       # macOS Vision OCR bridge（.m=ObjC, .c=Linux stub）
-├── ds_dump.h                    # 调试张量 dump 工具
-├── main.c                       # CLI 入口
-├── test.c                       # 测试套件
-├── stb_image.h                  # 单头图片加载器（public domain）
-├── Makefile                     # 构建系统
-├── download_model.sh            # 模型下载脚本
-└── README.md
+├── ds_platform_ocr.h/c/m       # macOS Vision OCR bridge (.m=ObjC, .c=Linux stub)
+├── ds_dump.h                    # Debug tensor dump utilities
+├── main.c                       # CLI entry point
+├── test.c                       # Test suite
+├── stb_image.h                  # Single-header image loader (public domain)
+├── Makefile                     # Build system
+├── download_model.sh            # Model download script
+├── README.md                    # This file (English)
+└── README_zh.md                 # Chinese documentation
 ```
 
-**代码规模**：~12K 行自研代码（不含 stb_image.h），编译后二进制 ~331KB。
+**Code size**: ~12K lines of custom code (excluding stb_image.h), compiled binary ~331KB.
 
-## 测试
+## Testing
 
 ```bash
-make test              # 构建并运行全部测试（BLAS 后端）
-make test_debug        # AddressSanitizer 模式
-./test_ds_ocr test_kernels   # 运行指定测试套件
+make test              # Build and run all tests (BLAS backend)
+make test_debug        # AddressSanitizer mode
+./test_ds_ocr test_kernels   # Run specific test suite
 ```
 
-测试套件：
-- **test_kernels** — 数学内核正确性（LayerNorm, RMSNorm, matmul, SwiGLU, attention）
-- **test_safetensors** — Safetensors 读取（索引解析, BF16/FP32 转换）
-- **test_tokenizer** — BPE encode/decode 往返
-- **test_config** — 配置初始化和常量验证
-- **test_integration** — 端到端流程（需要模型权重）
+Test suites:
+- **test_kernels** — Math kernel correctness (LayerNorm, RMSNorm, matmul, SwiGLU, attention)
+- **test_safetensors** — Safetensors reader (index parsing, BF16/FP32 conversion)
+- **test_tokenizer** — BPE encode/decode round-trip
+- **test_config** — Configuration init and constant validation
+- **test_integration** — End-to-end pipeline (requires model weights)
 
-## 调试环境变量
+## Debug Environment Variables
 
-开发调试用，设置后可 dump 中间张量或跳过管线阶段（详见源码 `ds_dump.h`）：
+For development debugging. Set to dump intermediate tensors or skip pipeline stages (see `ds_dump.h`):
 
-| 变量 | 说明 |
-|------|------|
-| `DS_DUMP_TENSORS` | 启用张量 dump |
-| `DS_DUMP_PATCH_EMBED` | dump SAM patch embedding 输出 |
-| `DS_DUMP_SAM_LAYERS` | 逐层 SAM attention/output + neck + downsample |
-| `DS_DUMP_ENCODER` | dump encoder 输出 |
-| `DS_DUMP_INPUT_EMBEDS` | dump 投影后输入嵌入 |
-| `DS_DUMP_DECODER` | dump decoder layer 0 内部 |
-| `DS_DUMP_DECODER_LAYERS` | dump 全部 decoder 层 |
-| `DS_DUMP_DECODE_STEPS` | dump 逐步 decode 过程 |
-| `DS_DUMP_LAYERS` | dump MoE expert routing 细节 |
-| `DS_DUMP_CONV2_IM2COL` | dump ds_conv2d im2col buffer |
-| `DS_DUMP_DIR` | 自定义 dump 输出目录 |
-| `DS_SKIP_ENCODER` | 跳过 encoder，从文件加载嵌入 |
-| `DS_PERFECT_ENCODER` | 用 Python 参考 .npy 覆盖 encoder 输出 |
-| `DS_LOAD_ENCODER_OUTPUT` | 加载 Python encoder 输出（跳过 SAM+encoder） |
-| `DS_LOAD_ENC_INPUT` | 加载 Python encoder 输入（跳过 SAM，保留 encoder） |
-| `DS_LOAD_SAM_TOKENS` | 加载 Python SAM tokens（跳过 SAM，保留 encoder） |
-| `DS_LOAD_SAM_ALL` | 加载完整 Python SAM tokens（global + all crops） |
-| `DS_LOAD_PIL_PIXELS` | 加载 PIL 预处理像素（绕过 C resize） |
-| `DS_LOAD_INPUT_EMBEDS` | 加载 Python inputs_embeds（decoder 调试） |
-| `DS_BF16_CACHE_MB` | BF16 权重缓存大小（MB） |
-| `DS_BF16_SIMULATE_PYTHON` | 截断中间值为 BF16 精度（匹配 Python） |
-| `DS_SLOW_PREFILL` | 使用逐 token prefill（调试用，非批量 sgemm） |
+| Variable | Description |
+|----------|-------------|
+| `DS_DUMP_TENSORS` | Enable tensor dumping |
+| `DS_DUMP_PATCH_EMBED` | Dump SAM patch embedding output |
+| `DS_DUMP_SAM_LAYERS` | Per-layer SAM attention/output + neck + downsample |
+| `DS_DUMP_ENCODER` | Dump encoder output |
+| `DS_DUMP_INPUT_EMBEDS` | Dump projected input embeddings |
+| `DS_DUMP_DECODER` | Dump decoder layer 0 internals |
+| `DS_DUMP_DECODER_LAYERS` | Dump all decoder layers |
+| `DS_DUMP_DECODE_STEPS` | Dump step-by-step decode process |
+| `DS_DUMP_LAYERS` | Dump MoE expert routing details |
+| `DS_DUMP_CONV2_IM2COL` | Dump ds_conv2d im2col buffer |
+| `DS_DUMP_DIR` | Custom dump output directory |
+| `DS_SKIP_ENCODER` | Skip encoder, load embeddings from file |
+| `DS_PERFECT_ENCODER` | Override encoder output with Python reference .npy |
+| `DS_LOAD_ENCODER_OUTPUT` | Load Python encoder output (skip SAM+encoder) |
+| `DS_LOAD_ENC_INPUT` | Load Python encoder input (skip SAM, keep encoder) |
+| `DS_LOAD_SAM_TOKENS` | Load Python SAM tokens (skip SAM, keep encoder) |
+| `DS_LOAD_SAM_ALL` | Load full Python SAM tokens (global + all crops) |
+| `DS_LOAD_PIL_PIXELS` | Load PIL preprocessed pixels (bypass C resize) |
+| `DS_LOAD_INPUT_EMBEDS` | Load Python inputs_embeds (decoder debugging) |
+| `DS_BF16_CACHE_MB` | BF16 weight cache size (MB) |
+| `DS_BF16_SIMULATE_PYTHON` | Truncate intermediate values to BF16 precision (match Python) |
+| `DS_SLOW_PREFILL` | Use per-token prefill (debug, not batched sgemm) |
 
-## 权重加载
+## Weight Loading
 
-直接读取 HuggingFace safetensors 格式，mmap 零拷贝加载：
+Reads HuggingFace safetensors format directly, mmap zero-copy loading:
 
-| 组件 | Tensor 命名模式 | 格式 |
-|------|----------------|------|
+| Component | Tensor naming pattern | Format |
+|-----------|----------------------|--------|
 | SAM patch embed | `model.sam_model.patch_embed.proj.*` | FP32 |
 | SAM blocks | `model.sam_model.blocks.{l}.*` | FP32 |
 | SAM neck/downsample | `model.sam_model.neck.*`, `net_2.*`, `net_3.*` | FP32 |
@@ -318,55 +321,55 @@ make test_debug        # AddressSanitizer 模式
 | Decoder layers | `model.layers.{l}.*` | BF16 |
 | LM head | `lm_head.weight` | BF16 |
 
-## 平台优化
+## Platform Optimizations
 
-| 平台 | 内核集 | 关键操作 |
-|------|--------|---------|
+| Platform | Kernel set | Key operations |
+|----------|-----------|----------------|
 | **ARM (Apple Silicon)** | NEON + BF16 dot product | BF16→F32, RMSNorm, matmul, SwiGLU |
 | **x86 (Intel/AMD)** | AVX2+FMA / AVX-512 | BF16→F32, RMSNorm, matmul, SwiGLU |
-| **其他** | Generic (scalar) | 可移植 C 回退 |
+| **Other** | Generic (scalar) | Portable C fallback |
 
-## 当前状态
+## Status
 
-| 组件 | V1 | V2 |
-|------|----|----|
+| Component | V1 | V2 |
+|-----------|----|----|
 | SAM Vision Tokenizer | ✅ | ✅ |
-| Encoder | ✅ | ✅（corr ~0.995 vs Python） |
+| Encoder | ✅ | ✅ (corr ~0.995 vs Python) |
 | Projector | ✅ | ✅ |
-| MoE Decoder | ✅ | ✅ **已验证**（gate softmax 修复: corr 0.82→0.9998） |
+| MoE Decoder | ✅ | ✅ **Verified** (gate softmax fix: corr 0.82→0.9998) |
 | Tokenizer | ✅ | ✅ |
 | Multi-crop | N/A | ✅ |
-| 端到端 OCR | ✅ | ✅ **99.29% 文本一致率** |
+| End-to-end OCR | ✅ | ✅ **99.29% text agreement** |
 
-### 版本历史
+### Version History
 
-- **v0.8** — 批量 MoE prefill + 并行 encoding：16s 端到端（6× v0.5）
-- **v0.7** — F32 KV cache + 融合 residual+norm + 直接 SwiGLU + 批量 decode
-- **v0.6** — sgemm LM head + BF16 KV cache + 融合 decode attention + fast exp
-- **v0.5** — MoE gate softmax 修复，decoder 正确性验证，7.5× vs Python
+- **v0.8** — Batched MoE prefill + parallel encoding: 16s end-to-end (6× v0.5)
+- **v0.7** — F32 KV cache + fused residual+norm + direct SwiGLU + batched decode
+- **v0.6** — sgemm LM head + BF16 KV cache + fused decode attention + fast exp
+- **v0.5** — MoE gate softmax fix, decoder correctness verification, 7.5× vs Python
 
-### 已知问题
+### Known Issues
 
-1. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。不影响 OCR 质量。
-2. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
+1. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
+2. **Independent lm_head weights**: `lm_head.weight` ≠ `embed_tokens.weight`; C correctly loads the independent weights.
 
-## 与 Python 实现的差异
+## Differences from Python Implementation
 
-| 特性 | Python (PyTorch) | 本实现 (C) |
-|------|-------------------|-----------|
-| 权重格式 | 完整 FP32/BF16 张量 | mmap BF16（零拷贝） |
-| Attention | FlashAttention / SDPA | Online softmax（O(1) 内存） |
-| MoE routing | GPU scatter/gather | 批量 sgemm: grouped expert + shared 一步完成 |
-| 位置编码 | 动态计算 | 预计算 RoPE 表 |
-| 图片 resize | PIL BICUBIC (antialias) | Antialias bicubic |
-| Tokenizer | HuggingFace tokenizers | 自定义 BPE (GPT-2 byte-level) + added_tokens |
-| 依赖 | PyTorch, transformers... | 仅 BLAS + stb_image |
+| Feature | Python (PyTorch) | This Implementation (C) |
+|---------|-------------------|--------------------------|
+| Weight format | Full FP32/BF16 tensors | mmap BF16 (zero-copy) |
+| Attention | FlashAttention / SDPA | Online softmax (O(1) memory) |
+| MoE routing | GPU scatter/gather | Batched sgemm: grouped expert + shared in one pass |
+| Position encoding | Dynamic computation | Pre-computed RoPE table |
+| Image resize | PIL BICUBIC (antialias) | Antialias bicubic |
+| Tokenizer | HuggingFace tokenizers | Custom BPE (GPT-2 byte-level) + added_tokens |
+| Dependencies | PyTorch, transformers... | Only BLAS + stb_image |
 
-## 致谢
+## Acknowledgments
 
-- 架构灵感：[antirez/qwen-asr](https://github.com/antirez/qwen-asr) — 纯 C ASR 推理
-- 模型：[deepseek-ai/DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR)
-- 图片加载：[stb_image](https://github.com/nothings/stb)（public domain）
+- Architecture inspiration: [antirez/qwen-asr](https://github.com/antirez/qwen-asr) — pure C ASR inference
+- Model: [deepseek-ai/DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR)
+- Image loading: [stb_image](https://github.com/nothings/stb) (public domain)
 
 ## License
 
