@@ -296,4 +296,18 @@ void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n);
 void ds_f32_matvec_sgemm(float *y, const float *x, const float *W_f32,
                           int in_dim, int out_dim);
 
+/* NEON-vectorized BF16 roundtrip: truncate F32 array to BF16 precision.
+ * Used by DS_BF16_SIMULATE_PYTHON to match Python's BF16 intermediate values
+ * without the overhead of per-element scalar bit manipulation. */
+void ds_bf16_truncate_array(float *data, int n);
+
+/* ========================================================================
+ * Runtime BF16 kernel dispatch
+ * ======================================================================== */
+
+/* Initialize optimal BF16 matvec kernel for current CPU.
+ * Called automatically on first matvec, or explicitly via ds_load().
+ * On Apple M2+: uses bfdot (2× throughput). On M1: uses vshll+vfma. */
+void ds_kernels_dispatch_init(void);
+
 #endif /* DS_KERNELS_H */
