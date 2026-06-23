@@ -23,7 +23,11 @@
 #include <sys/stat.h>
 
 int ds_verbose = 1;
-int ds_bf16_simulate_python = 0;  /* Set to 1 to truncate intermediate values to BF16 precision */
+int ds_bf16_simulate_python = 1;  /* BF16 intermediate truncation ON by default.
+                                     Matches Python BF16 computation path.
+                                     Without this, F32 precision diverges from Python
+                                     after 12 MoE layers, reducing EOS logit and causing
+                                     hallucinated output after OCR text is complete. */
 int g_dump_crop_id = -1;  /* Crop ID for per-crop dumps */
 
 /* ========================================================================
@@ -567,16 +571,10 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->repeat_penalty = 1.0f; /* No penalty by default */
     ctx->no_repeat_ngram_size = 0; /* Disabled by default; ngram blocking causes premature EOS in OCR.
                                       Use --ngram N to enable (Python: 20 non-eval, 35 eval) */
-    ctx->min_new_tokens = 256;     /* Suppress EOS for first 256 tokens to avoid premature truncation.
-                                      OCR documents often need >200 tokens; model may output EOS at
-                                      paragraph breaks. Use --min-tokens 0 to disable. */
-    if (cfg->model_version == 3) {
-        /* Unlimited-OCR: CPU BF16 precision causes decoder to predict EOS at step 0,
-         * while GPU CUDA BF16 predicts <|det|> instead. Setting min_new_tokens=1
-         * forces past this initial EOS, after which the model correctly generates
-         * detection blocks. Python generate() with streamer also handles this. */
-        ctx->min_new_tokens = 1;
-    }
+    ctx->min_new_tokens = 0;        /* Don't suppress EOS — let model stop naturally.
+                                      With BF16 intermediate truncation (ds_bf16_simulate_python=1),
+                                      the numerical path matches Python's, and EOS is output correctly.
+                                      Python generate() has no min_new_tokens; it stops at EOS. */
 
     return 0;
 }
@@ -1709,6 +1707,14 @@ prompt_construction:
     if (ds_verbose >= 1)
         fprintf(stderr, "Recognition: %d tokens generated in %.0f ms\n",
                 n_generated, ctx->perf_total_ms);
+
+    /* Trim trailing whitespace (matching Python .strip()) */
+    if (output && out_len > 0) {
+        while (out_len > 0 && (output[out_len-1] == ' ' || output[out_len-1] == '\n' ||
+                                output[out_len-1] == '\r' || output[out_len-1] == '\t')) {
+            output[--out_len] = '\0';
+        }
+    }
 
     return output;
 }

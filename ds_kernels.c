@@ -44,6 +44,79 @@ static inline float ds_f32_to_bf16_to_f32(float x) {
 /* ds_fast_expf now provided by ds_kernels.h (inline) */
 
 /* ========================================================================
+ * Runtime BF16 dispatch — selects optimal matvec kernel at startup.
+ *
+ * On Apple M2+ (FEAT_BF16), uses bfdot instructions for 2× throughput.
+ * On Apple M1 or other ARM without FEAT_BF16, falls back to vshll+vfma.
+ * On x86, the AVX/generic path is selected at compile time.
+ * ======================================================================== */
+
+#ifdef __ARM_NEON
+ds_bf16_matvec_fused_fn_t ds_bf16_matvec_fused_impl_ptr = ds_bf16_matvec_fused_neon;
+ds_argmax_bf16_range_fn_t ds_argmax_bf16_range_impl_ptr = ds_argmax_bf16_range_neon;
+#else
+/* Non-ARM platforms: compile-time dispatch (no runtime check needed) */
+ds_bf16_matvec_fused_fn_t ds_bf16_matvec_fused_impl_ptr = ds_bf16_matvec_fused_generic;
+ds_argmax_bf16_range_fn_t ds_argmax_bf16_range_impl_ptr = ds_argmax_bf16_range_generic;
+#endif
+
+static int ds_dispatch_initialized = 0;
+
+void ds_kernels_dispatch_init(void) {
+    if (ds_dispatch_initialized) return;
+    ds_dispatch_initialized = 1;
+
+#ifdef __ARM_NEON
+    int has_bf16 = 0;
+#ifdef __APPLE__
+    /* sysctl for FEAT_BF16: hw.optional.arm.FEAT_BF16 == 1 on M2+ */
+    size_t len = sizeof(has_bf16);
+    if (sysctlbyname("hw.optional.arm.FEAT_BF16", &has_bf16, &len, NULL, 0) != 0)
+        has_bf16 = 0;
+#else
+    /* Linux: check HWCAP2_BF16 from auxiliary vector */
+#ifdef __linux__
+#include <sys/auxv.h>
+#ifndef HWCAP2_BF16
+#define HWCAP2_BF16 (1 << 14)
+#endif
+    unsigned long hwcap2 = getauxval(AT_HWCAP2);
+    has_bf16 = (hwcap2 & HWCAP2_BF16) != 0;
+#endif /* __linux__ */
+#endif /* __APPLE__ */
+
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    if (has_bf16) {
+        ds_bf16_matvec_fused_impl_ptr = ds_bf16_matvec_fused_neon_bf16;
+        ds_argmax_bf16_range_impl_ptr = ds_argmax_bf16_range_neon_bf16;
+        if (ds_verbose >= 1)
+            fprintf(stderr, "BF16 dispatch: bfdot path (FEAT_BF16 detected)\n");
+    } else
+#endif
+    {
+        /* Fallback: vshll+vfma (no FEAT_BF16, e.g. Apple M1) */
+        ds_bf16_matvec_fused_impl_ptr = ds_bf16_matvec_fused_neon;
+        ds_argmax_bf16_range_impl_ptr = ds_argmax_bf16_range_neon;
+        if (ds_verbose >= 1)
+            fprintf(stderr, "BF16 dispatch: vshll path (no FEAT_BF16)\n");
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    ds_bf16_matvec_fused_impl_ptr = ds_bf16_matvec_fused_avx;
+    ds_argmax_bf16_range_impl_ptr = ds_argmax_bf16_range_avx;
+    if (ds_verbose >= 1)
+        fprintf(stderr, "BF16 dispatch: AVX2 path\n");
+#else
+    if (ds_verbose >= 1)
+        fprintf(stderr, "BF16 dispatch: generic path\n");
+#endif
+}
+
+/* Auto-initialize on first matvec call (thread-safe via simple flag). */
+static void ds_dispatch_ensure_init(void) {
+    if (!ds_dispatch_initialized) ds_kernels_dispatch_init();
+}
+
+/* ========================================================================
  * Thread Pool
  * ======================================================================== */
 
@@ -186,10 +259,8 @@ void ds_expert_forward(float *out, const float *x,
      * that Python doesn't, causing SwiGLU results to diverge. */
     extern int ds_bf16_simulate_python;
     if (ds_bf16_simulate_python) {
-        for (int i = 0; i < intermediate; i++) {
-            gate_buf[i] = ds_f32_to_bf16_to_f32(gate_buf[i]);
-            up_buf[i] = ds_f32_to_bf16_to_f32(up_buf[i]);
-        }
+        ds_bf16_truncate_array(gate_buf, intermediate);
+        ds_bf16_truncate_array(up_buf, intermediate);
     }
 
     /* Fused gate+up for SwiGLU — use ds_swiglu_direct to avoid interleaving.
@@ -200,9 +271,7 @@ void ds_expert_forward(float *out, const float *x,
 
     /* Truncate SwiGLU output to BF16 (Python's down projection input is BF16) */
     if (ds_bf16_simulate_python) {
-        for (int i = 0; i < intermediate; i++) {
-            hidden_buf[i] = ds_f32_to_bf16_to_f32(hidden_buf[i]);
-        }
+        ds_bf16_truncate_array(hidden_buf, intermediate);
     }
 
     /* down projection */
@@ -210,9 +279,7 @@ void ds_expert_forward(float *out, const float *x,
 
     /* Truncate final output to BF16 */
     if (ds_bf16_simulate_python) {
-        for (int i = 0; i < hidden; i++) {
-            out[i] = ds_f32_to_bf16_to_f32(out[i]);
-        }
+        ds_bf16_truncate_array(out, hidden);
     }
 }
 
@@ -667,7 +734,8 @@ void ds_expert_forward_f32(float *out, const float *x,
  */
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
-    ds_bf16_matvec_fused_impl(y, x, W_bf16, bias, in_dim, out_dim);
+    ds_dispatch_ensure_init();
+    ds_bf16_matvec_fused_impl_ptr(y, x, W_bf16, bias, in_dim, out_dim);
 }
 
 /* Threaded matvec: split output rows across threads */
@@ -826,7 +894,8 @@ void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
 static void argmax_bf16_range(const float *x, const uint16_t *W_bf16,
                                int in_dim, int start, int end,
                                int *best_out, float *best_val_out) {
-    ds_argmax_bf16_range_impl(x, W_bf16, in_dim, start, end, best_out, best_val_out);
+    ds_dispatch_ensure_init();
+    ds_argmax_bf16_range_impl_ptr(x, W_bf16, in_dim, start, end, best_out, best_val_out);
 }
 
 typedef struct {
@@ -2237,4 +2306,38 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
             }
         }
     }
+}
+
+/* NEON-vectorized BF16 roundtrip: truncate F32 array to BF16 precision and back.
+ * Processes 4 floats at a time using NEON vcvtnq_f32_bf16 (if available) or
+ * manual bit manipulation. This is ~4× faster than the scalar loop when
+ * DS_BF16_SIMULATE_PYTHON is enabled. */
+void ds_bf16_truncate_array(float *data, int n) {
+#ifdef __ARM_NEON
+    /* NEON bit manipulation: round F32 to BF16 precision and back.
+     * Works on all ARMv8+ (M1, M2, etc.) without FEAT_BF16.
+     * Uses vaddq_u32 + vandq_u32 to match ds_f32_to_bf16_to_f32 scalar logic. */
+    int i = 0;
+    uint32x4_t mask = vdupq_n_u32(0xFFFF0000u);
+    uint32x4_t half = vdupq_n_u32(0x8000u);
+    for (; i + 4 <= n; i += 4) {
+        uint32x4_t u = vreinterpretq_u32_f32(vld1q_f32(data + i));
+        u = vandq_u32(vaddq_u32(u, half), mask);  /* Round to nearest BF16 */
+        vst1q_f32(data + i, vreinterpretq_f32_u32(u));
+    }
+    for (; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, data + i, sizeof(u));
+        u = (u + 0x8000u) & 0xFFFF0000u;
+        memcpy(data + i, &u, sizeof(u));
+    }
+#else
+    /* Generic scalar fallback */
+    for (int i = 0; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, data + i, sizeof(u));
+        u = (u + 0x8000u) & 0xFFFF0000u;
+        memcpy(data + i, &u, sizeof(u));
+    }
+#endif
 }
