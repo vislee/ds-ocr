@@ -221,113 +221,126 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
     int clip_output_len = clip_n_patches; /* without CLS */
     float *clip_output = (float *)malloc(clip_output_len * clip_dim * sizeof(float));
     memcpy(clip_output, x + clip_dim, clip_output_len * clip_dim * sizeof(float));
+    free(x); /* Free CLIP transformer output */
 
-    /* Concatenate CLIP output + SAM features → projector
-     * CLIP: [clip_n_patches, 1024]
-     * SAM: [n_sam_tokens, 1024] (flattened from spatial)
-     * Combined: [clip_n_patches, 2048] (aligned by position, CLIP + SAM)
+    /* =====================================================================
+     * Concatenate CLIP output + SAM flattened features → projector input
+     * =====================================================================
+     * Python modeling code:
+     *   local_features = cat(clip_output[:, 1:], sam_output.flatten(2).permute(0,2,1), dim=-1)
      *
-     * But the token counts need to match! In the actual model:
-     * clip_output shape: [B, L_clip, 1024] where L_clip = clip_n_patches
-     * sam_output shape: [B, L_sam, 1024] where L_sam = n_sam_tokens
-     * They are NOT the same length!
+     * For Unlimited-OCR (V3):
+     *   clip_output[:, 1:] = [B, 256, 1024]  (256 CLIP patch tokens)
+     *   sam_output.flatten(2).permute(0,2,1) = [B, 256, 1024]  (256 SAM tokens)
+     *   concat → [B, 256, 2048]
      *
-     * Actually, looking at the modeling code:
-     * cat([clip_output[:, 1:, :], sam_output.flatten(2).permute(0,2,1)], dim=-1)
-     * This concatenates along the FEATURE dimension, not the sequence dimension!
-     * But they need the same number of tokens for this to work...
-     *
-     * Let me re-check: in the modeling code, CLIP output after removing CLS is
-     * [B, N_clip, 1024] and SAM is [B, 1024, H', W'] → flatten → [B, N_sam, 1024]
-     * where N_clip = N_sam (they should be the same spatial resolution after
-     * SAM downsampling and CLIP's additional patch embedding)
-     *
-     * For 1024×1024 input:
-     * - SAM: 1024/16 = 64 → 64×64 patches → neck → 64×64 → ds → 32×32 → ds → 16×16
-     * - CLIP takes SAM's 64×64 patch_embeds → Conv2d(14,14) stride 14 →
-     *   64/14 = ~4.5... This doesn't divide evenly!
-     *
-     * Hmm, let me re-read the modeling code more carefully.
-     * Actually, the CLIP patch_embedding might take SAM's output at a different
-     * stage. Let me check the actual dimensions...
-     *
-     * Looking at the real code flow for V1:
-     * 1. SAM produces patch_embeds [B, 768, H/16, W/16]
-     * 2. CLIP processes these: embeddings(patch_embeds) produces [B, N, 1024]
-     *    where N = (H/16 / patch_size) * (W/16 / patch_size) with patch_size=14
-     * 3. SAM also has its downsample path: [B, 1024, H/64, W/64]
-     * 4. Concat: [B, N, 1024+1024] = [B, N, 2048]
-     *
-     * But SAM output has (H/64)*(W/64) = 16*16 = 256 tokens
-     * CLIP output has ((H/16)/14)*((W/16)/14) = 4*4 = 16? No, that's too few...
-     *
-     * Actually wait: CLIP's patch_embedding doesn't use 14 as stride on the SAM features.
-     * It's treating the SAM features as a "pseudo-image" and the CLIP patch_embedding
-     * is a 1x1 or linear projection...
-     *
-     * I think I'm overcomplicating this. Let me just look at the actual tensor shapes
-     * by examining the modeling code flow for a 1024x1024 input.
-     *
-     * For 1024×1024:
-     * - SAM patch_embed: [1, 768, 64, 64]
-     * - After SAM blocks: [1, 768, 64, 64]
-     * - SAM neck → [1, 256, 64, 64] → net_2 → [1, 512, 32, 32] → net_3 → [1, 1024, 16, 16]
-     *   sam_output = [1, 1024, 16, 16] → flatten(2) → [1, 1024, 256] → permute → [1, 256, 1024]
-     *
-     * - CLIP input: SAM's patch_embed [1, 768, 64, 64]
-     *   CLIP patch_embedding Conv2d(768, 1024, 14, 14) on [1, 768, 64, 64]
-     *   → [1, 1024, 64/14, 64/14] = [1, 1024, 4, 4] (with floor division)
-     *   That gives only 16 CLIP tokens vs 256 SAM tokens...
-     *
-     * Hmm, this doesn't match. Let me reconsider.
-     * Maybe CLIP's patch_embedding is actually a linear/1x1 projection, not a 14x14 conv?
-     * Looking at the config: "patch_size": 14 for CLIP, but that's for raw image (224x224).
-     * When taking SAM patch_embeds as input, maybe the CLIP uses a different embedding?
-     *
-     * I need to read the actual CLIPVisionEmbeddings code from the model...
-     *
-     * OK, I think the key insight is: the CLIP in DeepSeek-OCR is MODIFIED.
-     * It doesn't use the standard CLIP embedding. Instead:
-     * self.patch_embedding = nn.Conv2d(768, 1024, kernel_size=14, stride=14, padding=0)
-     * This takes the 768-dim SAM features and projects to 1024-dim with spatial downsampling.
-     *
-     * For 1024×1024 → SAM produces [768, 64, 64]
-     * CLIP Conv2d(768→1024, k14, s14) → [1024, 4, 4] = 16 tokens
-     * But SAM output is [1024, 16, 16] = 256 tokens
-     * These don't match for concatenation!
-     *
-     * UNLESS... the concatenation is not along the token dimension but along the feature dim.
-     * cat([clip_output[:, 1:], sam_output], dim=-1) where:
-     * - clip_output[:, 1:] = [B, 16, 1024]  (16 CLIP tokens, 1024 dim)
-     * - sam_output = [B, 256, 1024] (256 SAM tokens, 1024 dim)
-     * But these have different sequence lengths! Can't concat along dim=-1 with different L!
-     *
-     * I think I need to actually read the code more carefully. Let me skip this for now
-     * and just implement the V2 path which is simpler, and come back to V1 later.
-     */
+     * For DeepSeek-OCR V1:
+     *   clip_output[:, 1:] = [B, clip_n_patches, 1024]
+     *   sam_output = [B, n_sam_tokens, 1024] (visual_tokens from SAM neck)
+     *   For V1: clip_n_patches may differ from n_sam_tokens — this is known
+     *   to be broken for V1. V3 is the primary target.
+     * ===================================================================== */
 
-    /* For now, just use the clip_output as the combined features
-     * TODO: Properly implement SAM+CLIP concatenation based on actual modeling code
-     */
-    free(x);
+    float *concat_features = NULL;
+    int concat_len = 0;
+    int proj_in_dim = 0;
 
-    /* Project to decoder dimension via projector */
-    int proj_in = clip_dim; /* Will be 2048 when concat is properly implemented */
-    float *projected = (float *)malloc(clip_output_len * cfg->dec_hidden * sizeof(float));
-    if (ctx->projector.weight) {
-        ds_linear(projected, clip_output, ctx->projector.weight, ctx->projector.bias,
-                  clip_output_len, proj_in, cfg->dec_hidden);
+    if (cfg->model_version == 3 && clip_output_len == n_sam_tokens) {
+        /* Unlimited-OCR: CLIP and SAM have same token count (256 each for 1024×1024 input)
+         * Concat: [256, 1024] + [256, 1024] → [256, 2048] along feature dim */
+        concat_len = clip_output_len;
+        proj_in_dim = clip_dim + cfg->sam_ds2_dim; /* 1024 + 1024 = 2048 */
+        concat_features = (float *)malloc(concat_len * proj_in_dim * sizeof(float));
+        for (int t = 0; t < concat_len; t++) {
+            memcpy(concat_features + t * proj_in_dim,
+                   clip_output + t * clip_dim, clip_dim * sizeof(float));
+            memcpy(concat_features + t * proj_in_dim + clip_dim,
+                   sam_features + t * cfg->sam_ds2_dim, cfg->sam_ds2_dim * sizeof(float));
+        }
+        free(clip_output);
+
+        if (ds_verbose >= 1)
+            fprintf(stderr, "CLIP+SAM concat: [%d, %d] + [%d, %d] → [%d, %d]\n",
+                    clip_output_len, clip_dim, n_sam_tokens, cfg->sam_ds2_dim,
+                    concat_len, proj_in_dim);
     } else {
-        /* No projector, just copy (shouldn't happen) */
-        memset(projected, 0, clip_output_len * cfg->dec_hidden * sizeof(float));
+        /* Fallback: use CLIP output only (broken for V1, but won't crash) */
+        concat_features = clip_output;
+        concat_len = clip_output_len;
+        proj_in_dim = clip_dim;
+        if (ds_verbose >= 1)
+            fprintf(stderr, "Warning: CLIP+SAM concat skipped (clip=%d, sam=%d), using CLIP only\n",
+                    clip_output_len, n_sam_tokens);
     }
-    free(clip_output);
 
-    *out_seq_len = clip_output_len;
+    /* Project to decoder dimension via projector: [concat_len, proj_in_dim] → [concat_len, 1280] */
+    int dec_hidden = cfg->dec_hidden; /* 1280 */
+    float *projected = (float *)malloc(concat_len * dec_hidden * sizeof(float));
+    if (ctx->projector.weight) {
+        ds_linear(projected, concat_features, ctx->projector.weight, ctx->projector.bias,
+                  concat_len, proj_in_dim, dec_hidden);
+    } else {
+        memset(projected, 0, concat_len * dec_hidden * sizeof(float));
+    }
+    free(concat_features);
 
-    if (ds_verbose >= 1)
-        fprintf(stderr, "CLIP encoder: %d patches in -> %d tokens out (projected to %d)\n",
-                n_patches, clip_output_len, cfg->dec_hidden);
+    if (cfg->model_version == 3) {
+        /* =====================================================================
+         * Insert image_newline between grid rows + append view_seperator
+         * =====================================================================
+         * Python code:
+         *   global_features = proj_output.view(h, w, n_dim)
+         *   global_features = cat([global_features, image_newline[None,None,:].expand(h,1,n_dim)], dim=1)
+         *   global_features = global_features.view(-1, n_dim)  # [272, 1280]
+         *   global_local_features = cat([global_features, view_seperator[None,:]], dim=0)  # [273, 1280]
+         *
+         * Layout: 16 rows × (16 patches + 1 newline) + 1 view_seperator = 273 tokens
+         * ===================================================================== */
+        int grid_h = (int)sqrtf((float)concat_len); /* 16 */
+        int grid_w = concat_len / grid_h;           /* 16 */
+        float *image_newline = ctx->vis_tokenizer.image_newline;   /* [1280] */
+        float *view_sep = ctx->vis_tokenizer.view_seperator;       /* [1280] */
+
+        if (image_newline && view_sep && grid_h * grid_w == concat_len) {
+            /* Build: [row0_patches, newline, row1_patches, newline, ..., view_sep]
+             * Each row has grid_w patches + 1 newline = grid_w+1 tokens
+             * Total = grid_h * (grid_w + 1) + 1 */
+            int final_len = grid_h * (grid_w + 1) + 1; /* 16*17+1 = 273 */
+            float *final_out = (float *)malloc(final_len * dec_hidden * sizeof(float));
+            int dst = 0;
+            for (int row = 0; row < grid_h; row++) {
+                /* Copy grid_w patches from this row */
+                memcpy(final_out + dst * dec_hidden,
+                       projected + row * grid_w * dec_hidden,
+                       grid_w * dec_hidden * sizeof(float));
+                dst += grid_w;
+                /* Insert image_newline */
+                memcpy(final_out + dst * dec_hidden, image_newline, dec_hidden * sizeof(float));
+                dst += 1;
+            }
+            /* Append view_seperator */
+            memcpy(final_out + dst * dec_hidden, view_sep, dec_hidden * sizeof(float));
+            dst += 1;
+
+            free(projected);
+            projected = final_out;
+            *out_seq_len = final_len;
+
+            if (ds_verbose >= 1)
+                fprintf(stderr, "CLIP+SAM+Projector: %d patches → %d tokens (with newlines + view_sep)\n",
+                        concat_len, final_len);
+        } else {
+            *out_seq_len = concat_len;
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Warning: image_newline/view_seperator not loaded or grid mismatch (%d=%d*%d)\n",
+                        concat_len, grid_h, grid_w);
+        }
+    } else {
+        *out_seq_len = concat_len;
+        if (ds_verbose >= 1)
+            fprintf(stderr, "CLIP encoder: %d patches in -> %d tokens out (projected to %d)\n",
+                    n_patches, concat_len, dec_hidden);
+    }
 
     return projected;
 }
