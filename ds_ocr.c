@@ -1095,6 +1095,22 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             fprintf(stderr, "Encoder forward failed\n");
             return NULL;
         }
+
+        /* Debug: dump C encoder output for comparison */
+        {
+            const char *dump_dir = getenv("DS_DUMP_ENCODER");
+            if (dump_dir) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/c_encoder_output.bin", dump_dir);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(encoder_output, sizeof(float), n_encoder_tokens * hidden, f);
+                    fclose(f);
+                    fprintf(stderr, "Dumped C encoder output (%d x %d) to %s\n",
+                            n_encoder_tokens, hidden, path);
+                }
+            }
+        }
     }
 
     /* Override encoder output with Python reference for decoder quality testing */
@@ -1327,30 +1343,18 @@ prompt_construction:
          * Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
          *
          * Image token layout (from Python infer):
-         *   num_queries_base = ceil(base_size/16/4) = ceil(1024/16/4) = 16
-         *   tokenized_image = ([128815]*16 + [128815]) * 16 + [128815]
-         *   = (16+1)*16 + 1 = 273 tokens for global view
+         *   num_queries_base = ceil(1024/16/4) = 16
+         *   tokenized_image = ([128815]*16 + [128815]) * 16 + [128815] = 273
          *
-         * For single image (no crops), n_encoder_tokens = 257 from CLIP+SAM+projector.
-         * The encoder output is scattered into the 273 image positions via masked_scatter.
-         * Non-image positions (text after <image>) keep their token embeddings.
+         * The CLIP+SAM+Projector encoder now returns 273 tokens:
+         *   - 256 projected tokens (16x16 grid of CLIP+SAM features)
+         *   - 16 image_newline tokens (inserted after each grid row)
+         *   - 1 view_seperator token (appended at end)
          *
-         * With image_newline between grid rows: the 273 layout is:
-         *   16 rows of (16 patch tokens + 1 newline token) + 1 trailing newline
-         *   = 16*17 + 1 = 273 total image positions
-         * The encoder output (256 CLIP+projected tokens) goes into the first 256
-         * positions, and the remaining 17 get the newline embedding.
-         *
-         * Actually, Python builds the full layout and uses masked_scatter:
-         *   images_seq_mask = [False]*BOS + [True]*273 + [False]*text_after
-         *   source = images_in_this_batch = [global_features(257)]
-         *   So source has 257 elements (256 CLIP + 1 view_separator),
-         *   and masked_scatter fills 273 True positions with source[0:257],
-         *   leaving 16 positions (273-257) with the original 128815 embedding.
-         *
-         * For C: we embed the image tokens using the 128815 embedding,
-         * then overwrite with encoder_output for the first 257 positions.
-         * Remaining 16 positions (273-257) keep the 128815 embedding.
+         * Python's masked_scatter places all 273 encoder tokens into the
+         * 273 image positions (all True in images_seq_mask).
+         * For C: embed all image positions with 128815, then overwrite
+         * ALL 273 with encoder_output (n_encoder_tokens should equal n_img_tokens).
          */
         int base_size = 1024;
         int num_queries_base = (base_size + 15) / 16 / 4;  /* 16 */
@@ -1396,18 +1400,21 @@ prompt_construction:
         EMBED_TOKEN_V3(DS_TOKEN_BOS);
 
         /* 2. Image tokens — embed all with 128815, then overwrite with encoder output.
-         * Python uses masked_scatter to place encoder_output into image positions.
-         * The source is [global_features(256) + view_separator(1)] = 257 elements.
-         * The True positions count is 273 (n_img_tokens).
-         * So the first 257 positions get encoder_output, remaining 16 keep 128815 embedding. */
+         * The encoder returns exactly n_encoder_tokens tokens which should equal
+         * n_img_tokens (273). Overwrite all image positions with encoder output. */
         int img_start = pos;
         for (int i = 0; i < n_img_tokens; i++) {
             EMBED_TOKEN_V3(DS_TOKEN_IMAGE_PLACEHOLDER);  /* 128815 */
         }
 
-        /* Overwrite first n_encoder_tokens positions with encoder output */
+        /* Overwrite image positions with encoder output */
         int n_copy = n_encoder_tokens < n_img_tokens ? n_encoder_tokens : n_img_tokens;
         memcpy(input_embeds + img_start * hidden, encoder_output, n_copy * hidden * sizeof(float));
+
+        if (ds_verbose >= 1 && n_encoder_tokens != n_img_tokens) {
+            fprintf(stderr, "Warning: n_encoder_tokens=%d != n_img_tokens=%d\n",
+                    n_encoder_tokens, n_img_tokens);
+        }
 
         /* 3. Text after image */
         for (int t = 0; t < n_text_after; t++) EMBED_TOKEN_V3(text_after_ids[t]);
@@ -1500,6 +1507,19 @@ prompt_construction:
                 }
             }
         } else {
+            /* Debug: dump input_embeds for comparison with Python */
+            {
+                const char *dump_ie = getenv("DS_DUMP_INPUT_EMBEDS");
+                if (dump_ie) {
+                    FILE *f = fopen(dump_ie, "wb");
+                    if (f) {
+                        fwrite(input_embeds, sizeof(float), prefix_len * hidden, f);
+                        fclose(f);
+                        fprintf(stderr, "Dumped input_embeds (%d x %d) to %s\n",
+                                prefix_len, hidden, dump_ie);
+                    }
+                }
+            }
             ds_decoder_prefill(ctx, input_embeds, prefix_len);
             /* Use prefill logits for first token selection */
             if (ctx->dec_logits) {

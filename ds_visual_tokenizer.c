@@ -1336,8 +1336,14 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
             fprintf(stderr, "Resizing %dx%d -> %dx%d\n",
                     width, height, target_size, target_size);
         if (cfg->model_version == 2) {
+            /* V2: pad with gray (127) to maintain aspect ratio */
+            resized_img = ds_image_pad(&img, target_size, 127);
+        } else if (cfg->model_version == 3) {
+            /* V3 (Unlimited-OCR): Python uses ImageOps.pad() with mean color (0.5*255=127).
+             * Same as V2 — pad to maintain aspect ratio, don't stretch. */
             resized_img = ds_image_pad(&img, target_size, 127);
         } else {
+            /* V1: stretch to target size */
             resized_img = ds_image_resize(&img, target_size, target_size);
         }
         if (!resized_img) {
