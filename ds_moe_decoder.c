@@ -265,7 +265,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);
     ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);
 
-    if (ctx->profile_enabled) ctx->perf_layer_qkv_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
+    if (ctx->profile_enabled) ctx->perf_layer_qkv_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
 
     /* Store K, V directly into F32 KV cache (no BF16 conversion needed).
      * This eliminates the per-step batch BF16→F32 conversion that previously
@@ -323,13 +323,13 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
                                     1, kv_seq_len, n_heads, n_kv_heads, head_dim,
                                     scale, cache_offset, kv_stride);
     }
-    if (ctx->profile_enabled) ctx->perf_layer_attn_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
+    if (ctx->profile_enabled) ctx->perf_layer_attn_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
 
     /* Output projection + residual */
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *proj_out = ctx->dec_proj_out;
     ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, 1, q_dim, hidden);
-    if (ctx->profile_enabled) ctx->perf_layer_proj_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
+    if (ctx->profile_enabled) ctx->perf_layer_proj_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
 
     /* Post-attention: fused residual add + RMS norm.
      * This combines out = x + proj_out and norm_out = rms_norm(out, weight)
@@ -352,8 +352,8 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     ds_vec_add(out, out, mlp_out, hidden);
 
     if (ctx->profile_enabled) {
-        ctx->perf_layer_mlp_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
-        ctx->perf_layer_total_ms[layer_idx] = (ds_time_sec() - t_layer_start) * 1000.0;
+        ctx->perf_layer_mlp_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
+        ctx->perf_layer_total_ms[layer_idx] += (ds_time_sec() - t_layer_start) * 1000.0;
     }
 }
 
@@ -829,7 +829,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         } else {
             token = ds_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, hidden, vocab);
         }
-        if (ctx->profile_enabled) ctx->perf_lm_head_ms += ds_time_sec() * 1000.0;
+        if (ctx->profile_enabled) { /* no logits path — timing not tracked */ }
         return token;
     }
 
@@ -865,7 +865,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
                 ds_bf16_matvec_pub(logits, x, dec->tok_embeddings_bf16, NULL, hidden, vocab);
             }
         }
-        ctx->perf_lm_head_ms = (ds_time_sec() - t_lm) * 1000.0;
+        ctx->perf_lm_head_ms += (ds_time_sec() - t_lm) * 1000.0;
     } else {
         /* Non-profile path: same sgemm optimization */
         if (dec->lm_head_bf16) {
