@@ -2031,8 +2031,137 @@ void ds_causal_attention_aligned(float *out, const float *Q, const float *K, con
 }
 
 /* ========================================================================
- * Position Embeddings
+ * Reference Sliding Window Attention (R-SWA) for Unlimited-OCR
  * ======================================================================== */
+
+void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, const float *V_base,
+                                int seq_q, int n_heads, int n_kv_heads, int head_dim,
+                                float scale, int kv_stride,
+                                int prefill_len, int window_start, int kv_seq_len) {
+    /* R-SWA decode attention: attend to two non-contiguous KV ranges:
+     *   Range 1 (reference): positions [0, prefill_len)
+     *   Range 2 (window):    positions [window_start, kv_seq_len)
+     * Positions [prefill_len, window_start) are skipped (out of sliding window).
+     *
+     * This implements the same logic as Python's SlidingWindowLlamaAttention
+     * steady-state decode path, where the KV cache has a ring buffer for
+     * text tokens beyond the sliding window, but reference (visual) tokens
+     * are always kept.
+     *
+     * For seq_q=1 decode with MHA (n_heads == n_kv_heads), we use an
+     * online softmax approach: scan reference range, then window range,
+     * maintaining running max/sum for numerically stable softmax. */
+
+    if (seq_q == 1 && n_heads == n_kv_heads) {
+        /* Single-token decode fast path */
+        for (int h = 0; h < n_heads; h++) {
+            const float *q = Q + h * head_dim;
+            const float *k_h = K_base + h * head_dim;
+            const float *v_h = V_base + h * head_dim;
+            float *o = out + h * head_dim;
+
+            float max_s = -1e30f, sum_e = 0.0f;
+            for (int d = 0; d < head_dim; d++) o[d] = 0.0f;
+
+            /* Range 1: reference tokens [0, prefill_len) */
+            for (int j = 0; j < prefill_len; j++) {
+                const float *k_row = k_h + (size_t)j * kv_stride;
+                const float *v_row = v_h + (size_t)j * kv_stride;
+                if (j + 2 < prefill_len) {
+                    __builtin_prefetch(k_h + (size_t)(j + 2) * kv_stride, 0, 1);
+                    __builtin_prefetch(v_h + (size_t)(j + 2) * kv_stride, 0, 1);
+                }
+                float score = ds_dot_f32(q, k_row, head_dim) * scale;
+                if (score > max_s) {
+                    float corr = ds_fast_expf(max_s - score);
+                    sum_e = sum_e * corr + 1.0f;
+                    ds_vec_scale_add(o, v_row, corr, head_dim);
+                    max_s = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_s);
+                    sum_e += wt;
+                    ds_vec_axpy_inplace(o, v_row, wt, head_dim);
+                }
+            }
+
+            /* Range 2: window tokens [window_start, kv_seq_len) */
+            for (int j = window_start; j < kv_seq_len; j++) {
+                const float *k_row = k_h + (size_t)j * kv_stride;
+                const float *v_row = v_h + (size_t)j * kv_stride;
+                if (j + 2 < kv_seq_len) {
+                    __builtin_prefetch(k_h + (size_t)(j + 2) * kv_stride, 0, 1);
+                    __builtin_prefetch(v_h + (size_t)(j + 2) * kv_stride, 0, 1);
+                }
+                float score = ds_dot_f32(q, k_row, head_dim) * scale;
+                if (score > max_s) {
+                    float corr = ds_fast_expf(max_s - score);
+                    sum_e = sum_e * corr + 1.0f;
+                    ds_vec_scale_add(o, v_row, corr, head_dim);
+                    max_s = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_s);
+                    sum_e += wt;
+                    ds_vec_axpy_inplace(o, v_row, wt, head_dim);
+                }
+            }
+
+            if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, head_dim);
+        }
+        return;
+    }
+
+    /* General path: compute attention over combined reference + window positions.
+     * For each head, build a compact K/V array from the two ranges,
+     * then use standard attention. This is slower but handles GQA correctly. */
+    int n_groups = n_heads / n_kv_heads;
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / n_groups;
+        const float *q = Q + h * head_dim;
+        const float *k_h = K_base + kv_h * head_dim;
+        const float *v_h = V_base + kv_h * head_dim;
+        float *o = out + h * head_dim;
+
+        float max_s = -1e30f, sum_e = 0.0f;
+        for (int d = 0; d < head_dim; d++) o[d] = 0.0f;
+
+        /* Reference range */
+        for (int j = 0; j < prefill_len; j++) {
+            const float *k_row = k_h + (size_t)j * kv_stride;
+            const float *v_row = v_h + (size_t)j * kv_stride;
+            float score = ds_dot_f32(q, k_row, head_dim) * scale;
+            if (score > max_s) {
+                float corr = ds_fast_expf(max_s - score);
+                sum_e = sum_e * corr + 1.0f;
+                ds_vec_scale_add(o, v_row, corr, head_dim);
+                max_s = score;
+            } else {
+                float wt = ds_fast_expf(score - max_s);
+                sum_e += wt;
+                ds_vec_axpy_inplace(o, v_row, wt, head_dim);
+            }
+        }
+
+        /* Window range */
+        for (int j = window_start; j < kv_seq_len; j++) {
+            const float *k_row = k_h + (size_t)j * kv_stride;
+            const float *v_row = v_h + (size_t)j * kv_stride;
+            float score = ds_dot_f32(q, k_row, head_dim) * scale;
+            if (score > max_s) {
+                float corr = ds_fast_expf(max_s - score);
+                sum_e = sum_e * corr + 1.0f;
+                ds_vec_scale_add(o, v_row, corr, head_dim);
+                max_s = score;
+            } else {
+                float wt = ds_fast_expf(score - max_s);
+                sum_e += wt;
+                ds_vec_axpy_inplace(o, v_row, wt, head_dim);
+            }
+        }
+
+        if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, head_dim);
+    }
+}
 
 void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
     int half = d_model / 2;

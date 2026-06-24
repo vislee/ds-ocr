@@ -131,6 +131,12 @@ int main(int argc, char **argv) {
     if (min_new_tokens >= 0) ctx->min_new_tokens = min_new_tokens;
     if (profile) ctx->profile_enabled = 1;
 
+    /* Unlimited-OCR (V3) defaults: ngram=35 for repeat suppression.
+     * Python uses SlidingWindowNoRepeatNgramProcessor(ngram_size=35, window=128). */
+    if (ctx->config.model_version == 3 && no_repeat_ngram_size == 0) {
+        ctx->no_repeat_ngram_size = 35;
+    }
+
     /* Set up streaming callback */
     if (verbosity > 0) {
         ds_set_token_callback(ctx, stream_token, NULL);

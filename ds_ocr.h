@@ -1,7 +1,7 @@
 /*
  * ds_ocr.h - DeepSeek-OCR Pure C Inference Engine
  *
- * Supports DeepSeek-OCR (v1) and DeepSeek-OCR-2 (v2) models.
+ * Supports DeepSeek-OCR (v1), DeepSeek-OCR-2 (v2), and Unlimited-OCR (v3) models.
  * Architecture: SAM Vision Tokenizer + DeepEncoder/DeepEncoderV2 + MoE Decoder
  */
 
@@ -73,6 +73,7 @@
 #define DS_TOKEN_IMAGE_START    151655
 #define DS_TOKEN_IMAGE_END      151656
 #define DS_TOKEN_NEWLINE        151657
+#define DS_TOKEN_IMAGE_PLACEHOLDER 128815  /* Unlimited-OCR: single image token ID */
 
 /* Maximum layer counts (for static array sizing) */
 #define DS_MAX_ENC_LAYERS       24
@@ -84,7 +85,8 @@
  * ======================================================================== */
 
 typedef struct {
-    int model_version;          /* 1 = DeepSeek-OCR, 2 = DeepSeek-OCR-2 */
+    int model_version;          /* 1 = DeepSeek-OCR, 2 = DeepSeek-OCR-2, 3 = Unlimited-OCR */
+    int sliding_window_size;    /* R-SWA window (0=disabled, 128=Unlimited-OCR) */
 
     /* Vision tokenizer (SAM ViT-B) */
     int image_size;             /* 1024 */
@@ -400,6 +402,7 @@ typedef struct {
     int token_history_cap;
     int no_repeat_ngram_size;          /* n-gram blocking (0=disabled, default=0) */
     int min_new_tokens;               /* Min tokens before allowing EOS (0=disabled, default=256) */
+    int prefill_token_count;          /* Token count after prefill (for R-SWA: visual+prompt tokens) */
 
     /* Per-run performance stats */
     double perf_total_ms;
