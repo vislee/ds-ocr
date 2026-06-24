@@ -114,6 +114,12 @@ static int detect_model_version(const char *model_dir) {
     buf[n] = '\0';
     fclose(f);
 
+    /* Check for Unlimited-OCR first (has sliding_window_size in config) */
+    if (strstr(buf, "sliding_window_size") || strstr(buf, "unlimited-ocr") ||
+        strstr(buf, "Unlimited-OCR") || strstr(buf, "UnlimitedOCR")) {
+        return 3;
+    }
+
     if (strstr(buf, "DeepEncoderV2") || strstr(buf, "deepencoderv2") ||
         strstr(buf, "causal_flow") ||
         (strstr(buf, "enc_type") && strstr(buf, "\"2\""))) {
@@ -156,6 +162,21 @@ static void init_config(ds_config_t *cfg, int version) {
         cfg->proj_input_dim = DS_PROJECTOR_V2_INPUT; /* 896 */
         cfg->enc_rope_theta = 1000000.0f;
         cfg->sam_ds2_dim = DS_SAM_DS2_DIM_V2; /* 896 for V2 */
+        cfg->sliding_window_size = 0; /* No R-SWA for V2 */
+    } else if (version == 3) {
+        /* Unlimited-OCR: same as V1 (CLIP encoder) but with R-SWA decoder */
+        cfg->enc_type = 1;
+        cfg->enc_layers = DS_CLIP_LAYERS;
+        cfg->enc_hidden = DS_CLIP_HIDDEN;
+        cfg->enc_heads = DS_CLIP_HEADS;
+        cfg->enc_kv_heads = DS_CLIP_HEADS;
+        cfg->enc_head_dim = DS_CLIP_HEAD_DIM;
+        cfg->enc_intermediate = DS_CLIP_MLP_DIM;
+        cfg->enc_causal_flow_queries = 0;
+        cfg->proj_input_dim = DS_PROJECTOR_V1_INPUT; /* 2048: CLIP(1024) + SAM(1024) */
+        cfg->enc_rope_theta = 0;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 for V1/Unlimited-OCR */
+        cfg->sliding_window_size = 128; /* R-SWA window for Unlimited-OCR */
     } else {
         /* V1: CLIP ViT-L/14 */
         cfg->enc_type = 1;
@@ -1052,8 +1073,15 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 
         /* Step 2: Encoder (CLIP V1 or DeepEncoder V2) */
         if (cfg->enc_type == 1) {
+            /* CLIP encoder needs the full-resolution SAM patch_embeds [768, n_full_patches].
+             * n_visual_tokens is the downsampled count (256), but patch_embeds has
+             * 4096 patches (64x64 grid) from the SAM patch embedding layer.
+             * Calculate the actual patch count from patch_embeds dimensions.
+             * patch_embeds layout: [768, n_full_patches] in CHW format.
+             * For 1024x1024 input: n_full_patches = (1024/16)^2 = 4096. */
+            int n_full_patches = 64 * 64; /* Fixed for 1024x1024 SAM input */
             encoder_output = ds_clip_encoder_forward(ctx, patch_embeds,
-                                                      n_visual_tokens, visual_tokens,
+                                                      n_full_patches, visual_tokens,
                                                       n_visual_tokens, &n_encoder_tokens);
         } else {
             encoder_output = ds_encoder_forward_v2(ctx, visual_tokens, n_visual_tokens,
@@ -1293,6 +1321,99 @@ prompt_construction:
         }
 
         free(text_after_ids);
+    } else if (cfg->model_version == 3) {
+        /* Unlimited-OCR (V3) prompt format:
+         * Python: format_messages with sft_format='plain' → "<image>\ndocument parsing."
+         * Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
+         *
+         * Image token layout (from Python infer):
+         *   num_queries_base = ceil(base_size/16/4) = ceil(1024/16/4) = 16
+         *   tokenized_image = ([128815]*16 + [128815]) * 16 + [128815]
+         *   = (16+1)*16 + 1 = 273 tokens for global view
+         *
+         * For single image (no crops), n_encoder_tokens = 257 from CLIP+SAM+projector.
+         * The encoder output is scattered into the 273 image positions via masked_scatter.
+         * Non-image positions (text after <image>) keep their token embeddings.
+         *
+         * With image_newline between grid rows: the 273 layout is:
+         *   16 rows of (16 patch tokens + 1 newline token) + 1 trailing newline
+         *   = 16*17 + 1 = 273 total image positions
+         * The encoder output (256 CLIP+projected tokens) goes into the first 256
+         * positions, and the remaining 17 get the newline embedding.
+         *
+         * Actually, Python builds the full layout and uses masked_scatter:
+         *   images_seq_mask = [False]*BOS + [True]*273 + [False]*text_after
+         *   source = images_in_this_batch = [global_features(257)]
+         *   So source has 257 elements (256 CLIP + 1 view_separator),
+         *   and masked_scatter fills 273 True positions with source[0:257],
+         *   leaving 16 positions (273-257) with the original 128815 embedding.
+         *
+         * For C: we embed the image tokens using the 128815 embedding,
+         * then overwrite with encoder_output for the first 257 positions.
+         * Remaining 16 positions (273-257) keep the 128815 embedding.
+         */
+        int base_size = 1024;
+        int num_queries_base = (base_size + 15) / 16 / 4;  /* 16 */
+        int n_img_tokens = (num_queries_base + 1) * num_queries_base + 1;  /* 273 */
+
+        int n_text_after = 0;
+        int *text_after_ids = NULL;
+        if (tokenizer) {
+            /* Python tokenizer encodes "\ndocument parsing." as [201, 34030, 76466, 16].
+             * C BPE tokenizer may not handle this correctly, so use verified IDs. */
+            text_after_ids = ds_tokenizer_encode(tokenizer, "\ndocument parsing.", &n_text_after);
+            if (!text_after_ids || n_text_after <= 0 || n_text_after > 10) {
+                /* Fallback: verified Python token IDs for "\ndocument parsing." */
+                static const int fallback_ids[] = {201, 34030, 76466, 16};
+                n_text_after = 4;
+                if (text_after_ids) free(text_after_ids);
+                text_after_ids = (int *)malloc(n_text_after * sizeof(int));
+                memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
+            }
+            if (ds_verbose >= 1) {
+                fprintf(stderr, "V3 Prompt: BOS + img(%d, id=128815) + after(%d) = %d tokens\n",
+                        n_img_tokens, n_text_after, 1 + n_img_tokens + n_text_after);
+            }
+        }
+
+        prefix_len = 1 + n_img_tokens + n_text_after;
+        input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
+        memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
+        int pos = 0;
+
+        #define EMBED_TOKEN_V3(tid) do { \
+            if (ctx->decoder.tok_embeddings_bf16 && (tid) >= 0 && (tid) < cfg->vocab_size) { \
+                const uint16_t *_e = ctx->decoder.tok_embeddings_bf16 + (size_t)(tid) * hidden; \
+                for (int _i = 0; _i < hidden; _i++) { \
+                    uint32_t _f32 = ((uint32_t)_e[_i]) << 16; \
+                    memcpy(&input_embeds[pos * hidden + _i], &_f32, sizeof(float)); \
+                } \
+            } \
+            pos++; \
+        } while(0)
+
+        /* 1. BOS token (id=0) */
+        EMBED_TOKEN_V3(DS_TOKEN_BOS);
+
+        /* 2. Image tokens — embed all with 128815, then overwrite with encoder output.
+         * Python uses masked_scatter to place encoder_output into image positions.
+         * The source is [global_features(256) + view_separator(1)] = 257 elements.
+         * The True positions count is 273 (n_img_tokens).
+         * So the first 257 positions get encoder_output, remaining 16 keep 128815 embedding. */
+        int img_start = pos;
+        for (int i = 0; i < n_img_tokens; i++) {
+            EMBED_TOKEN_V3(DS_TOKEN_IMAGE_PLACEHOLDER);  /* 128815 */
+        }
+
+        /* Overwrite first n_encoder_tokens positions with encoder output */
+        int n_copy = n_encoder_tokens < n_img_tokens ? n_encoder_tokens : n_img_tokens;
+        memcpy(input_embeds + img_start * hidden, encoder_output, n_copy * hidden * sizeof(float));
+
+        /* 3. Text after image */
+        for (int t = 0; t < n_text_after; t++) EMBED_TOKEN_V3(text_after_ids[t]);
+
+        #undef EMBED_TOKEN_V3
+        free(text_after_ids);
     } else {
         /* V1 prompt format: [image_start][encoder_output][image_end] */
         prefix_len = n_encoder_tokens + 2;
@@ -1401,6 +1522,16 @@ prompt_construction:
     }
     double prefill_end = now_ms();
     free(input_embeds);
+
+    /* Store prefill token count for R-SWA (Unlimited-OCR).
+     * After prefill, kv_cache_len = number of visual + prompt tokens.
+     * During decode, R-SWA keeps these tokens as "reference" and only
+     * attends to reference + last sliding_window_size text tokens. */
+    ctx->prefill_token_count = ctx->kv_cache_len;
+    if (cfg->sliding_window_size > 0 && ds_verbose >= 1) {
+        fprintf(stderr, "R-SWA: prefill_token_count=%d, sliding_window_size=%d\n",
+                ctx->prefill_token_count, cfg->sliding_window_size);
+    }
 
     double decode_start = now_ms();
 

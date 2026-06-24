@@ -101,23 +101,74 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
         fprintf(stderr, "CLIP encoder: %d patch_embeds from SAM\n", n_patches);
 
     /* Step 1: Build CLIP input embeddings
-     * CLIP takes SAM's patch_embeds as input (NOT raw image)
-     * Embeddings = patch_embeds + position_embedding + class_embedding
-     * Note: patch_embeds are [n_patches, clip_dim] (already projected from SAM's output)
      *
-     * In the actual model, CLIP's patch_embedding is a Conv2d that takes the
-     * SAM patch_embeds (which are [n_patches, 768] in SAM space).
-     * But looking at the modeling code: CLIP's embeddings() method takes
-     * both the raw image AND patch_embeds, and uses patch_embeds as input
-     * to its own patch_embedding layer.
+     * For DeepSeek-OCR V1:
+     *   CLIP takes SAM's [768, H', W'] spatial features, applies its own
+     *   patch_embedding Conv2d(768→1024, k14, s14) to project and subsample.
      *
-     * Actually, the CLIP ViT-L takes patch_embeds from SAM as input:
-     * x = self.patch_embedding(patch_embeds)  # [n_patches, 1024]
-     * x = cat([class_embedding, x])  # [1+n_patches, 1024]
-     * x = x + position_embedding
+     * For Unlimited-OCR (V3):
+     *   CLIP receives SAM's [1024, H', W'] downsampled features directly
+     *   as patch_embeds, bypassing its own patch_embedding Conv2d.
+     *   In Python: patch_embeds = local_features_1 (SAM output [B, 1024, 16, 16])
+     *   Then: patch_embeds = patch_embeds.flatten(2).transpose(1, 2) → [B, 256, 1024]
+     *
+     * We detect V3 by checking if patch_embeds dim matches clip_dim (1024).
+     * For V1, n_patches is 4096 (64×64 SAM patches) and data is 768-dim.
+     * For V3, n_patches is 256 (16×16 SAM downsampled) and data is 1024-dim.
      */
-    int total_len = 1 + n_patches; /* CLS token + patches */
 
+    int clip_n_patches;
+    float *clip_tokens;  /* [clip_n_patches, clip_dim] — CLIP patch tokens */
+
+    if (cfg->model_version == 3) {
+        /* Unlimited-OCR: SAM downsampled features used directly as CLIP patch_embeds.
+         * sam_features is [n_sam_tokens, ds2_dim] = [256, 1024] in token format.
+         * We need to reshape to [1024, 16, 16] spatial, then flatten to tokens.
+         * Actually, sam_features is already [256, 1024] token format — just use it directly! */
+        clip_n_patches = n_sam_tokens;  /* 256 for 1024×1024 input */
+        clip_tokens = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
+        /* Copy sam_features as-is: [n_sam_tokens, 1024] → [clip_n_patches, clip_dim] */
+        memcpy(clip_tokens, sam_features, clip_n_patches * clip_dim * sizeof(float));
+
+        if (ds_verbose >= 1)
+            fprintf(stderr, "CLIP V3: using SAM features directly as patch_embeds (%d tokens x %d dim)\n",
+                    clip_n_patches, clip_dim);
+    } else {
+        /* V1: Apply CLIP's patch_embedding Conv2d to SAM's spatial patch_embeds */
+        int grid_h = (int)sqrtf((float)n_patches);
+        int grid_w = n_patches / grid_h;
+
+        float *patch_spatial = (float *)malloc(DS_SAM_EMBED_DIM * n_patches * sizeof(float));
+        for (int p = 0; p < n_patches; p++) {
+            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
+                patch_spatial[d * n_patches + p] = patch_embeds[p * DS_SAM_EMBED_DIM + d];
+            }
+        }
+
+        int clip_h, clip_w;
+        clip_tokens = (float *)malloc(clip_dim * n_patches * sizeof(float)); /* over-allocate */
+
+        ds_conv2d(clip_tokens, patch_spatial, clip->patch_embedding_weight, NULL,
+                  DS_SAM_EMBED_DIM, clip_dim, grid_h, grid_w, 14, 14, 14, 0);
+        free(patch_spatial);
+
+        clip_h = (grid_h - 14) / 14 + 1;
+        clip_w = (grid_w - 14) / 14 + 1;
+        clip_n_patches = clip_h * clip_w;
+
+        /* Convert [1024, clip_n_patches] → [clip_n_patches, 1024] */
+        float *clip_tokens_t = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
+        for (int p = 0; p < clip_n_patches; p++) {
+            for (int d = 0; d < clip_dim; d++) {
+                clip_tokens_t[p * clip_dim + d] = clip_tokens[d * clip_n_patches + p];
+            }
+        }
+        free(clip_tokens);
+        clip_tokens = clip_tokens_t;
+    }
+
+    /* Build full input: CLS token + patch tokens */
+    int total_len = 1 + clip_n_patches;
     float *x = (float *)calloc(total_len * clip_dim, sizeof(float));
 
     /* CLS token at position 0 */
@@ -125,67 +176,9 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
         memcpy(x, clip->class_embedding, clip_dim * sizeof(float));
     }
 
-    /* Patch embeddings through CLIP's patch_embedding layer */
-    /* patch_embeds is [n_patches, 768] — CLIP's patch_embedding is [1024, 3, 14, 14]?
-     * No! Looking at the code more carefully:
-     * The CLIP in DeepSeek-OCR takes SAM's patch_embeds (768-dim) and
-     * applies its own patch_embedding Conv2d(3, 1024, 14, 14) to the SAM output
-     * But that doesn't make sense dimensionally...
-     *
-     * Actually re-reading the modeling code:
-     * self.embeddings(x, patch_embeds=patch_embeds)
-     * Inside CLIPVisionEmbeddings:
-     *   patch_embeds = self.patch_embedding(patch_embeds)  # Conv2d on patch_embeds
-     * But patch_embeds is [B, 768, H, W] spatial format from SAM
-     * And self.patch_embedding is Conv2d(768, 1024, kernel_size=14, stride=14)
-     * So it's a projection from 768→1024 via 14×14 conv!
-     *
-     * Wait, that still doesn't work because SAM output is already patches...
-     * Let me re-read the actual code more carefully.
-     *
-     * OK I see: patch_embeds from SAM are in [B, 768, H', W'] format where
-     * H' = H/patch_size, W' = W/patch_size. Then CLIP's patch_embedding
-     * Conv2d(768, 1024, 14, 14) further subsamples these with stride 14.
-     * This produces [B, 1024, H'/14, W'/14] tokens.
-     *
-     * But our SAM output is already in token format [n_patches, 768]...
-     * We need to reshape to spatial [768, grid_h, grid_w] then apply conv.
-     */
-
-    /* Reshape patch_embeds [n_patches, 768] → spatial [768, grid_h, grid_w] */
-    int grid_h = (int)sqrtf((float)n_patches); /* For square images */
-    int grid_w = n_patches / grid_h;
-
-    float *patch_spatial = (float *)malloc(DS_SAM_EMBED_DIM * n_patches * sizeof(float));
-    for (int p = 0; p < n_patches; p++) {
-        for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-            patch_spatial[d * n_patches + p] = patch_embeds[p * DS_SAM_EMBED_DIM + d];
-        }
-    }
-
-    /* CLIP patch_embedding: Conv2d(768, 1024, 14, stride=14) on SAM's spatial output */
-    int clip_h, clip_w;
-    float *clip_patches = (float *)malloc(clip_dim * n_patches * sizeof(float)); /* over-allocate */
-
-    /* Conv2d(768→1024, k14, s14) on [768, grid_h, grid_w] */
-    ds_conv2d(clip_patches, patch_spatial, clip->patch_embedding_weight, NULL,
-              DS_SAM_EMBED_DIM, clip_dim, grid_h, grid_w, 14, 14, 14, 0);
-    free(patch_spatial);
-
-    clip_h = (grid_h - 14) / 14 + 1;
-    clip_w = (grid_w - 14) / 14 + 1;
-    int clip_n_patches = clip_h * clip_w;
-
-    /* Convert [1024, clip_n_patches] → [clip_n_patches, 1024] and place after CLS */
-    for (int p = 0; p < clip_n_patches; p++) {
-        for (int d = 0; d < clip_dim; d++) {
-            x[(1 + p) * clip_dim + d] = clip_patches[d * clip_n_patches + p];
-        }
-    }
-    free(clip_patches);
-
-    /* Re-compute total_len with actual CLIP patch count */
-    total_len = 1 + clip_n_patches;
+    /* Patch tokens */
+    memcpy(x + clip_dim, clip_tokens, clip_n_patches * clip_dim * sizeof(float));
+    free(clip_tokens);
 
     /* Add position embedding */
     if (clip->position_embedding) {

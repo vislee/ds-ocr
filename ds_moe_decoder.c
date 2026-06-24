@@ -278,16 +278,51 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
 
     /* Causal attention — read directly from F32 KV cache (zero conversion).
      * The cache is aligned and contiguous for optimal sequential read.
-     * K/V rows are at stride _kv_row_stride (≥ kv_dim, aligned to 64 bytes). */
+     * K/V rows are at stride _kv_row_stride (≥ kv_dim, aligned to 64 bytes).
+     *
+     * R-SWA (Reference Sliding Window Attention, Unlimited-OCR):
+     * During decode (cache_offset >= prefill_token_count), only attend to:
+     *   1. Reference tokens: positions [0..prefill_token_count-1] (visual + prompt tokens)
+     *   2. Recent text tokens: positions [window_start..kv_cache_len]
+     * where window_start = max(prefill_token_count, kv_seq_len - sliding_window_size)
+     * During prefill (cache_offset < prefill_token_count), use full causal attention. */
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *attn_out = ctx->dec_attn_out;
     float *k_base = ds_kv_k_layer(ctx, layer_idx);
     float *v_base = ds_kv_v_layer(ctx, layer_idx);
     int kv_seq_len = cache_offset + 1;
     int kv_stride = ctx->_kv_row_stride;
-    ds_causal_attention_aligned(attn_out, q, k_base, v_base,
-                                1, kv_seq_len, n_heads, n_kv_heads, head_dim,
-                                scale, cache_offset, kv_stride);
+
+    if (cfg->sliding_window_size > 0 && cache_offset >= ctx->prefill_token_count) {
+        /* R-SWA decode path: attend only to reference + sliding window */
+        int prefill_len = ctx->prefill_token_count;
+        int W = cfg->sliding_window_size;
+        int window_start = prefill_len > (kv_seq_len - W) ? prefill_len : (kv_seq_len - W);
+
+        /* Two non-contiguous ranges: [0..prefill_len-1] and [window_start..kv_seq_len-1]
+         * For efficiency, we compute attention manually with these two ranges.
+         * If window_start <= prefill_len, the ranges overlap and we just use
+         * [0..kv_seq_len-1] (which happens during warmup when kv_seq_len < prefill_len + W). */
+        if (window_start <= prefill_len) {
+            /* Warmup phase: no gap between reference and window, use full attention */
+            ds_causal_attention_aligned(attn_out, q, k_base, v_base,
+                                        1, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                                        scale, cache_offset, kv_stride);
+        } else {
+            /* Steady state: gap between reference and window.
+             * Compute Q@K^T for reference range and window range separately,
+             * then combine into a single softmax. */
+            ds_rswa_attention_aligned(attn_out, q, k_base, v_base,
+                                       1, n_heads, n_kv_heads, head_dim,
+                                       scale, kv_stride,
+                                       prefill_len, window_start, kv_seq_len);
+        }
+    } else {
+        /* Standard causal attention (prefill or no R-SWA) */
+        ds_causal_attention_aligned(attn_out, q, k_base, v_base,
+                                    1, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                                    scale, cache_offset, kv_stride);
+    }
     if (ctx->profile_enabled) ctx->perf_layer_attn_ms[layer_idx] = (ds_time_sec() - t0) * 1000.0;
 
     /* Output projection + residual */

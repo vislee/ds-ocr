@@ -141,6 +141,21 @@ void ds_causal_attention_aligned(float *out, const float *Q, const float *K, con
                                    int head_dim, float scale, int q_offset, int kv_stride);
 
 /*
+ * Reference Sliding Window Attention (R-SWA) for Unlimited-OCR.
+ * During decode, attention only attends to two non-contiguous KV ranges:
+ *   1. Reference: positions [0..prefill_len-1] (visual + prompt tokens, always kept)
+ *   2. Window: positions [window_start..kv_seq_len-1] (recent text tokens)
+ * Positions [prefill_len..window_start-1] are skipped (out of window).
+ *
+ * For seq_q=1 decode: compute Q@K^T for both ranges, softmax over combined,
+ * then compute weighted sum over V from both ranges.
+ */
+void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, const float *V_base,
+                                int seq_q, int n_heads, int n_kv_heads, int head_dim,
+                                float scale, int kv_stride,
+                                int prefill_len, int window_start, int kv_seq_len);
+
+/*
  * Mixed attention for DeepEncoder V2: visual tokens use bidirectional,
  * causal flow queries use causal attention.
  * visual_len: number of visual tokens (bidirectional)
