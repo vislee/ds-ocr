@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/mman.h>
 
 /* Forward declaration */
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
@@ -180,11 +181,26 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     }
     if (scores != scores_buf) free(scores);
 
-    /* Step 3: Forward through each selected routed expert */
+    /* Step 3: Forward through each selected routed expert.
+     * Prefetch next expert's weights while current expert is computing,
+     * to reduce page fault stalls from random expert address jumps. */
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
     for (int k = 0; k < top_k; k++) {
         int expert_id = top_indices[k];
+        /* Prefetch next expert's weights via madvise to trigger async page-in.
+         * Each expert's 3 weight matrices total ~7MB, spread across ~430 pages.
+         * madvise(WILLNEED) tells the kernel to start reading these pages
+         * while the current expert computes. */
+        if (k + 1 < top_k) {
+            int next_id = top_indices[k + 1];
+            size_t gate_bytes = (size_t)moe_inter * hidden * 2;
+            size_t up_bytes = gate_bytes;
+            size_t down_bytes = (size_t)hidden * moe_inter * 2;
+            madvise((void *)layer->experts[next_id].gate_weight_bf16, gate_bytes, MADV_WILLNEED);
+            madvise((void *)layer->experts[next_id].up_weight_bf16, up_bytes, MADV_WILLNEED);
+            madvise((void *)layer->experts[next_id].down_weight_bf16, down_bytes, MADV_WILLNEED);
+        }
         ds_expert_forward(expert_outputs + k * hidden, x,
                           layer->experts[expert_id].gate_weight_bf16,
                           layer->experts[expert_id].up_weight_bf16,
