@@ -229,6 +229,11 @@ void ds_expert_combine(float *output, const float *expert_outputs,
 int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                            int in_dim, int out_dim);
 
+/* Compute dot product of x with a single row of W_bf16 (for selective logit).
+ * Returns the logit value for token at row index `tok_id`. */
+float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
+                      int in_dim, int tok_id);
+
 /* Compute logits = W_bf16 @ x + bias, storing full [out_dim] vector */
 void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
                          const float *b, int in_dim, int out_dim);
@@ -239,6 +244,7 @@ void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
 
 /* Set number of threads for parallel operations (default: 1) */
 void ds_set_threads(int n);
+int  ds_get_threads(void);
 
 /* Get number of available CPU cores */
 int ds_get_num_cpus(void);
