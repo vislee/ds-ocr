@@ -491,6 +491,10 @@ void ds_set_threads(int n) {
         fprintf(stderr, "Thread pool: %d threads\n", n);
 }
 
+int ds_get_threads(void) {
+    return tp.n_threads;
+}
+
 int ds_get_num_cpus(void) {
 #ifdef __APPLE__
     int n = 0;
@@ -920,6 +924,39 @@ static void ds_argmax_worker(int tid, int n_threads, void *arg) {
     }
     argmax_bf16_range(t->x, t->W_bf16, t->in_dim, start, end,
                       &t->best_idx[tid], &t->best_val[tid]);
+}
+
+/* Compute single-row BF16 dot product: logit = W_bf16[tok_id * in_dim ..] · x */
+float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
+                      int in_dim, int tok_id) {
+    const uint16_t *w_row = W_bf16 + (size_t)tok_id * in_dim;
+    float sum = 0.0f;
+#ifdef __ARM_NEON
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    int k = 0;
+    for (; k + 8 <= in_dim; k += 8) {
+        uint16x8_t bf = vld1q_u16(w_row + k);
+        acc0 = vfmaq_f32(acc0, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16)),
+                         vld1q_f32(x + k));
+        acc1 = vfmaq_f32(acc1, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16)),
+                         vld1q_f32(x + k + 4));
+    }
+    sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; k < in_dim; k++) {
+        uint32_t bits = ((uint32_t)w_row[k]) << 16;
+        float wv;
+        memcpy(&wv, &bits, sizeof(float));
+        sum += wv * x[k];
+    }
+#else
+    for (int k = 0; k < in_dim; k++) {
+        uint32_t bits = ((uint32_t)w_row[k]) << 16;
+        float wv;
+        memcpy(&wv, &bits, sizeof(float));
+        sum += wv * x[k];
+    }
+#endif
+    return sum;
 }
 
 int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,

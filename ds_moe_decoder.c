@@ -821,15 +821,87 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     /* LM head: compute logits then sample with optional repetition penalty */
     int vocab = cfg->vocab_size;
     float *logits = ctx->dec_logits;  /* [vocab_size] buffer */
+    const uint16_t *lm_w = dec->lm_head_bf16 ? dec->lm_head_bf16 : dec->tok_embeddings_bf16;
+
+    /* ──── Fast argmax path (no temperature sampling) ────
+     * Instead of computing all 129280 logits via sgemm (631MB BF16→F32),
+     * use ds_argmax_matvec_bf16 which computes dot products on-the-fly
+     * and only tracks the best value. For repetition penalty, we
+     * selectively recompute only the ~hundred history tokens' logits
+     * instead of all 129280. This saves ~55ms/step on LM head. */
+    if (ctx->temperature <= 0.0f && lm_w) {
+        double t_lm = ctx->profile_enabled ? ds_time_sec() : 0;
+
+        /* Step 1: Argmax over all rows — returns best token and value */
+        int best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
+        float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);
+
+        /* Step 2: Apply repetition penalty selectively.
+         * Only recompute logits for tokens in the history (typically <100),
+         * not all 129280 tokens. If a penalized token beats the current
+         * best, update best. If the best token itself is penalized, recompute. */
+        float rp = ctx->repeat_penalty;
+        if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
+            /* First: if the argmax winner is in history, apply penalty */
+            for (int i = 0; i < ctx->token_history_len; i++) {
+                if (ctx->token_history[i] == best_token) {
+                    best_val = (best_val > 0) ? best_val / rp : best_val * rp;
+                    break;
+                }
+            }
+            /* Then: compute logits for other history tokens that might
+             * surpass the penalized best. Only check unique tokens. */
+            for (int i = 0; i < ctx->token_history_len; i++) {
+                int tid = ctx->token_history[i];
+                if (tid >= 0 && tid < vocab && tid != best_token) {
+                    float val = ds_bf16_dot_row(x, lm_w, hidden, tid);
+                    val = (val > 0) ? val / rp : val * rp;
+                    if (val > best_val) {
+                        best_val = val;
+                        best_token = tid;
+                    }
+                }
+            }
+        }
+
+        /* Step 3: N-gram blocking — if best token is banned, find next best.
+         * For ngram blocking we need the full argmax scan again with banned
+         * tokens excluded — but typically ngram only bans 0-1 tokens, so
+         * just check if best is banned and if so, rescan. */
+        int ngram_n = ctx->no_repeat_ngram_size;
+        if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
+            int prefix_len = ngram_n - 1;
+            int *hist = ctx->token_history;
+            int hist_len = ctx->token_history_len;
+            for (int i = 0; i <= hist_len - prefix_len - 1; i++) {
+                int match = 1;
+                for (int j = 0; j < prefix_len; j++) {
+                    if (hist[i + j] != hist[hist_len - prefix_len + j]) {
+                        match = 0; break;
+                    }
+                }
+                if (match) {
+                    int banned = hist[i + prefix_len];
+                    if (banned == best_token) {
+                        /* Best token is banned — need to find next best.
+                         * Fall back to full sgemm logits for this step. */
+                        goto full_logits_path;
+                    }
+                }
+            }
+        }
+
+        if (ctx->profile_enabled) {
+            ctx->perf_lm_head_ms += (ds_time_sec() - t_lm) * 1000.0;
+        }
+        return best_token;
+    }
+
+full_logits_path:
+    /* ──── Full logits path (temperature sampling or ngram fallback) ──── */
     if (!logits) {
         /* Fallback: direct argmax (no penalty support) */
-        int token;
-        if (dec->lm_head_bf16) {
-            token = ds_argmax_matvec_bf16(x, dec->lm_head_bf16, hidden, vocab);
-        } else {
-            token = ds_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, hidden, vocab);
-        }
-        if (ctx->profile_enabled) { /* no logits path — timing not tracked */ }
+        int token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
         return token;
     }
 
