@@ -570,6 +570,13 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->min_new_tokens = 256;     /* Suppress EOS for first 256 tokens to avoid premature truncation.
                                       OCR documents often need >200 tokens; model may output EOS at
                                       paragraph breaks. Use --min-tokens 0 to disable. */
+    if (cfg->model_version == 3) {
+        /* Unlimited-OCR: CPU BF16 precision causes decoder to predict EOS at step 0,
+         * while GPU CUDA BF16 predicts <|det|> instead. Setting min_new_tokens=1
+         * forces past this initial EOS, after which the model correctly generates
+         * detection blocks. Python generate() with streamer also handles this. */
+        ctx->min_new_tokens = 1;
+    }
 
     return 0;
 }
