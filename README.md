@@ -27,16 +27,27 @@ make blas
 
 Apple M2 Pro (8 threads, BLAS), 6-crop V2 image:
 
-| Stage | v0.5 | v0.8 | Optimization |
-|-------|------|------|-------------|
-| SAM+Encoder | ~50s | **8.8s** | Parallel global crop |
-| Prefill (862 tokens) | ~30s | **1.1s** | Batched MoE sgemm |
-| Decode (280 tokens) | ~19s | **6.2s** | F32 KV cache + fused kernels |
-| **Total** | **~97s** | **16s** | |
+| Stage | v0.5 | v0.8 | v0.9 | Optimization |
+|-------|------|------|------|-------------|
+| SAM+Encoder | ~50s | **8.8s** | **8.8s** | Parallel global crop |
+| Prefill (862 tokens) | ~30s | **1.1s** | **1.1s** | Batched MoE sgemm |
+| Decode (280 tokens) | ~19s | **6.2s** | **~5s** | Argmax LM head + madvise prefetch |
+| **Total** | **~97s** | **16s** | **~15s** | |
 
-**v0.8 = 6× v0.5 = 45× Python PyTorch (CPU BF16 ~736s)**
+Key optimizations in v0.9:
+- **Argmax LM head**: Uses `ds_argmax_matvec_bf16` instead of full sgemm for
+  greedy decoding — avoids 631MB BF16→F32 weight conversion, computes dot
+  products on-the-fly while tracking only the best token (~8ms vs ~60ms/step).
+- **Selective repetition penalty**: Only recomputes logits for history tokens
+  (~100) via `ds_bf16_dot_row`, not all 129280 vocabulary entries.
+- **madvise prefetch**: Issues `MADV_WILLNEED` for next expert's weights during
+  MoE decode, reducing page fault stalls from random expert address jumps.
+- **8-thread decode**: All cores used for decode (argmax LM head benefits from
+  8T; small expert matvecs are marginally slower but overall faster).
 
-Small images (1-crop V2): ~11s total.
+Small images (1-crop V2, global-only): ~40s total (~3-4 tok/s decode).
+
+**v0.9 = 6.5× v0.5 = 49× Python PyTorch (CPU BF16 ~736s)**
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
