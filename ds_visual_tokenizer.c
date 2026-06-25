@@ -833,16 +833,11 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
     }
 
     /* Neck conv2: [256, h, w] → [256, h, w]
-     * V1: 1×1 conv, no padding
-     * V2: 3×3 conv, stride=1, padding=1 */
+     * ALL versions (V1, V2, V3): 3×3 conv, stride=1, padding=1
+     * Weight shape: [256, 256, 3, 3] confirms kernel_size=3 */
     float *conv2_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
-    if (g_sam_is_v2) {
-        ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
-                  c_mid, c_mid, h, w, 3, 3, 1, 1);
-    } else {
-        ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
-                  c_mid, c_mid, h, w, 1, 1, 1, 0);
-    }
+    ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
+              c_mid, c_mid, h, w, 3, 3, 1, 1);
     free(ln1_out);
 
     /* DUMP: after conv2 */
@@ -1177,6 +1172,18 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         }
 
         if (interp_pos) free(interp_pos);
+    } else if (cfg->model_version == 3) {
+        /* V3 (Unlimited-OCR): pos_embed is 2D spatial [1, 64, 64, 768] (same as V2)
+         * No CLS token, no interpolation needed for 1024×1024 input (64×64 patches).
+         * Uses the same 2D spatial indexing as V2. */
+        for (int p = 0; p < n_patches; p++) {
+            int row = p / grid_w;
+            int col = p % grid_w;
+            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
+                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
+                    + vt->sam_pos_embed[(row * grid_w + col) * DS_SAM_EMBED_DIM + d];
+            }
+        }
     } else {
         /* V1: pos_embed is 1D sequence [1, n_patches+1, 768] (with CLS token at index 0) */
         for (int p = 0; p < n_patches; p++) {
