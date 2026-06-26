@@ -305,6 +305,57 @@ void ds_expert_forward_legacy(float *out, const float *x,
     free(gate_buf); free(up_buf); free(gate_up_buf); free(hidden_buf);
 }
 
+/* Fused gate+up expert forward — one matvec instead of two.
+ * gate_up_fused_bf16 layout: [2*intermediate, hidden] BF16
+ *   rows 0..intermediate-1 = gate_W
+ *   rows intermediate..2*intermediate-1 = up_W
+ *
+ * Pipeline:
+ *   1. gate_up = gate_up_fused_bf16 @ x   [1280 → 1792] single matvec
+ *   2. gate = gate_up[0:intermediate], up = gate_up[intermediate:2*intermediate]
+ *   3. BF16 truncate (if ds_bf16_simulate_python)
+ *   4. swiglu = SiLU(gate) * up
+ *   5. BF16 truncate swiglu
+ *   6. out = down_bf16 @ swiglu            [896 → 1280]
+ *   7. BF16 truncate out
+ */
+void ds_expert_forward_fused(float *out, const float *x,
+                              const uint16_t *gate_up_fused_bf16,
+                              const uint16_t *down_bf16,
+                              int hidden, int intermediate,
+                              float *gate_up_buf, float *gate_buf,
+                              float *up_buf, float *hidden_buf) {
+    /* Step 1: Fused gate+up projection — single matvec [hidden → 2*intermediate] */
+    ds_linear_nobias_bf16(gate_up_buf, x, gate_up_fused_bf16, 1, hidden, 2 * intermediate);
+
+    /* Step 2: Split fused output into gate and up */
+    memcpy(gate_buf, gate_up_buf, intermediate * sizeof(float));
+    memcpy(up_buf, gate_up_buf + intermediate, intermediate * sizeof(float));
+
+    /* Step 3: BF16 truncate gate and up to match Python's BF16 precision */
+    extern int ds_bf16_simulate_python;
+    if (ds_bf16_simulate_python) {
+        ds_bf16_truncate_array(gate_buf, intermediate);
+        ds_bf16_truncate_array(up_buf, intermediate);
+    }
+
+    /* Step 4: SwiGLU = SiLU(gate) * up */
+    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);
+
+    /* Step 5: BF16 truncate SwiGLU output */
+    if (ds_bf16_simulate_python) {
+        ds_bf16_truncate_array(hidden_buf, intermediate);
+    }
+
+    /* Step 6: Down projection */
+    ds_linear_nobias_bf16(out, hidden_buf, down_bf16, 1, intermediate, hidden);
+
+    /* Step 7: BF16 truncate final output */
+    if (ds_bf16_simulate_python) {
+        ds_bf16_truncate_array(out, hidden);
+    }
+}
+
 void ds_expert_combine(float *output, const float *expert_outputs,
                        const int *top_indices, const float *top_weights,
                        int top_k, int hidden) {

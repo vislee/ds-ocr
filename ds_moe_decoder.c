@@ -183,31 +183,54 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
 
     /* Step 3: Forward through each selected routed expert.
      * Prefetch next expert's weights while current expert is computing,
-     * to reduce page fault stalls from random expert address jumps. */
+     * to reduce page fault stalls from random expert address jumps.
+     * With contiguous expert blocks, gate_up_fused for all experts are
+     * in one allocation — a single madvise on the block covers upcoming
+     * experts. We also prefetch the down weight (still in mmap'd region). */
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
+    /* Prefetch the entire range of selected experts' gate_up_fused weights
+     * within the contiguous block. This covers all top-k experts' gate_up
+     * in one system call, letting the kernel async-read-ahead. */
+    if (layer->expert_block_bf16 && top_k > 1) {
+        /* Find min/max offset of selected experts within the block */
+        size_t fused_per_expert = (size_t)2 * moe_inter * hidden * sizeof(uint16_t);
+        uintptr_t block_base = (uintptr_t)layer->expert_block_bf16;
+        uintptr_t min_off = (uintptr_t)layer->experts[top_indices[0]].gate_up_fused_bf16 - block_base;
+        uintptr_t max_end = min_off + fused_per_expert;
+        for (int k = 1; k < top_k; k++) {
+            uintptr_t off = (uintptr_t)layer->experts[top_indices[k]].gate_up_fused_bf16 - block_base;
+            if (off < min_off) min_off = off;
+            uintptr_t end = off + fused_per_expert;
+            if (end > max_end) max_end = end;
+        }
+        madvise((void *)(block_base + min_off), max_end - min_off, MADV_WILLNEED);
+    }
     for (int k = 0; k < top_k; k++) {
         int expert_id = top_indices[k];
-        /* Prefetch next expert's weights via madvise to trigger async page-in.
-         * Each expert's 3 weight matrices total ~7MB, spread across ~430 pages.
-         * madvise(WILLNEED) tells the kernel to start reading these pages
-         * while the current expert computes. */
+        /* Prefetch next expert's down weight (in mmap'd region, not in block) */
         if (k + 1 < top_k) {
             int next_id = top_indices[k + 1];
-            size_t gate_bytes = (size_t)moe_inter * hidden * 2;
-            size_t up_bytes = gate_bytes;
             size_t down_bytes = (size_t)hidden * moe_inter * 2;
-            madvise((void *)layer->experts[next_id].gate_weight_bf16, gate_bytes, MADV_WILLNEED);
-            madvise((void *)layer->experts[next_id].up_weight_bf16, up_bytes, MADV_WILLNEED);
             madvise((void *)layer->experts[next_id].down_weight_bf16, down_bytes, MADV_WILLNEED);
         }
-        ds_expert_forward(expert_outputs + k * hidden, x,
-                          layer->experts[expert_id].gate_weight_bf16,
-                          layer->experts[expert_id].up_weight_bf16,
-                          layer->experts[expert_id].down_weight_bf16,
-                          hidden, moe_inter,
-                          expert_gate_buf, expert_up_buf,
-                          expert_gate_up_buf, expert_hidden_buf);
+        /* Use fused gate+up path if available (faster: 1 matvec vs 2) */
+        if (layer->experts[expert_id].gate_up_fused_bf16) {
+            ds_expert_forward_fused(expert_outputs + k * hidden, x,
+                                     layer->experts[expert_id].gate_up_fused_bf16,
+                                     layer->experts[expert_id].down_weight_bf16,
+                                     hidden, moe_inter,
+                                     expert_gate_up_buf, expert_gate_buf,
+                                     expert_up_buf, expert_hidden_buf);
+        } else {
+            ds_expert_forward(expert_outputs + k * hidden, x,
+                              layer->experts[expert_id].gate_weight_bf16,
+                              layer->experts[expert_id].up_weight_bf16,
+                              layer->experts[expert_id].down_weight_bf16,
+                              hidden, moe_inter,
+                              expert_gate_buf, expert_up_buf,
+                              expert_gate_up_buf, expert_hidden_buf);
+        }
     }
 
     /* Step 4: Combine routed expert outputs */
@@ -216,7 +239,39 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     else memset(expert_outputs_buf, 0, top_k * hidden * sizeof(float));
 
     /* Step 5: Add shared expert outputs (always active) */
-    if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
+    if (layer->shared_gate_up_fused_bf16) {
+        /* Fused gate+up path: single matvec [hidden → 2*shared_inter] */
+        int shared_inter = n_shared * moe_inter;
+        ds_linear_nobias_bf16(shared_gate_up_buf, x, layer->shared_gate_up_fused_bf16,
+                               1, hidden, 2 * shared_inter);
+        /* Split into gate and up */
+        memcpy(shared_gate_buf, shared_gate_up_buf, shared_inter * sizeof(float));
+        memcpy(shared_up_buf, shared_gate_up_buf + shared_inter, shared_inter * sizeof(float));
+
+        /* BF16 truncate (match Python precision) */
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) {
+            ds_bf16_truncate_array(shared_gate_buf, shared_inter);
+            ds_bf16_truncate_array(shared_up_buf, shared_inter);
+        }
+
+        /* Direct SwiGLU */
+        ds_swiglu_direct(shared_swiglu_buf, shared_gate_buf, shared_up_buf, 1, shared_inter);
+
+        if (ds_bf16_simulate_python) {
+            ds_bf16_truncate_array(shared_swiglu_buf, shared_inter);
+        }
+
+        ds_linear_nobias_bf16(shared_out_buf, shared_swiglu_buf, layer->shared_down_weight_bf16,
+                               1, shared_inter, hidden);
+
+        if (ds_bf16_simulate_python) {
+            ds_bf16_truncate_array(shared_out_buf, hidden);
+        }
+
+        ds_vec_add(output, output, shared_out_buf, hidden);
+    } else if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
+        /* Fallback: separate gate + up (for prefill or if fused not available) */
         int shared_inter = n_shared * moe_inter;
 
         ds_linear_nobias_bf16(shared_gate_buf, x, layer->shared_gate_weight_bf16, 1, hidden, shared_inter);
@@ -786,10 +841,57 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     ds_moe_decoder_t *dec = &ctx->decoder;
     ds_config_t *cfg = &ctx->config;
     int hidden = cfg->dec_hidden;
+    int n_heads = cfg->dec_heads;
+    int n_kv_heads = cfg->dec_kv_heads;
+    int head_dim = cfg->dec_head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
 
     /* Copy input to working buffer */
     float *x = ctx->dec_x;
     memcpy(x, input_embed, hidden * sizeof(float));
+
+    /* Prefetch distant layer weights via madvise.
+     * In safetensors alphabetical layout, layers 10/11 sit at file offsets
+     * ~1140-2031 MB — between layers 1 and 2! During sequential decode
+     * (layer 0→1→2→...→9→10→11), the OS must seek backward to page-in
+     * layers 10/11 after layer 9. By issuing WILLNEED at the start of
+     * each decode step, the kernel begins async page-in while we compute
+     * layers 0-9, reducing cold-cache stall time.
+     * Only prefetch layers 10/11 + their guaranteed-used weights (attention
+     * + shared experts). Routed experts are prefetched per-expert in moe_forward. */
+    for (int _pl = 10; _pl < cfg->dec_layers; _pl++) {
+        ds_dec_layer_t *_layer = &dec->layers[_pl];
+        /* Attention weights: wq, wk, wv, wo — contiguous in safetensors,
+         * so one madvise per contiguous region is sufficient. */
+        if (_layer->wq_weight_bf16)
+            madvise((void *)_layer->wq_weight_bf16,
+                    (size_t)(q_dim + kv_dim * 2) * hidden * 2, MADV_WILLNEED);
+        if (_layer->wo_weight_bf16)
+            madvise((void *)_layer->wo_weight_bf16,
+                    (size_t)q_dim * hidden * 2, MADV_WILLNEED);
+        /* Shared expert weights — always used, not dependent on routing.
+         * If expert_block is available, shared gate_up_fused is in the
+         * contiguous block (prefetch as part of the block). Otherwise
+         * prefetch separate gate+up weights from mmap. */
+        {
+            int shared_inter = cfg->dec_n_shared_experts * cfg->dec_moe_inter;
+            if (_layer->shared_down_weight_bf16)
+                madvise((void *)_layer->shared_down_weight_bf16,
+                        (size_t)hidden * shared_inter * 2, MADV_WILLNEED);
+            if (_layer->expert_block_bf16 && _layer->shared_gate_up_fused_bf16) {
+                /* Prefetch from the contiguous block: shared gate_up_fused
+                 * is at the tail of the expert block */
+                size_t shared_fused_bytes = (size_t)2 * shared_inter * hidden * 2;
+                madvise((void *)_layer->shared_gate_up_fused_bf16, shared_fused_bytes, MADV_WILLNEED);
+            } else if (_layer->shared_gate_weight_bf16) {
+                madvise((void *)_layer->shared_gate_weight_bf16,
+                        (size_t)shared_inter * hidden * 2, MADV_WILLNEED);
+                madvise((void *)_layer->shared_up_weight_bf16,
+                        (size_t)shared_inter * hidden * 2, MADV_WILLNEED);
+            }
+        }
+    }
 
     /* Process through all layers */
     float *out = ctx->dec_layer_out;
