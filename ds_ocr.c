@@ -455,6 +455,80 @@ static int load_all_weights(ds_ctx_t *ctx) {
     #undef DEC_BF16
     #undef DEC_F32
 
+    /* ---- Build fused gate+up weights for decode-path expert forward ----
+     * Each expert's gate and up projections share the same input x,
+     * so concatenating [gate_W; up_W] into a single [2*inter, hidden] matrix
+     * allows one matvec instead of two — better L2 cache reuse of x, fewer
+     * thread dispatches. This is only used for single-token decode;
+     * prefill uses the separate gate/up weights for batched sgemm.
+     *
+     * Contiguous block layout: all experts' gate_up_fused + shared gate_up_fused
+     * are packed into ONE allocation per layer for better page-in locality.
+     * When the OS pages in expert N's weights, expert N+1 is already adjacent
+     * in virtual memory, reducing page faults from random expert access. */
+    {
+        int moe_inter = cfg->dec_moe_inter;
+        int n_experts = cfg->dec_n_routed_experts;
+        int n_shared = cfg->dec_n_shared_experts;
+        int shared_inter = n_shared * moe_inter;
+        int dec_hidden = cfg->dec_hidden;
+        size_t fused_per_expert = (size_t)2 * moe_inter * dec_hidden;  /* BF16 elements */
+        size_t shared_fused_size = (size_t)2 * shared_inter * dec_hidden;  /* BF16 elements */
+
+        for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++) {
+            ds_dec_layer_t *layer = &dec->layers[l];
+
+            /* Single contiguous block:
+             *   [expert 0 gate_up_fused | expert 1 gate_up_fused | ... | expert N-1 gate_up_fused | shared gate_up_fused]
+             * Total elements = n_experts * fused_per_expert + shared_fused_size */
+            size_t block_elements = (size_t)n_experts * fused_per_expert + shared_fused_size;
+            size_t block_bytes = block_elements * sizeof(uint16_t);
+            uint16_t *block = (uint16_t *)malloc(block_bytes);
+            if (!block) {
+                fprintf(stderr, "Failed to allocate expert block for layer %d (%.1f MB)\n",
+                        l, block_bytes / 1048576.0);
+                return -1;
+            }
+            layer->expert_block_bf16 = block;
+            layer->expert_block_size = block_bytes;
+
+            /* Fill routed experts: gate_up_fused for each */
+            uint16_t *ptr = block;
+            for (int e = 0; e < n_experts; e++) {
+                if (layer->experts[e].gate_weight_bf16 && layer->experts[e].up_weight_bf16) {
+                    /* Layout: [gate_W(moe_inter, hidden); up_W(moe_inter, hidden)]
+                     * Row-major: gate rows 0..moe_inter-1, then up rows 0..moe_inter-1 */
+                    memcpy(ptr, layer->experts[e].gate_weight_bf16,
+                           (size_t)moe_inter * dec_hidden * sizeof(uint16_t));
+                    memcpy(ptr + (size_t)moe_inter * dec_hidden,
+                           layer->experts[e].up_weight_bf16,
+                           (size_t)moe_inter * dec_hidden * sizeof(uint16_t));
+                    layer->experts[e].gate_up_fused_bf16 = ptr;
+                }
+                ptr += fused_per_expert;
+            }
+
+            /* Fill shared experts: gate_up_fused at the end of the block */
+            if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
+                memcpy(ptr, layer->shared_gate_weight_bf16,
+                       (size_t)shared_inter * dec_hidden * sizeof(uint16_t));
+                memcpy(ptr + (size_t)shared_inter * dec_hidden,
+                       layer->shared_up_weight_bf16,
+                       (size_t)shared_inter * dec_hidden * sizeof(uint16_t));
+                layer->shared_gate_up_fused_bf16 = ptr;
+            }
+        }
+
+        if (ds_verbose >= 1) {
+            size_t total_fused = 0;
+            for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++) {
+                total_fused += dec->layers[l].expert_block_size;
+            }
+            fprintf(stderr, "Contiguous expert blocks: %.1f MB allocated (%d experts × %d layers + shared, 1 block/layer)\n",
+                    total_fused / 1048576.0, n_experts, cfg->dec_layers - cfg->dec_first_k_dense);
+        }
+    }
+
     if (ds_verbose >= 1)
         fprintf(stderr, "All weights loaded\n");
 
@@ -658,6 +732,23 @@ void ds_free(ds_ctx_t *ctx) {
     free(ctx->enc_output);
     free(ctx->lm_head_f32);
     free(ctx->tok_emb_f32);
+
+    /* Free contiguous expert blocks (malloc'd, not mmap'd).
+     * All experts' gate_up_fused + shared gate_up_fused are in one block per layer. */
+    {
+        ds_config_t *cfg = &ctx->config;
+        ds_moe_decoder_t *dec = &ctx->decoder;
+        for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++) {
+            ds_dec_layer_t *layer = &dec->layers[l];
+            free(layer->expert_block_bf16);
+            layer->expert_block_bf16 = NULL;
+            layer->expert_block_size = 0;
+            /* Nullify pointers into the freed block */
+            for (int e = 0; e < cfg->dec_n_routed_experts; e++)
+                layer->experts[e].gate_up_fused_bf16 = NULL;
+            layer->shared_gate_up_fused_bf16 = NULL;
+        }
+    }
 
     /* Note: visual tokenizer, encoder, and decoder weight pointers
      * point into mmap'd safetensors data — they are freed when

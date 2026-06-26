@@ -297,15 +297,25 @@ typedef struct {
         uint16_t *gate_weight_bf16;    /* [moe_inter, hidden] */
         uint16_t *up_weight_bf16;      /* [moe_inter, hidden] */
         uint16_t *down_weight_bf16;    /* [hidden, moe_inter] */
+        uint16_t *gate_up_fused_bf16;  /* [2*moe_inter, hidden] gate+up concatenated (decode) */
     } experts[DS_MAX_EXPERTS];
+
+    /* Contiguous expert block: all routed experts' gate_up_fused + shared gate_up_fused
+     * in one allocation for better page-in locality during decode.
+     * Layout: expert 0 gate_up_fused [2*moe_inter, hidden]
+     *         expert 1 gate_up_fused [2*moe_inter, hidden]
+     *         ...
+     *         expert N-1 gate_up_fused [2*moe_inter, hidden]
+     *         shared gate_up_fused [2*n_shared*moe_inter, hidden]
+     * experts[e].gate_up_fused_bf16 and shared_gate_up_fused_bf16 point into this block. */
+    uint16_t *expert_block_bf16;
+    size_t    expert_block_size;        /* bytes */
 
     /* Shared experts (always active) */
     uint16_t *shared_gate_weight_bf16; /* [shared_experts * moe_inter, hidden] */
     uint16_t *shared_up_weight_bf16;   /* [shared_experts * moe_inter, hidden] */
     uint16_t *shared_down_weight_bf16; /* [hidden, shared_experts * moe_inter] */
-
-    /* Fused gate+up weight for single-token matvec */
-    uint16_t *gate_up_fused_bf16;
+    uint16_t *shared_gate_up_fused_bf16; /* [2*shared_experts*moe_inter, hidden] gate+up concatenated (decode) */
 } ds_dec_layer_t;
 
 typedef struct {

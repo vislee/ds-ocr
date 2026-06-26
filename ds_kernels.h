@@ -203,6 +203,16 @@ void ds_expert_forward(float *out, const float *x,
                        float *gate_buf, float *up_buf,
                        float *gate_up_buf, float *hidden_buf);
 
+/* Fused gate+up expert forward: gate_up = [gate_W; up_W] @ x, then split & SwiGLU.
+ * gate_up_fused_bf16 is [2*intermediate, hidden] with gate rows first, then up rows.
+ * Uses one matvec instead of two — better cache reuse of x, fewer thread dispatches. */
+void ds_expert_forward_fused(float *out, const float *x,
+                              const uint16_t *gate_up_fused_bf16,
+                              const uint16_t *down_bf16,
+                              int hidden, int intermediate,
+                              float *gate_up_buf, float *gate_buf,
+                              float *up_buf, float *hidden_buf);
+
 void ds_expert_forward_f32(float *out, const float *x,
                             const uint16_t *gate_bf16, const uint16_t *up_bf16,
                             const uint16_t *down_bf16,
