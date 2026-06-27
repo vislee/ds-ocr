@@ -860,7 +860,8 @@ static void test_integration_v2_visual_tokenizer(void) {
     int n_tokens = 0;
     float *patch_embeds = NULL;
     float *tokens = ds_visual_tokenizer_forward(ctx, img->pixels,
-        img->width, img->height, img->channels, &n_tokens, &patch_embeds);
+        img->width, img->height, img->channels, &n_tokens, &patch_embeds,
+        NULL, NULL, NULL);
 
     ASSERT_NOT_NULL(tokens);
     ASSERT_TRUE(n_tokens > 0);

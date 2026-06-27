@@ -484,12 +484,17 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 /* Visual tokenizer forward pass: image pixels -> SAM features + patch_embeds */
 float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int width, int height, int channels,
-                                    int *out_n_tokens, float **out_patch_embeds);
+                                    int *out_n_tokens, float **out_patch_embeds,
+                                    unsigned char **out_resized_pixels,
+                                    int *out_resized_w, int *out_resized_h);
 
-/* CLIP encoder forward pass (V1): SAM patch_embeds + SAM features -> projected output */
-float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
-                                int n_patches, const float *sam_features,
-                                int n_sam_tokens, int *out_seq_len);
+/* CLIP encoder forward pass (V1/V3):
+ * V1: raw RGB pixels -> Conv2d(3→1024) -> CLIP transformer
+ * V3: SAM features directly as CLIP patch_embeds */
+float *ds_clip_encoder_forward(ds_ctx_t *ctx,
+                                const unsigned char *rgb_pixels, int width, int height, int channels,
+                                const float *sam_features, int n_sam_tokens,
+                                int *out_seq_len);
 
 /* DeepEncoder V2 forward pass: visual tokens -> encoder output */
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,

@@ -1329,7 +1329,9 @@ float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
  * ======================================================================== */
 float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int width, int height, int channels,
-                                    int *out_n_tokens, float **out_patch_embeds) {
+                                    int *out_n_tokens, float **out_patch_embeds,
+                                    unsigned char **out_resized_pixels,
+                                    int *out_resized_w, int *out_resized_h) {
     ds_config_t *cfg = &ctx->config;
     g_sam_is_v2 = (cfg->model_version == 2 || cfg->model_version == 3);
 
@@ -1362,6 +1364,18 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
     /* Convert to float CHW and run SAM forward */
     ds_image_t *effective_img = resized_img ? resized_img : &img;
     float *image_chw = ds_image_to_float_chw(effective_img);
+
+    /* Save resized pixels for CLIP V1 (which needs raw RGB input) */
+    if (out_resized_pixels && effective_img->pixels) {
+        size_t sz = (size_t)effective_img->width * effective_img->height * effective_img->channels;
+        *out_resized_pixels = (unsigned char *)malloc(sz);
+        if (*out_resized_pixels) {
+            memcpy(*out_resized_pixels, effective_img->pixels, sz);
+            if (out_resized_w) *out_resized_w = effective_img->width;
+            if (out_resized_h) *out_resized_h = effective_img->height;
+        }
+    }
+
     if (resized_img) ds_image_free(resized_img);
     if (!image_chw) return NULL;
 
@@ -1381,7 +1395,8 @@ float *ds_sam_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                        int width, int height, int channels,
                        int *out_n_tokens, float **out_patch_embeds) {
     return ds_visual_tokenizer_forward(ctx, pixels, width, height, channels,
-                                       out_n_tokens, out_patch_embeds);
+                                       out_n_tokens, out_patch_embeds,
+                                       NULL, NULL, NULL);
 }
 
 /* Weight Loading (done in ds_ocr.c during ds_load()) */

@@ -24,6 +24,11 @@ typedef struct {
 /* Load tokenizer from vocab.json in model directory */
 ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path);
 
+/* Load tokenizer from tokenizer.json (HuggingFace format).
+ * Extracts model.vocab and model.merges from the nested JSON structure.
+ * This is the fallback when vocab.json is not available (e.g. DeepSeek-OCR V2). */
+ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json_path);
+
 /* Decode a single token ID to text. Returns pointer to internal string. */
 const char *ds_tokenizer_decode(const ds_tokenizer_t *tok, int token_id);
 

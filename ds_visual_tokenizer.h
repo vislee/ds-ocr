@@ -24,10 +24,14 @@ float *ds_sam_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                        int width, int height, int channels,
                        int *out_n_tokens, float **out_patch_embeds);
 
-/* Full visual tokenizer forward pass (calls SAM then returns features) */
+/* Full visual tokenizer forward pass (calls SAM then returns features)
+ * out_resized_pixels: if non-NULL, returns the resized RGB pixels (for CLIP V1 input).
+ * Caller must free the returned pixels. */
 float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int width, int height, int channels,
-                                    int *out_n_tokens, float **out_patch_embeds);
+                                    int *out_n_tokens, float **out_patch_embeds,
+                                    unsigned char **out_resized_pixels,
+                                    int *out_resized_w, int *out_resized_h);
 
 /* SAM forward from pre-processed ds_image_t (supports variable input size)
  * Used for multi-crop encoding where each crop may be 768x768 (requires
