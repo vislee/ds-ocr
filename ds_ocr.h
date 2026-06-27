@@ -75,6 +75,11 @@
 #define DS_TOKEN_NEWLINE        151657
 #define DS_TOKEN_IMAGE_PLACEHOLDER 128815  /* Unlimited-OCR: single image token ID */
 
+/* Model version identifiers */
+#define DS_MODEL_VERSION_V1     1       /* DeepSeek-OCR (original, SAM+CLIP) */
+#define DS_MODEL_VERSION_V2     2       /* DeepSeek-OCR-2 (DeepEncoder V2) */
+#define DS_MODEL_VERSION_UNLIMITED 3    /* Unlimited-OCR (SAM+CLIP+2D grid+sliding window) */
+
 /* Maximum layer counts (for static array sizing) */
 #define DS_MAX_ENC_LAYERS       24
 #define DS_MAX_DEC_LAYERS       12
@@ -133,6 +138,11 @@ typedef struct {
     int vocab_size;             /* 129280 */
     float dec_rms_norm_eps;     /* 1e-6 */
     float dec_rope_theta;       /* 10000.0 */
+    int has_qk_norm;            /* 1 = per-head Q/K RMSNorm (V1/V2), 0 = none (Unlimited-OCR) */
+
+    /* Unlimited-OCR specific */
+    int image_token_id;         /* 128815 for Unlimited-OCR, unused for V1/V2 */
+    int image_size_crop;        /* 640 (crop image size for Unlimited-OCR) */
 } ds_config_t;
 
 /* ========================================================================

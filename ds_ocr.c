@@ -102,7 +102,7 @@ static void *crop_worker_global(void *arg) {
  * ======================================================================== */
 
 static int detect_model_version(const char *model_dir) {
-    /* Check for DeepEncoder V2 indicators (Qwen2-based encoder) */
+    /* Check config.json for model type indicators */
     char path[1024];
     snprintf(path, sizeof(path), "%s/config.json", model_dir);
 
@@ -112,7 +112,6 @@ static int detect_model_version(const char *model_dir) {
         return -1;
     }
 
-    /* Simple detection: search for "DeepEncoderV2" or "causal_flow" in config */
     char buf[65536];
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     buf[n] = '\0';
@@ -212,6 +211,63 @@ static void init_config(ds_config_t *cfg, int version) {
     cfg->vocab_size = DS_DEC_VOCAB_SIZE;
     cfg->dec_rms_norm_eps = 1e-6f;
     cfg->dec_rope_theta = 10000.0f;
+
+    if (version == 3) {
+        /* Unlimited-OCR: SAM + CLIP-L/14 + 2D grid + sliding window */
+        cfg->enc_type = 1;  /* CLIP encoder */
+        cfg->enc_layers = DS_CLIP_LAYERS;
+        cfg->enc_hidden = DS_CLIP_HIDDEN;
+        cfg->enc_heads = DS_CLIP_HEADS;
+        cfg->enc_kv_heads = DS_CLIP_HEADS;  /* CLIP uses same heads for KV */
+        cfg->enc_head_dim = DS_CLIP_HEAD_DIM;
+        cfg->enc_intermediate = DS_CLIP_MLP_DIM;
+        cfg->enc_causal_flow_queries = 0;
+        cfg->proj_input_dim = DS_PROJECTOR_V1_INPUT; /* 2048 */
+        cfg->enc_rope_theta = 0;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 */
+
+        /* Unlimited-OCR specific */
+        cfg->sliding_window_size = 128;
+        cfg->has_qk_norm = 0;  /* No per-head Q/K RMSNorm */
+        cfg->image_token_id = 128815;
+        cfg->image_size_crop = 640;  /* crop image size for dynamic_preprocess */
+    } else if (version == 2) {
+        /* DeepEncoder V2 (Qwen2-0.5B based) */
+        cfg->enc_type = 2;
+        cfg->enc_layers = DS_ENC_V2_LAYERS;
+        cfg->enc_hidden = DS_ENC_V2_HIDDEN;
+        cfg->enc_heads = DS_ENC_V2_HEADS;
+        cfg->enc_kv_heads = DS_ENC_V2_KV_HEADS;
+        cfg->enc_head_dim = DS_ENC_V2_HEAD_DIM;
+        cfg->enc_intermediate = DS_ENC_V2_INTERMEDIATE;
+        cfg->enc_causal_flow_queries = DS_VISUAL_TOKENS_BASE; /* 256 queries */
+        cfg->proj_input_dim = DS_PROJECTOR_V2_INPUT; /* 896 */
+        cfg->enc_rope_theta = 1000000.0f;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM_V2; /* 896 for V2 */
+
+        cfg->sliding_window_size = 0;
+        cfg->has_qk_norm = 1;
+        cfg->image_token_id = DS_TOKEN_IMAGE_START; /* V2 uses image_start token */
+        cfg->image_size_crop = 640;
+    } else {
+        /* V1: CLIP ViT-L/14 */
+        cfg->enc_type = 1;
+        cfg->enc_layers = DS_CLIP_LAYERS;
+        cfg->enc_hidden = DS_CLIP_HIDDEN;
+        cfg->enc_heads = DS_CLIP_HEADS;
+        cfg->enc_kv_heads = DS_CLIP_HEADS;
+        cfg->enc_head_dim = DS_CLIP_HEAD_DIM;
+        cfg->enc_intermediate = DS_CLIP_MLP_DIM;
+        cfg->enc_causal_flow_queries = 0;
+        cfg->proj_input_dim = DS_PROJECTOR_V1_INPUT; /* 2048 */
+        cfg->enc_rope_theta = 0;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 for V1 */
+
+        cfg->sliding_window_size = 0;
+        cfg->has_qk_norm = 1;
+        cfg->image_token_id = DS_TOKEN_IMAGE_START;
+        cfg->image_size_crop = 640;
+    }
 }
 
 /* ========================================================================
@@ -268,26 +324,30 @@ static int load_all_weights(ds_ctx_t *ctx) {
         SAM_WEIGHT(mlp_lin2_bias, "mlp.lin2.bias");
     }
 
-    /* SAM neck — V1 uses neck.{0,1,2,3}.{weight,bias}, V2 omits Conv biases */
+    /* SAM neck — V1 uses neck.{0,1,2,3}.{weight,bias}, V2/V3 omits Conv biases */
     LOAD_F32("model.sam_model.neck.0.weight", vt->sam_neck_conv1_weight);
-    LOAD_F32("model.sam_model.neck.0.bias", vt->sam_neck_conv1_bias);
     LOAD_F32("model.sam_model.neck.1.weight", vt->sam_neck_ln1_weight);
     LOAD_F32("model.sam_model.neck.1.bias", vt->sam_neck_ln1_bias);
     LOAD_F32("model.sam_model.neck.2.weight", vt->sam_neck_conv2_weight);
-    LOAD_F32("model.sam_model.neck.2.bias", vt->sam_neck_conv2_bias);
     LOAD_F32("model.sam_model.neck.3.weight", vt->sam_neck_ln2_weight);
     LOAD_F32("model.sam_model.neck.3.bias", vt->sam_neck_ln2_bias);
+    /* Conv biases — V1 has them, V2/V3 don't */
+    if (cfg->model_version == 1) {
+        LOAD_F32("model.sam_model.neck.0.bias", vt->sam_neck_conv1_bias);
+        LOAD_F32("model.sam_model.neck.2.bias", vt->sam_neck_conv2_bias);
+    }
 
-    /* SAM downsample — V1 uses net_2.0/net_3.0, V2 uses net_2/net_3 */
-    LOAD_F32("model.sam_model.net_2.0.weight", vt->sam_net2_weight);
-    LOAD_F32("model.sam_model.net_2.0.bias", vt->sam_net2_bias);
-    LOAD_F32("model.sam_model.net_3.0.weight", vt->sam_net3_weight);
-    LOAD_F32("model.sam_model.net_3.0.bias", vt->sam_net3_bias);
-    /* V2 naming (no .0 suffix, no bias) */
-    if (!vt->sam_net2_weight)
+    /* SAM downsample — V1 uses net_2.0/net_3.0, V2/Unlimited uses net_2/net_3 */
+    /* SAM downsample — V1 uses net_2.0/net_3.0, V2/V3 uses net_2/net_3 (no .0 suffix, no bias) */
+    if (cfg->model_version == 1) {
+        LOAD_F32("model.sam_model.net_2.0.weight", vt->sam_net2_weight);
+        LOAD_F32("model.sam_model.net_2.0.bias", vt->sam_net2_bias);
+        LOAD_F32("model.sam_model.net_3.0.weight", vt->sam_net3_weight);
+        LOAD_F32("model.sam_model.net_3.0.bias", vt->sam_net3_bias);
+    } else {
         LOAD_F32("model.sam_model.net_2.weight", vt->sam_net2_weight);
-    if (!vt->sam_net3_weight)
         LOAD_F32("model.sam_model.net_3.weight", vt->sam_net3_weight);
+    }
 
     /* Learnable tokens — image_newline is V1 only, view_seperator is shared */
     LOAD_F32("model.image_newline", vt->image_newline);
@@ -324,8 +384,11 @@ static int load_all_weights(ds_ctx_t *ctx) {
             CLIP_WEIGHT(mlp_fc2_bias, "mlp.fc2.bias");
         }
 
-        LOAD_F32("model.vision_model.post_layernorm.weight", clip->final_norm_weight);
-        LOAD_F32("model.vision_model.post_layernorm.bias", clip->final_norm_bias);
+        /* Post-LayerNorm — V3 (Unlimited-OCR) doesn't have this, V1 does */
+        if (cfg->model_version != 3) {
+            LOAD_F32("model.vision_model.post_layernorm.weight", clip->final_norm_weight);
+            LOAD_F32("model.vision_model.post_layernorm.bias", clip->final_norm_bias);
+        }
     }
 
     /* ---- DeepEncoder V2 Weights (V2 only) ---- */
@@ -407,8 +470,11 @@ static int load_all_weights(ds_ctx_t *ctx) {
         DEC_BF16(wv_weight_bf16, "self_attn.v_proj.weight");
         DEC_BF16(wo_weight_bf16, "self_attn.o_proj.weight");
 
-        DEC_F32(q_norm_weight, "self_attn.q_norm.weight");
-        DEC_F32(k_norm_weight, "self_attn.k_norm.weight");
+        /* Q/K norm weights — only present in V1/V2, not Unlimited-OCR (has_qk_norm=0) */
+        if (cfg->has_qk_norm) {
+            DEC_F32(q_norm_weight, "self_attn.q_norm.weight");
+            DEC_F32(k_norm_weight, "self_attn.k_norm.weight");
+        }
         DEC_F32(input_norm, "input_layernorm.weight");
         DEC_F32(post_attn_norm, "post_attention_layernorm.weight");
 

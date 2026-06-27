@@ -1331,7 +1331,7 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int width, int height, int channels,
                                     int *out_n_tokens, float **out_patch_embeds) {
     ds_config_t *cfg = &ctx->config;
-    g_sam_is_v2 = (cfg->model_version == 2);
+    g_sam_is_v2 = (cfg->model_version == 2 || cfg->model_version == 3);
 
     /* Preprocess: resize/pad to target image size (e.g. 1024x1024) */
     ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
