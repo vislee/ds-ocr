@@ -38,19 +38,19 @@ make blas
 | **C support** | ✅ Full | ✅ Full | ✅ Full |
 | **Model size** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
-### Benchmark (Apple M2 Pro, same test image)
+### Benchmark (Apple M2 Pro, 1794×1578 test image)
 
 | Metric | V1 | V2 (recommended) | V3 (Unlimited-OCR) |
 |--------|----|-------------------|---------------------|
-| **Total time** | 14.9s | 14.9s | 20.1s |
-| **Encoding** | 6.7s | 9.2s | 6.5s |
-| **Prefill** | 3.0s | 3.3s | 3.0s |
-| **Decode** | 5.1s (233 tokens) | 2.5s (106 tokens) | 10.5s (464 tokens) |
-| **Decode speed** | 45.5 tok/s | 43.1 tok/s | 44.1 tok/s |
-| **Output quality** | ✅ Minor typos | ✅ Correct | ✅ Correct (extra tags) |
+| **Total time** | 12.2s | 15.0s | 17.6s |
+| **Encoding** | 6.4s | 9.0s | 6.4s |
+| **Prefill** | 0.72s | 0.93s | 0.70s |
+| **Decode** | 5.1s (233 tokens) | 5.1s (226 tokens) | 10.5s (464 tokens) |
+| **Decode speed** | 45.7 tok/s | 44.4 tok/s | 44.0 tok/s |
+| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags stripped) |
 
-> V2 is recommended for best quality. V1 has minor precision-induced typos (e.g. "raletimit" vs "ratelimit").
-> V3 produces extra detection/reference tags that are stripped in post-processing.
+> V2 is recommended for best quality and formatting. V1 has minor precision-induced typos (e.g. "raletimit" vs "ratelimit").
+> V3 outputs detection/reference tags (`<|det|>`, `<|ref|>`) that are automatically stripped in post-processing.
 
 ## Performance
 
@@ -59,9 +59,9 @@ Apple M2 Pro (8 threads, BLAS), 6-crop V2 image:
 | Stage | v0.5 | v0.8 | v0.9 | Optimization |
 |-------|------|------|------|-------------|
 | SAM+Encoder | ~50s | **8.8s** | **8.8s** | Parallel global crop |
-| Prefill (862 tokens) | ~30s | **1.1s** | **1.1s** | Batched MoE sgemm |
-| Decode (280 tokens) | ~19s | **6.2s** | **~2s** | Argmax LM head + contiguous experts |
-| **Total** | **~97s** | **16s** | **~12s** | |
+| Prefill (~660 tokens) | ~30s | **1.1s** | **0.93s** | Batched MoE sgemm |
+| Decode (226 tokens) | ~19s | **6.2s** | **5.1s** | Argmax LM head + contiguous experts |
+| **Total** | **~97s** | **16s** | **15.0s** | |
 
 Key optimizations in v0.9:
 - **Argmax LM head**: Uses `ds_argmax_matvec_bf16` instead of full sgemm for
@@ -83,46 +83,49 @@ Key optimizations in v0.9:
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
-Inference: 12135 ms, 280 text tokens (14.3 tok/s decode)
-  Encoding: 8783 ms | Prefill: 1092 ms | Decode: 2260 ms
+Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
+  Encoding: 8989 ms | Prefill: 934 ms | Decode: 5102 ms
 ```
 
 ## Architecture
 
 ```
-DeepSeek-OCR V2                         Unlimited-OCR (V3)
-─────────────────                        ──────────────────
-Any Image                                Image (640×640 padded)
-    │                                         │
-    ▼                                         ▼
-Dynamic Preprocess                      SAM ViT-B (12 blocks)
-├─ N crops × 768×768                        │
-└─ 1 global 1024×1024                       ▼
-    │                                    ┌───┴───┐
-    ▼                                    │ CLIP  │ ← SAM features (bypass Conv2d)
-┌───────┴───────┐                        │ViT-L/14│
-│ SAM × (N+1)   │                        │24 blocks│
-│ local→896×12² │                        └───┬───┘
-│ global→896×16²│                            │
-└───────┬───────┘                            ▼
-        │                              Concat(SAM,CLIP) → 2048-dim
-        ▼                                   │
-DeepEncoder V2 (Qwen2-0.5B)                  ▼
-24 layers + causal flow queries          Projector (2048→1280)
-1121→857 tokens (masked_scatter)             │
-        │                                    │
-        ▼                                    │
-Projector (896→1280)                         │
-        │                                    │
-        └────────────┬───────────────────────┘
-                     ▼
-             MoE Decoder (DeepSeek3B-MoE)
-             12 layers: L0 dense + L1-11 MoE
-             64 routed experts (top-6) + 2 shared
-             V3: R-SWA decode attention (sliding_window=128)
-                     │
-                     ▼
-                 Text Output
+  DeepSeek-OCR V1          DeepSeek-OCR V2          Unlimited-OCR (V3)
+  ─────────────────         ─────────────────         ─────────────────
+  Image (1024×1024)         Any Image                 Image (640×640 padded)
+       │                         │                          │
+       ▼                         ▼                          ▼
+  SAM ViT-B (12 blocks)    Dynamic Preprocess         SAM ViT-B (12 blocks)
+       │                    ├─ N crops × 768×768            │
+       │                    └─ 1 global 1024×1024            ▼
+       ▼                         │                     ┌────┴────┐
+  ┌────┴────┐              ┌─────┴─────┐               │  CLIP   │ ← SAM features
+  │  CLIP   │ ← SAM feat  │ SAM ×(N+1)│               │ ViT-L/14│   (bypass Conv2d)
+  │ ViT-L/14│              │local→896×12²              │ 24 blocks│
+  │ 24 blocks│              │global→896×16²              └────┬────┘
+  └────┬────┘              └─────┬─────┘                     │
+       │                         │                           ▼
+       ▼                         ▼                    Concat(SAM,CLIP)
+  Concat(SAM,CLIP)         DeepEncoder V2             → 2048-dim
+   → 2048-dim              (Qwen2-0.5B)                    │
+       │                   24 layers + causal flow          ▼
+       ▼                   1121→857 tokens            Projector
+  Projector                   (masked_scatter)         (2048→1280)
+  (2048→1280)                     │                         │
+       │                           ▼                         │
+       │                     Projector (896→1280)             │
+       │                           │                         │
+       └──────────┬────────────────┴────────────┬────────────┘
+                  │                              │
+                  └──────────────┬───────────────┘
+                                 ▼
+                      MoE Decoder (DeepSeek3B-MoE)
+                      12 layers: L0 dense + L1-11 MoE
+                      64 routed experts (top-6) + 2 shared
+                      V3: R-SWA decode attention (sliding_window=128)
+                                 │
+                                 ▼
+                             Text Output
 ```
 
 ### Model Parameters
@@ -398,7 +401,7 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 ### Known Issues
 
 1. **V1 CLIP encoder**: V1 and V3 share the same CLIP architecture (bypass Conv2d, receive SAM features directly). V1 output has minor BF16 precision-induced typos (e.g. "raletimit" vs "ratelimit") — within normal precision range.
-2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are stripped in post-processing. Some formatting (sub-item indentation) may differ from Python output.
+2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing. The 830 added_tokens (including `<|det|>`, `<|ref|>`, `<|grounding|>`, `<td>`, `<tr>`, etc.) are now correctly loaded from `tokenizer.json` with vocab expansion beyond 128K.
 3. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
 4. **Independent lm_head weights**: `lm_head.weight` ≠ `embed_tokens.weight`; C correctly loads the independent weights.
 

@@ -38,12 +38,12 @@ make blas
 
 | 指标 | V1 | V2（推荐） | V3 (Unlimited-OCR) |
 |------|----|-----------|---------------------|
-| **总耗时** | 14.9s | 14.9s | 20.1s |
-| **编码** | 6.7s | 9.2s | 6.5s |
-| **Prefill** | 3.0s | 3.3s | 3.0s |
-| **解码** | 5.1s (233 token) | 2.5s (106 token) | 10.5s (464 token) |
-| **解码速度** | 45.5 tok/s | 43.1 tok/s | 44.1 tok/s |
-| **输出质量** | ✅ 少量拼写偏差 | ✅ 正确 | ✅ 正确（额外标签） |
+| **总耗时** | 12.2s | 15.0s | 17.6s |
+| **编码** | 6.4s | 9.0s | 6.4s |
+| **Prefill** | 0.72s | 0.93s | 0.70s |
+| **解码** | 5.1s (233 token) | 5.1s (226 token) | 10.5s (464 token) |
+| **解码速度** | 45.7 tok/s | 44.4 tok/s | 44.0 tok/s |
+| **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 正确（det 标签已过滤） |
 
 ## 性能
 
@@ -51,10 +51,10 @@ Apple M2 Pro（8 线程，BLAS 加速），6-crop V2 图像：
 
 | 阶段 | v0.5 | v0.8 | v0.9 | 优化手段 |
 |------|------|------|------|---------|
-| SAM+Encoder | ~50s | **8.8s** | **8.8s** | 并行 global crop |
-| Prefill（862 tokens） | ~30s | **1.1s** | **1.1s** | 批量 MoE sgemm |
-| Decode（280 tokens） | ~19s | **6.2s** | **~2s** | Argmax LM head + 连续 expert 块 |
-| **总计** | **~97s** | **16s** | **~12s** | |
+| SAM+Encoder | ~50s | **8.8s** | **9.0s** | 并行 global crop |
+| Prefill（~660 tokens） | ~30s | **1.1s** | **0.93s** | 批量 MoE sgemm |
+| Decode（226 tokens） | ~19s | **6.2s** | **5.1s** | Argmax LM head + 连续 expert 块 |
+| **总计** | **~97s** | **16s** | **15.0s** | |
 
 v0.9 主要优化：
 - **Argmax LM head**：decode 时用 `ds_argmax_matvec_bf16` 替代 sgemm，
@@ -81,47 +81,52 @@ Inference: 12135 ms, 280 text tokens (14.3 tok/s decode)
 ## 架构
 
 ```
-DeepSeek-OCR V1                           DeepSeek-OCR V2
-─────────────────                          ─────────────────
-Image (1024×1024)                          Any Image
-    │                                          │
-    ▼                                          ▼
-SAM ViT-B (12 blocks)                     Dynamic Preprocess
-    │                                      ├─ N crops × 768×768
-    │                                      └─ 1 global 1024×1024
-    ▼                                          │
-┌───┴───┐                              ┌───────┴───────┐
-│ CLIP  │  ← SAM patch_embeds           │ SAM × (N+1)   │
-│ViT-L/14│                              │ local→896×12² │
-│24 blocks│                              │ global→896×16²│
-└───┬───┘                               └───────┬───────┘
-    │                                           │
-    ▼                                           ▼
-Concat(SAM,CLIP) → 2048-dim          DeepEncoder V2 (Qwen2-0.5B)
-    │                                  24 layers + causal flow queries
-    ▼                                  1121→857 tokens (masked_scatter)
-Projector (2048→1280)                     │
-    │                                     ▼
-    │                               Projector (896→1280)
-    │                                     │
-    └──────────────┬──────────────────────┘
-                   ▼
-           MoE Decoder (DeepSeek3B-MoE)
-           12 layers: L0 dense + L1-11 MoE
-           64 routed experts (top-6) + 2 shared
-                   │
-                   ▼
-               Text Output
+  DeepSeek-OCR V1          DeepSeek-OCR V2          Unlimited-OCR (V3)
+  ─────────────────         ─────────────────         ─────────────────
+  Image (1024×1024)         Any Image                 Image (640×640 padded)
+       │                         │                          │
+       ▼                         ▼                          ▼
+  SAM ViT-B (12 blocks)    Dynamic Preprocess         SAM ViT-B (12 blocks)
+       │                    ├─ N crops × 768×768            │
+       │                    └─ 1 global 1024×1024            ▼
+       ▼                         │                     ┌────┴────┐
+  ┌────┴────┐              ┌─────┴─────┐               │  CLIP   │ ← SAM features
+  │  CLIP   │ ← SAM feat  │ SAM ×(N+1)│               │ ViT-L/14│   (bypass Conv2d)
+  │ ViT-L/14│              │local→896×12²              │ 24 blocks│
+  │ 24 blocks│              │global→896×16²              └────┬────┘
+  └────┬────┘              └─────┬─────┘                     │
+       │                         │                           ▼
+       ▼                         ▼                    Concat(SAM,CLIP)
+  Concat(SAM,CLIP)         DeepEncoder V2             → 2048-dim
+   → 2048-dim              (Qwen2-0.5B)                    │
+       │                   24 layers + causal flow          ▼
+       ▼                   1121→857 tokens            Projector
+  Projector                   (masked_scatter)         (2048→1280)
+  (2048→1280)                     │                         │
+       │                           ▼                         │
+       │                     Projector (896→1280)             │
+       │                           │                         │
+       └──────────┬────────────────┴────────────┬────────────┘
+                  │                              │
+                  └──────────────┬───────────────┘
+                                 ▼
+                      MoE Decoder (DeepSeek3B-MoE)
+                      12 层: L0 dense + L1-11 MoE
+                      64 routed experts (top-6) + 2 shared
+                      V3: R-SWA 解码注意力 (sliding_window=128)
+                                 │
+                                 ▼
+                             文本输出
 ```
 
 ### 模型参数
 
 | 组件 | V1 | V2 | V3 | 参数量 |
-|------|----|----|--------|
-| SAM Vision Tokenizer | ViT-B | ViT-B | ~86M |
+|------|----|----|----|--------|
+| SAM Vision Tokenizer | ViT-B | ViT-B | ViT-B | ~86M |
 | Encoder | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 (bypass Conv2d) | ~300M / ~500M / ~300M |
-| Projector | 2048→1280 | 896→1280 (linear) | ~2.6M / ~1.1M |
-| MoE Decoder | DeepSeek3B-MoE | DeepSeek3B-MoE | ~3B (570M active) |
+| Projector | 2048→1280 | 896→1280 | 2048→1280 | ~2.6M / ~1.1M / ~2.6M |
+| MoE Decoder | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA | ~3B (570M active) |
 
 ### 关键架构细节
 
@@ -153,6 +158,17 @@ Projector (2048→1280)                     │
 - Layer 1-11: 64 routed experts (top-6) + 2 shared experts，expert intermediate=896
 - Standard MHA + LLaMA-style RoPE（非 MLA，kv_heads=q_heads=10）
 - BOS=0, EOS=1
+
+</details>
+
+<details>
+<summary>R-SWA 解码注意力（V3）</summary>
+
+- Reference Sliding Window Attention，解码时使用
+- Prefill 阶段：完整因果注意力（不变）
+- Decode 阶段：attend to [0..prefill_len-1]（视觉/reference）+ [kv_cache_len-128..kv_cache_len]（近期文本）
+- sliding_window_size=128，减少长输出的 KV cache 增长
+- Token ID 128815 用于所有图像位置（无单独的 start/end/newline token）
 
 </details>
 
