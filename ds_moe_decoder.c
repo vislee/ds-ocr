@@ -940,6 +940,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     int vocab = cfg->vocab_size;
     float *logits = ctx->dec_logits;  /* [vocab_size] buffer */
     const uint16_t *lm_w = dec->lm_head_bf16 ? dec->lm_head_bf16 : dec->tok_embeddings_bf16;
+    float rp = ctx->repeat_penalty;  /* Repetition penalty (used in both fast and full paths) */
 
     /* ──── Fast argmax path (no temperature sampling) ────
      * Instead of computing all 129280 logits via sgemm (631MB BF16→F32),
@@ -953,12 +954,6 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         /* Step 1: Argmax over all rows — returns best token and value */
         int best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
         float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);
-
-        /* Step 2: Apply repetition penalty selectively.
-         * Only recompute logits for tokens in the history (typically <100),
-         * not all 129280 tokens. If a penalized token beats the current
-         * best, update best. If the best token itself is penalized, recompute. */
-        float rp = ctx->repeat_penalty;
         if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
             /* First: if the argmax winner is in history, apply penalty */
             for (int i = 0; i < ctx->token_history_len; i++) {
@@ -1100,8 +1095,7 @@ full_logits_path:
         fprintf(stderr, "\n");
     }
 
-    /* Apply repetition penalty */
-    float rp = ctx->repeat_penalty;
+    /* Apply repetition penalty (rp already defined above) */
     if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
         /* For each previously generated token, divide its logit by penalty
          * (standard HuggingFace repetition penalty implementation) */

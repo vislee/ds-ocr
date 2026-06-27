@@ -43,6 +43,180 @@ static double now_ms(void) {
 /* ds_time_sec now provided by ds_kernels.h (inline) */
 
 /* ========================================================================
+ * V3 Streaming Det Tag Filter
+ *
+ * Unlimited-OCR outputs <|det|>label [bbox]<|/det|> tags that contain
+ * bounding box coordinates. During streaming (token-by-token output),
+ * we buffer tokens that might be part of det/ref tags. When a complete
+ * tag is detected, we suppress it (don't emit). Regular text is flushed
+ * through as-is. This matches Python's re_match() behavior where
+ * det/ref blocks are stripped from the output.
+ * ======================================================================== */
+
+/* Check if the buffer contains a complete <|det|>...<|/det|> or
+ * <|ref|>...<|/ref|><|det|>...<|/det|> pattern, and if so, strip it.
+ * Returns: number of characters consumed from buf (0 = nothing to strip yet).
+ * If a complete pattern is found, buf is modified in-place with the stripped
+ * version and *out_new_len is set to the new length. */
+static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
+    /* Try standalone <|det|>...<|/det|> */
+    if (buf_len >= 7 && memcmp(buf, "<|det|>", 7) == 0) {
+        for (int i = 7; i + 8 <= buf_len; i++) {
+            if (memcmp(buf + i, "<|/det|>", 8) == 0) {
+                /* Found complete det tag: skip entire buf[0..i+8) */
+                int consumed = i + 8;
+                *out_new_len = 0;
+                return consumed;
+            }
+        }
+    }
+    /* Try <|ref|>...<|/ref|><|det|>...<|/det|> pair */
+    if (buf_len >= 7 && memcmp(buf, "<|ref|>", 7) == 0) {
+        int ref_end = -1;
+        for (int i = 7; i + 8 <= buf_len; i++) {
+            if (memcmp(buf + i, "<|/ref|>", 8) == 0) {
+                ref_end = i + 8;
+                break;
+            }
+        }
+        if (ref_end > 0 && ref_end + 7 <= buf_len && memcmp(buf + ref_end, "<|det|>", 7) == 0) {
+            for (int i = ref_end + 7; i + 8 <= buf_len; i++) {
+                if (memcmp(buf + i, "<|/det|>", 8) == 0) {
+                    /* Found complete ref+det pair: skip entire buf */
+                    int consumed = i + 8;
+                    *out_new_len = 0;
+                    return consumed;
+                }
+            }
+        }
+    }
+    return 0;  /* No complete pattern found yet */
+}
+
+/* Stream a decoded token piece through the det tag filter.
+ * Accumulates potential tag starts in ctx->_det_buf, and flushes
+ * regular text through the token callback. */
+static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
+    if (!ctx || !piece || !ctx->token_cb) return;
+    if (ctx->config.model_version != 3) {
+        /* Non-V3: pass through directly */
+        ctx->token_cb(piece, ctx->token_cb_userdata);
+        return;
+    }
+
+    int piece_len = (int)strlen(piece);
+    ds_token_cb cb = ctx->token_cb;
+    void *ud = ctx->token_cb_userdata;
+    char *buf = ctx->_det_buf;
+    int *pbuf_len = &ctx->_det_buf_len;
+    int buf_len = *pbuf_len;
+
+    /* Append piece to buffer */
+    if (buf_len + piece_len >= (int)sizeof(ctx->_det_buf) - 1) {
+        /* Buffer would overflow — flush what we have */
+        if (buf_len > 0) {
+            buf[buf_len] = '\0';
+            cb(buf, ud);
+            *pbuf_len = 0;
+            buf_len = 0;
+        }
+        /* Check if piece itself starts a tag */
+        if (piece_len >= 2 && piece[0] == '<' && piece[1] == '|') {
+            /* Could be start of a tag — buffer it */
+            int copy = piece_len < (int)sizeof(ctx->_det_buf) - 1 ? piece_len : (int)sizeof(ctx->_det_buf) - 1;
+            memcpy(buf, piece, copy);
+            buf[copy] = '\0';
+            *pbuf_len = copy;
+            buf_len = copy;
+        } else {
+            /* Not a tag start — emit directly */
+            cb(piece, ud);
+            return;
+        }
+    } else {
+        memcpy(buf + buf_len, piece, piece_len);
+        buf_len += piece_len;
+        buf[buf_len] = '\0';
+        *pbuf_len = buf_len;
+    }
+
+    /* Try to strip complete det/ref tags from buffer */
+    while (buf_len > 0) {
+        int new_len = 0;
+        int consumed = ds_try_strip_det_tag(buf, buf_len, &new_len);
+        if (consumed > 0) {
+            /* Found and stripped a complete tag */
+            buf_len -= consumed;
+            memmove(buf, buf + consumed, buf_len);
+            buf[buf_len] = '\0';
+            *pbuf_len = buf_len;
+            continue;
+        }
+
+        /* No complete tag found. Check if buffer could be a partial tag start.
+         * A tag start begins with '<' followed by '|'. If we have '<' at the
+         * end without the matching '|', we need to wait for more tokens.
+         * Otherwise, flush safe prefix. */
+        int safe_prefix = buf_len;
+        /* Find the last '<' in buffer — anything before it is safe to emit */
+        for (int i = buf_len - 1; i >= 0; i--) {
+            if (buf[i] == '<') {
+                safe_prefix = i;
+                break;
+            }
+        }
+        /* But also check if '<' could be part of a partial "<|" tag start */
+        int has_partial_tag = 0;
+        for (int i = 0; i < buf_len; i++) {
+            if (buf[i] == '<') {
+                /* Check if from position i, we could have the start of a tag */
+                int remaining = buf_len - i;
+                /* "<|det|>" is 7 chars, "<|ref|>" is 7, "<|/det|>" is 8, "<|/ref|>" is 8 */
+                if (remaining >= 2 && buf[i + 1] == '|') {
+                    /* This is already inside our buffer — check if complete tag */
+                    /* Already handled by ds_try_strip_det_tag above */
+                    has_partial_tag = 1;
+                    safe_prefix = i;
+                    break;
+                } else if (remaining == 1) {
+                    /* Just '<' — could be start of "<|det|>" etc. */
+                    has_partial_tag = 1;
+                    safe_prefix = i;
+                    break;
+                }
+                /* '<' not followed by '|' — not a tag start, safe */
+            }
+        }
+
+        if (!has_partial_tag) {
+            /* No potential tag in buffer — flush all */
+            if (buf_len > 0) {
+                buf[buf_len] = '\0';
+                cb(buf, ud);
+                *pbuf_len = 0;
+                return;
+            }
+            return;
+        }
+
+        /* Flush safe prefix (everything before potential tag start) */
+        if (safe_prefix > 0) {
+            char saved = buf[safe_prefix];
+            buf[safe_prefix] = '\0';
+            cb(buf, ud);
+            buf[safe_prefix] = saved;
+            buf_len -= safe_prefix;
+            memmove(buf, buf + safe_prefix, buf_len);
+            buf[buf_len] = '\0';
+            *pbuf_len = buf_len;
+        } else {
+            /* Entire buffer is potential tag — wait for more tokens */
+            return;
+        }
+    }
+}
+
+/* ========================================================================
  * Parallel crop encoding (for multi-crop SAM + encoder)
  * ======================================================================== */
 
@@ -1840,8 +2014,10 @@ prompt_construction:
                 out_len += piece_len;
                 output[out_len] = '\0';
 
-                /* Stream token */
-                if (ctx->token_cb) ctx->token_cb(piece, ctx->token_cb_userdata);
+                /* Stream token — with V3 det tag filtering for streaming output */
+                if (ctx->token_cb) {
+                    ds_stream_filter_det(ctx, piece);
+                }
             }
         }
 
@@ -1881,5 +2057,93 @@ prompt_construction:
         }
     }
 
+    /* V3 (Unlimited-OCR) post-processing: strip detection coordinate tags.
+     * Python: det_pattern = r'(<\|det\|>\s*([A-Za-z_][\w-]*)\s*(\[[^\]]+\])\s*<\|/det\|>)'
+     * and outputs.replace(a_match_other, '') — removes the entire <|det|>...<|/det|> block.
+     * Also strips <|ref|>...<|/ref|><|det|>...<|/det|> blocks (ref+det pairs).
+     * This removes bounding box coordinates while keeping the descriptive text. */
+    if (output && out_len > 0 && cfg->model_version == 3) {
+        out_len = ds_strip_det_tags(output, out_len);
+    }
+
     return output;
+}
+
+/* Strip V3 detection/ref tags from output text.
+ * Removes: <|det|>label [x1, y1, x2, y2]<|/det|> and <|ref|>...<|/ref|><|det|>...<|/det|>
+ * Keeps: the text content between detection blocks.
+ * Returns new string length. */
+int ds_strip_det_tags(char *text, int len) {
+    if (!text || len <= 0) return len;
+
+    int read = 0, write = 0;
+    while (read < len) {
+        /* Check for <|ref|>...<|/ref|><|det|>...<|/det|> pattern (ref+det pair) */
+        if (read + 7 < len && memcmp(text + read, "<|ref|>", 7) == 0) {
+            /* Find matching </ref> */
+            int ref_end = -1;
+            for (int i = read + 7; i + 8 <= len; i++) {
+                if (memcmp(text + i, "<|/ref|>", 8) == 0) {
+                    ref_end = i + 8;
+                    break;
+                }
+            }
+            if (ref_end > 0 && ref_end + 6 < len && memcmp(text + ref_end, "<|det|>", 7) == 0) {
+                /* Find matching </det> */
+                int det_end = -1;
+                for (int i = ref_end + 7; i + 8 <= len; i++) {
+                    if (memcmp(text + i, "<|/det|>", 8) == 0) {
+                        det_end = i + 8;
+                        break;
+                    }
+                }
+                if (det_end > 0) {
+                    read = det_end;  /* Skip entire ref+det pair */
+                    continue;
+                }
+            }
+            /* If ref doesn't form a valid pair, keep it as-is */
+            text[write++] = text[read++];
+        }
+        /* Check for standalone <|det|>...<|/det|> pattern */
+        else if (read + 6 < len && memcmp(text + read, "<|det|>", 7) == 0) {
+            /* Find matching </det> */
+            int det_end = -1;
+            for (int i = read + 7; i + 8 <= len; i++) {
+                if (memcmp(text + i, "<|/det|>", 8) == 0) {
+                    det_end = i + 8;
+                    break;
+                }
+            }
+            if (det_end > 0) {
+                read = det_end;  /* Skip entire det block */
+                continue;
+            }
+            /* If no matching </det>, keep as-is */
+            text[write++] = text[read++];
+        } else {
+            text[write++] = text[read++];
+        }
+    }
+
+    text[write] = '\0';
+
+    /* Clean up multiple consecutive newlines left after tag removal */
+    int w2 = 0, r2 = 0;
+    int prev_newline = 0;
+    while (r2 < write) {
+        if (text[r2] == '\n') {
+            if (prev_newline < 2) {
+                text[w2++] = text[r2];
+            }
+            prev_newline++;
+            r2++;
+        } else {
+            text[w2++] = text[r2++];
+            prev_newline = 0;
+        }
+    }
+    text[w2] = '\0';
+
+    return w2;
 }

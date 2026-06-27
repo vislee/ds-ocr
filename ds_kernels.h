@@ -239,6 +239,12 @@ void ds_expert_combine(float *output, const float *expert_outputs,
 int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                            int in_dim, int out_dim);
 
+/* Streaming argmax with token ID exclusion (for V3 det tag suppression).
+ * Same as ds_argmax_matvec_bf16 but skips the specified token IDs. */
+int ds_argmax_matvec_bf16_excluding(const float *x, const uint16_t *W_bf16,
+                                       int in_dim, int out_dim,
+                                       const int *exclude_ids, int n_exclude);
+
 /* Compute dot product of x with a single row of W_bf16 (for selective logit).
  * Returns the logit value for token at row index `tok_id`. */
 float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
