@@ -449,6 +449,10 @@ typedef struct {
     int lm_head_f32_ready;          /* 1 = converted and ready for sgemm */
     float *tok_emb_f32;             /* [vocab_size, hidden] F32 version of tok_embeddings_bf16 (if tied) */
     int tok_emb_f32_ready;
+
+    /* V3 streaming det tag filter state */
+    char _det_buf[256];             /* Buffer for accumulating potential det/ref tags */
+    int _det_buf_len;               /* Current length of buffered text */
 } ds_ctx_t;
 
 /* ========================================================================
@@ -513,5 +517,10 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
 
 /* Global verbose flag */
 extern int ds_verbose;
+
+/* V3 (Unlimited-OCR) post-processing: strip detection coordinate tags.
+ * Removes <|det|>label [bbox]<|/det|> and <|ref|>...<|/ref|><|det|>...<|/det|> blocks.
+ * Modifies text in-place, returns new length. */
+int ds_strip_det_tags(char *text, int len);
 
 #endif /* DS_OCR_H */
