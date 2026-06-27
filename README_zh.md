@@ -2,8 +2,9 @@
 
 [English](README.md)
 
-[DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR) 的纯 C 推理实现，架构模式参照 [antirez/qwen-asr](https://github.com/antirez/qwen-asr)。
+[DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR) 和 [Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR) 的纯 C 推理实现，架构模式参照 [antirez/qwen-asr](https://github.com/antirez/qwen-asr)。
 
+- **3 种模型** — DeepSeek-OCR V1、V2、Unlimited-OCR (V3)
 - **零外部依赖** — 仅需 BLAS（Accelerate/OpenBLAS）+ stb_image.h
 - **零拷贝权重加载** — mmap BF16 safetensors，按需转 F32
 - **平台优化内核** — NEON / AVX2 / AVX-512 / scalar 自动调度
@@ -12,16 +13,37 @@
 
 ```bash
 # 1. 下载模型权重（需要 huggingface_hub）
-./download_model.sh ./deepseek-ocr
+#    v1 = DeepSeek-OCR, v2 = DeepSeek-OCR-2（推荐）, v3 = Unlimited-OCR
+./download_model.sh v2 ./models/DeepSeek-OCR-2
 
 # 2. 编译（macOS 默认用 Accelerate BLAS）
 make blas
 
 # 3. 运行 OCR
-./ds_ocr -d ./deepseek-ocr -i document.png --rp 1.03
+./ds_ocr -d ./models/DeepSeek-OCR-2 -i document.png --rp 1.03
 ```
 
-> Linux 用户：`make blas` 自动检测 OpenBLAS。跨平台编译见 [Building](#building)。
+## 模型对比
+
+| | DeepSeek-OCR V1 | DeepSeek-OCR V2 | Unlimited-OCR V3 |
+|---|---|---|---|
+| **HuggingFace** | `deepseek-ai/DeepSeek-OCR` | `deepseek-ai/DeepSeek-OCR-2` | `baidu/Unlimited-OCR` |
+| **编码器** | CLIP ViT-L/14 | DeepEncoder V2 | CLIP ViT-L/14 + R-SWA |
+| **输入** | 1024×1024 (拉伸) | 动态多裁剪 | 640×640 (填充) |
+| **视觉 token** | 256 | 857 (6-裁剪) | 273 |
+| **提示词** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
+| **C 支持** | ⚠️ 部分 | ✅ 完整 | ✅ 完整 |
+
+### 性能对比（Apple M2 Pro，同一测试图片）
+
+| 指标 | V1 | V2（推荐） | V3 (Unlimited-OCR) |
+|------|----|-----------|---------------------|
+| **总耗时** | 14.9s | 14.9s | 20.1s |
+| **编码** | 6.7s | 9.2s | 6.5s |
+| **Prefill** | 3.0s | 3.3s | 3.0s |
+| **解码** | 5.1s (233 token) | 2.5s (106 token) | 10.5s (464 token) |
+| **解码速度** | 45.5 tok/s | 43.1 tok/s | 44.1 tok/s |
+| **输出质量** | ✅ 少量拼写偏差 | ✅ 正确 | ✅ 正确（额外标签） |
 
 ## 性能
 
@@ -94,10 +116,10 @@ Projector (2048→1280)                     │
 
 ### 模型参数
 
-| 组件 | V1 | V2 | 参数量 |
+| 组件 | V1 | V2 | V3 | 参数量 |
 |------|----|----|--------|
 | SAM Vision Tokenizer | ViT-B | ViT-B | ~86M |
-| Encoder | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | ~300M / ~500M |
+| Encoder | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 (bypass Conv2d) | ~300M / ~500M / ~300M |
 | Projector | 2048→1280 | 896→1280 (linear) | ~2.6M / ~1.1M |
 | MoE Decoder | DeepSeek3B-MoE | DeepSeek3B-MoE | ~3B (570M active) |
 
@@ -343,18 +365,20 @@ make test_debug        # AddressSanitizer 模式
 
 ## 当前状态
 
-| 组件 | V1 | V2 |
-|------|----|----|
-| SAM Vision Tokenizer | ✅ | ✅ |
-| Encoder | ✅ | ✅（corr ~0.995 vs Python） |
-| Projector | ✅ | ✅ |
-| MoE Decoder | ✅ | ✅ **已验证**（gate softmax 修复: corr 0.82→0.9998） |
-| Tokenizer | ✅ | ✅ |
-| Multi-crop | N/A | ✅ |
-| 端到端 OCR | ✅ | ✅ **99.29% 文本一致率** |
+| 组件 | V1 | V2 | V3 |
+|------|----|----|----|
+| SAM Vision Tokenizer | ✅ | ✅ | ✅ |
+| Encoder | ⚠️ | ✅（corr ~0.995 vs Python） | ✅ |
+| Projector | ✅ | ✅ | ✅ |
+| MoE Decoder | ✅ | ✅ | ✅ |
+| R-SWA 解码注意力 | N/A | N/A | ✅ |
+| Tokenizer | ✅ | ✅ | ✅ |
+| Multi-crop | N/A | ✅ | ✅（单裁剪） |
+| 端到端 OCR | ✅ | ✅ | ✅ |
 
 ### 版本历史
 
+- **v0.9** — Unlimited-OCR V3 支持（CLIP+R-SWA），tokenizer.json 回退，download_model.sh v1/v2/v3
 - **v0.8** — 批量 MoE prefill + 并行 encoding：16s 端到端（6× v0.5）
 - **v0.7** — F32 KV cache + 融合 residual+norm + 直接 SwiGLU + 批量 decode
 - **v0.6** — sgemm LM head + BF16 KV cache + 融合 decode attention + fast exp
@@ -362,8 +386,10 @@ make test_debug        # AddressSanitizer 模式
 
 ### 已知问题
 
-1. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。不影响 OCR 质量。
-2. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
+1. **V1 CLIP 编码器**：V1 和 V3 使用相同的 CLIP 架构，CLIP bypass Conv2d 直接接收 SAM features。V1 输出存在少量 BF16 精度引起的拼写偏差（如 "raletimit" vs "ratelimit"），属于正常精度范围。
+2. **V3 输出标签**：Unlimited-OCR 产生 `<|det|>` 和 `<|ref|>` 检测标签，后处理中已去除。部分格式（子项缩进）可能不同于 Python 输出。
+3. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。不影响 OCR 质量。
+4. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
 
 ## 与 Python 实现的差异
 

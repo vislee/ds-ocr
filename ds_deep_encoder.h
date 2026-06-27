@@ -10,16 +10,21 @@
 
 #include "ds_ocr.h"
 
-/* V1 CLIP encoder forward pass
- * Takes SAM patch_embeds as input (NOT raw image!)
- * Input: patch_embeds [n_patches, clip_hidden] (from SAM's patch embedding layer)
- * Also takes SAM spatial features [n_sam_tokens, 1024] for concatenation
+/* V1/V3 CLIP encoder forward pass
+ *
+ * For V1: CLIP takes raw RGB pixels directly (patch_embedding is Conv2d(3→1024, k14, s14)).
+ *   Pass rgb_pixels != NULL, width/height/channels describe the resized image.
+ *
+ * For V3 (Unlimited-OCR): CLIP takes SAM features directly as patch_embeds.
+ *   Pass sam_features != NULL, n_sam_tokens describes the token count.
+ *
  * Output: projected tokens [n_output_tokens, dec_hidden] (float32, caller must free)
  * out_seq_len: total sequence length including special tokens
  */
-float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
-                                int n_patches, const float *sam_features,
-                                int n_sam_tokens, int *out_seq_len);
+float *ds_clip_encoder_forward(ds_ctx_t *ctx,
+                                const unsigned char *rgb_pixels, int width, int height, int channels,
+                                const float *sam_features, int n_sam_tokens,
+                                int *out_seq_len);
 
 /* V2 DeepEncoder forward pass
  * Input: visual tokens [n_tokens, enc_hidden]

@@ -96,9 +96,10 @@ static void clip_layer_forward(float *out, const float *x,
  *
  * sam_features: SAM's downsampled output [n_sam_tokens, 1024] (for feature fusion with CLIP output)
  */
-float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
-                                int n_patches, const float *sam_features,
-                                int n_sam_tokens, int *out_seq_len) {
+float *ds_clip_encoder_forward(ds_ctx_t *ctx,
+                                const unsigned char *rgb_pixels, int width, int height, int channels,
+                                const float *sam_features, int n_sam_tokens,
+                                int *out_seq_len) {
     ds_clip_encoder_t *clip = &ctx->clip_encoder;
     ds_config_t *cfg = &ctx->config;
     int clip_dim = DS_CLIP_HIDDEN; /* 1024 */
@@ -108,67 +109,25 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
 
     /* Step 1: Build CLIP input embeddings
      *
-     * For DeepSeek-OCR V1:
-     *   CLIP takes SAM's [768, H', W'] spatial features, applies its own
-     *   patch_embedding Conv2d(768→1024, k14, s14) to project and subsample.
+     * Both V1 and V3: CLIP receives SAM's downsampled features directly
+     * as patch_embeds, bypassing its own patch_embedding Conv2d.
      *
-     * For Unlimited-OCR (V3):
-     *   CLIP receives SAM's [1024, H', W'] downsampled features directly
-     *   as patch_embeds, bypassing its own patch_embedding Conv2d.
-     *   In Python: patch_embeds = local_features_1 (SAM output [B, 1024, 16, 16])
-     *   Then: patch_embeds = patch_embeds.flatten(2).transpose(1, 2) → [B, 256, 1024]
+     * V1 flow: SAM → 16x Conv compression → 256 tokens (1024-dim) → CLIP
+     * V3 flow: SAM → 256 tokens (1024-dim) → CLIP
      *
-     * We detect V3 by checking if patch_embeds dim matches clip_dim (1024).
-     * For V1, n_patches is 4096 (64×64 SAM patches) and data is 768-dim.
-     * For V3, n_patches is 256 (16×16 SAM downsampled) and data is 1024-dim.
+     * In both cases, sam_features is [n_sam_tokens, 1024] token format.
+     * The patch_embedding Conv2d [1024, 3, 14, 14] is NOT used — CLIP
+     * processes the SAM features directly through its transformer layers.
      */
 
-    if (cfg->model_version == 3) {
-        /* Unlimited-OCR: SAM downsampled features used directly as CLIP patch_embeds.
-         * sam_features is [n_sam_tokens, ds2_dim] = [256, 1024] in token format.
-         * We need to reshape to [1024, 16, 16] spatial, then flatten to tokens.
-         * Actually, sam_features is already [256, 1024] token format — just use it directly! */
-        clip_n_patches = n_sam_tokens;  /* 256 for 1024×1024 input */
-        clip_tokens = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
-        /* Copy sam_features as-is: [n_sam_tokens, 1024] → [clip_n_patches, clip_dim] */
-        memcpy(clip_tokens, sam_features, clip_n_patches * clip_dim * sizeof(float));
+    /* Both V1 and V3: use SAM features directly as CLIP patch_embeds */
+    clip_n_patches = n_sam_tokens;  /* 256 for 1024×1024 input */
+    clip_tokens = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
+    memcpy(clip_tokens, sam_features, clip_n_patches * clip_dim * sizeof(float));
 
-        if (ds_verbose >= 1)
-            fprintf(stderr, "CLIP V3: using SAM features directly as patch_embeds (%d tokens x %d dim)\n",
-                    clip_n_patches, clip_dim);
-    } else {
-        /* V1: Apply CLIP's patch_embedding Conv2d to SAM's spatial patch_embeds */
-        int grid_h = (int)sqrtf((float)n_patches);
-        int grid_w = n_patches / grid_h;
-
-        float *patch_spatial = (float *)malloc(DS_SAM_EMBED_DIM * n_patches * sizeof(float));
-        for (int p = 0; p < n_patches; p++) {
-            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-                patch_spatial[d * n_patches + p] = patch_embeds[p * DS_SAM_EMBED_DIM + d];
-            }
-        }
-
-        int clip_h, clip_w;
-        clip_tokens = (float *)malloc(clip_dim * n_patches * sizeof(float)); /* over-allocate */
-
-        ds_conv2d(clip_tokens, patch_spatial, clip->patch_embedding_weight, NULL,
-                  DS_SAM_EMBED_DIM, clip_dim, grid_h, grid_w, 14, 14, 14, 0);
-        free(patch_spatial);
-
-        clip_h = (grid_h - 14) / 14 + 1;
-        clip_w = (grid_w - 14) / 14 + 1;
-        clip_n_patches = clip_h * clip_w;
-
-        /* Convert [1024, clip_n_patches] → [clip_n_patches, 1024] */
-        float *clip_tokens_t = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
-        for (int p = 0; p < clip_n_patches; p++) {
-            for (int d = 0; d < clip_dim; d++) {
-                clip_tokens_t[p * clip_dim + d] = clip_tokens[d * clip_n_patches + p];
-            }
-        }
-        free(clip_tokens);
-        clip_tokens = clip_tokens_t;
-    }
+    if (ds_verbose >= 1)
+        fprintf(stderr, "CLIP: using SAM features directly as patch_embeds (%d tokens x %d dim, V%d)\n",
+                clip_n_patches, clip_dim, cfg->model_version);
 
     /* Build full input: CLS token + patch tokens */
     int total_len = 1 + clip_n_patches;
@@ -303,8 +262,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
     int concat_len = 0;
     int proj_in_dim = 0;
 
-    if (cfg->model_version == 3 && clip_output_len == n_sam_tokens) {
-        /* Unlimited-OCR: CLIP and SAM have same token count (256 each for 1024×1024 input)
+    if ((cfg->model_version == 1 || cfg->model_version == 3) && clip_output_len == n_sam_tokens) {
+        /* V1/V3: CLIP and SAM have same token count (256 each for 1024×1024 input)
          * Concat: [256, 1024] + [256, 1024] → [256, 2048] along feature dim */
         concat_len = clip_output_len;
         proj_in_dim = clip_dim + cfg->sam_ds2_dim; /* 1024 + 1024 = 2048 */
@@ -342,10 +301,11 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
     }
     free(concat_features);
 
-    if (cfg->model_version == 3) {
+    if (cfg->model_version == 1 || cfg->model_version == 3) {
         /* =====================================================================
          * Insert image_newline between grid rows + append view_seperator
          * =====================================================================
+         * Both V1 and V3 need this layout:
          * Python code:
          *   global_features = proj_output.view(h, w, n_dim)
          *   global_features = cat([global_features, image_newline[None,None,:].expand(h,1,n_dim)], dim=1)
@@ -385,8 +345,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
             *out_seq_len = final_len;
 
             if (ds_verbose >= 1)
-                fprintf(stderr, "CLIP+SAM+Projector: %d patches → %d tokens (with newlines + view_sep)\n",
-                        concat_len, final_len);
+                fprintf(stderr, "CLIP+SAM+Projector: %d patches → %d tokens (with newlines + view_sep, V%d)\n",
+                        concat_len, final_len, cfg->model_version);
         } else {
             *out_seq_len = concat_len;
             if (ds_verbose >= 1)
@@ -396,8 +356,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
     } else {
         *out_seq_len = concat_len;
         if (ds_verbose >= 1)
-            fprintf(stderr, "CLIP encoder: %d patches in -> %d tokens out (projected to %d)\n",
-                    n_patches, concat_len, dec_hidden);
+            fprintf(stderr, "CLIP encoder: %d patches -> %d tokens out (projected to %d)\n",
+                    clip_n_patches, concat_len, dec_hidden);
     }
 
     return projected;
@@ -755,10 +715,9 @@ float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
                            int n_tokens, int *out_seq_len,
                            int n_causal_queries, const float *causal_queries) {
     if (ctx->config.enc_type == 1) {
-        /* V1: CLIP path — visual_tokens here are SAM features
-         * CLIP needs patch_embeds separately, but for the unified API
-         * we pass SAM features directly */
-        return ds_clip_encoder_forward(ctx, visual_tokens, n_tokens,
+        /* CLIP path — for V3, pass SAM features directly.
+         * This unified entry point is not used for V1 (V1 goes through ds_ocr.c directly). */
+        return ds_clip_encoder_forward(ctx, NULL, 0, 0, 0,
                                        visual_tokens, n_tokens, out_seq_len);
     } else {
         return ds_encoder_forward_v2(ctx, visual_tokens, n_tokens, out_seq_len,

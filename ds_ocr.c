@@ -420,7 +420,7 @@ static void init_config(ds_config_t *cfg, int version) {
         cfg->sam_ds2_dim = DS_SAM_DS2_DIM_V2; /* 896 for V2 */
 
         cfg->sliding_window_size = 0;
-        cfg->has_qk_norm = 1;
+        cfg->has_qk_norm = 0;  /* V2 doesn't have per-head Q/K RMSNorm either */
         cfg->image_token_id = DS_TOKEN_IMAGE_START; /* V2 uses image_start token */
         cfg->image_size_crop = 640;
     } else {
@@ -438,7 +438,7 @@ static void init_config(ds_config_t *cfg, int version) {
         cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 for V1 */
 
         cfg->sliding_window_size = 0;
-        cfg->has_qk_norm = 1;
+        cfg->has_qk_norm = 0;  /* V1 doesn't have per-head Q/K RMSNorm */
         cfg->image_token_id = DS_TOKEN_IMAGE_START;
         cfg->image_size_crop = 640;
     }
@@ -470,6 +470,14 @@ static int load_all_weights(ds_ctx_t *ctx) {
         } \
     } while(0)
 
+    #define LOAD_F32_OPT(name, target) do { \
+        t = multi_safetensors_find(ms, name, &sf); \
+        if (t) { \
+            target = safetensors_get_f32(sf, t); \
+            if (ds_verbose >= 2) fprintf(stderr, "Loaded %s\n", name); \
+        } \
+    } while(0)
+
     LOAD_F32("model.sam_model.patch_embed.proj.weight", vt->sam_patch_embed_weight);
     LOAD_F32("model.sam_model.patch_embed.proj.bias", vt->sam_patch_embed_bias);
     LOAD_F32("model.sam_model.pos_embed", vt->sam_pos_embed);
@@ -498,33 +506,24 @@ static int load_all_weights(ds_ctx_t *ctx) {
         SAM_WEIGHT(mlp_lin2_bias, "mlp.lin2.bias");
     }
 
-    /* SAM neck — V1 uses neck.{0,1,2,3}.{weight,bias}, V2/V3 omits Conv biases */
+    /* SAM neck — V1/V2/V3 all use neck.{0,1,2,3}.{weight,bias} naming.
+     * Conv biases (neck.0.bias, neck.2.bias) may not exist in any version. */
     LOAD_F32("model.sam_model.neck.0.weight", vt->sam_neck_conv1_weight);
     LOAD_F32("model.sam_model.neck.1.weight", vt->sam_neck_ln1_weight);
     LOAD_F32("model.sam_model.neck.1.bias", vt->sam_neck_ln1_bias);
     LOAD_F32("model.sam_model.neck.2.weight", vt->sam_neck_conv2_weight);
     LOAD_F32("model.sam_model.neck.3.weight", vt->sam_neck_ln2_weight);
     LOAD_F32("model.sam_model.neck.3.bias", vt->sam_neck_ln2_bias);
-    /* Conv biases — V1 has them, V2/V3 don't */
-    if (cfg->model_version == 1) {
-        LOAD_F32("model.sam_model.neck.0.bias", vt->sam_neck_conv1_bias);
-        LOAD_F32("model.sam_model.neck.2.bias", vt->sam_neck_conv2_bias);
-    }
+    /* Conv biases — try to load, may not exist in V1/V2/V3 */
+    LOAD_F32_OPT("model.sam_model.neck.0.bias", vt->sam_neck_conv1_bias);
+    LOAD_F32_OPT("model.sam_model.neck.2.bias", vt->sam_neck_conv2_bias);
 
-    /* SAM downsample — V1 uses net_2.0/net_3.0, V2/Unlimited uses net_2/net_3 */
-    /* SAM downsample — V1 uses net_2.0/net_3.0, V2/V3 uses net_2/net_3 (no .0 suffix, no bias) */
-    if (cfg->model_version == 1) {
-        LOAD_F32("model.sam_model.net_2.0.weight", vt->sam_net2_weight);
-        LOAD_F32("model.sam_model.net_2.0.bias", vt->sam_net2_bias);
-        LOAD_F32("model.sam_model.net_3.0.weight", vt->sam_net3_weight);
-        LOAD_F32("model.sam_model.net_3.0.bias", vt->sam_net3_bias);
-    } else {
-        LOAD_F32("model.sam_model.net_2.weight", vt->sam_net2_weight);
-        LOAD_F32("model.sam_model.net_3.weight", vt->sam_net3_weight);
-    }
+    /* SAM downsample — all versions use net_2/net_3 (no .0 suffix, no bias) */
+    LOAD_F32("model.sam_model.net_2.weight", vt->sam_net2_weight);
+    LOAD_F32("model.sam_model.net_3.weight", vt->sam_net3_weight);
 
     /* Learnable tokens — image_newline is V1 only, view_seperator is shared */
-    LOAD_F32("model.image_newline", vt->image_newline);
+    LOAD_F32_OPT("model.image_newline", vt->image_newline);
     LOAD_F32("model.view_seperator", vt->view_seperator);
 
     /* ---- CLIP Encoder Weights (V1 only) ---- */
@@ -558,11 +557,9 @@ static int load_all_weights(ds_ctx_t *ctx) {
             CLIP_WEIGHT(mlp_fc2_bias, "mlp.fc2.bias");
         }
 
-        /* Post-LayerNorm — V3 (Unlimited-OCR) doesn't have this, V1 does */
-        if (cfg->model_version != 3) {
-            LOAD_F32("model.vision_model.post_layernorm.weight", clip->final_norm_weight);
-            LOAD_F32("model.vision_model.post_layernorm.bias", clip->final_norm_bias);
-        }
+        /* Post-LayerNorm — V1 and V3 don't have this, V2 (DeepEncoder) skips CLIP entirely */
+        LOAD_F32_OPT("model.vision_model.post_layernorm.weight", clip->final_norm_weight);
+        LOAD_F32_OPT("model.vision_model.post_layernorm.bias", clip->final_norm_bias);
     }
 
     /* ---- DeepEncoder V2 Weights (V2 only) ---- */
@@ -1401,24 +1398,22 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         int n_visual_tokens;
         float *patch_embeds = NULL;
         float *visual_tokens = ds_visual_tokenizer_forward(ctx, pixels, width, height, channels,
-                                                            &n_visual_tokens, &patch_embeds);
+                                                            &n_visual_tokens, &patch_embeds,
+                                                            NULL, NULL, NULL);
         if (!visual_tokens) {
             fprintf(stderr, "Visual tokenizer failed\n");
             return NULL;
         }
 
-        /* Step 2: Encoder (CLIP V1 or DeepEncoder V2) */
+        /* Step 2: Encoder (CLIP V1/V3 or DeepEncoder V2) */
         if (cfg->enc_type == 1) {
-            /* CLIP encoder needs the full-resolution SAM patch_embeds [768, n_full_patches].
-             * n_visual_tokens is the downsampled count (256), but patch_embeds has
-             * 4096 patches (64x64 grid) from the SAM patch embedding layer.
-             * Calculate the actual patch count from patch_embeds dimensions.
-             * patch_embeds layout: [768, n_full_patches] in CHW format.
-             * For 1024x1024 input: n_full_patches = (1024/16)^2 = 4096. */
-            int n_full_patches = 64 * 64; /* Fixed for 1024x1024 SAM input */
-            encoder_output = ds_clip_encoder_forward(ctx, patch_embeds,
-                                                      n_full_patches, visual_tokens,
-                                                      n_visual_tokens, &n_encoder_tokens);
+            /* CLIP V1/V3: receives SAM features directly as patch_embeds.
+             * The patch_embedding Conv2d is NOT used — SAM's 16x compression
+             * already produces 256 tokens that CLIP processes directly. */
+            encoder_output = ds_clip_encoder_forward(ctx,
+                                                      NULL, 0, 0, 0,
+                                                      visual_tokens, n_visual_tokens,
+                                                      &n_encoder_tokens);
         } else {
             encoder_output = ds_encoder_forward_v2(ctx, visual_tokens, n_visual_tokens,
                                                     &n_encoder_tokens,
@@ -1518,11 +1513,19 @@ prompt_construction:
         }
     }
 
-    /* Load tokenizer early (needed for prompt encoding in V2) */
+    /* Load tokenizer early (needed for prompt encoding in V2).
+     * Try vocab.json first (standalone format), then tokenizer.json (HuggingFace format).
+     * tokenizer.json model.vocab has the same {token:id} structure as vocab.json. */
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir_str);
     tokenizer = ds_tokenizer_load(tokenizer_path);
+    if (!tokenizer) {
+        /* Fallback: extract model.vocab from tokenizer.json.
+         * ds_tokenizer_load_from_tokenizer_json() parses the nested format. */
+        snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", model_dir_str);
+        tokenizer = ds_tokenizer_load_from_tokenizer_json(tokenizer_path);
+    }
     if (!tokenizer && ds_verbose >= 1)
-        fprintf(stderr, "Note: vocab.json not found, tokenizer not loaded\n");
+        fprintf(stderr, "Note: neither vocab.json nor tokenizer.json found, tokenizer not loaded\n");
 
     float *input_embeds = NULL;
     int prefix_len = 0;
@@ -1758,32 +1761,77 @@ prompt_construction:
         #undef EMBED_TOKEN_V3
         free(text_after_ids);
     } else {
-        /* V1 prompt format: [image_start][encoder_output][image_end] */
-        prefix_len = n_encoder_tokens + 2;
+        /* V1 prompt format: [BOS][image_start][encoder_output][image_end][\nFree OCR.]
+         * Same as V2 but with image_start/end tokens instead of placeholder token. */
+        int n_text_after = 0;
+        int *text_after_ids = NULL;
+        if (tokenizer) {
+            text_after_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR.", &n_text_after);
+        }
+        if (!text_after_ids || n_text_after <= 0) {
+            static const int fallback_ids[] = {201, 21431, 126041, 16};
+            n_text_after = 4;
+            text_after_ids = (int *)malloc(n_text_after * sizeof(int));
+            memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
+        }
+
+        prefix_len = 1 + 1 + n_encoder_tokens + 1 + n_text_after; /* BOS + img_start + enc + img_end + text */
         input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
         memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
 
-        /* Embed image_start token */
+        int pos = 0;
+
+        /* BOS token */
+        if (ctx->decoder.tok_embeddings_bf16) {
+            const uint16_t *emb = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_BOS * hidden;
+            for (int i = 0; i < hidden; i++) {
+                uint32_t f32_bits = ((uint32_t)emb[i]) << 16;
+                memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
+            }
+        }
+        pos++;
+
+        /* image_start token */
         if (ctx->decoder.tok_embeddings_bf16) {
             const uint16_t *emb_start = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_IMAGE_START * hidden;
             for (int i = 0; i < hidden; i++) {
                 uint32_t f32_bits = ((uint32_t)emb_start[i]) << 16;
-                memcpy(&input_embeds[i], &f32_bits, sizeof(float));
+                memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
             }
         }
+        pos++;
 
         /* Encoder output */
-        memcpy(input_embeds + hidden, encoder_output, n_encoder_tokens * hidden * sizeof(float));
+        memcpy(input_embeds + pos * hidden, encoder_output, n_encoder_tokens * hidden * sizeof(float));
+        pos += n_encoder_tokens;
 
-        /* Embed image_end token */
+        /* image_end token */
         if (ctx->decoder.tok_embeddings_bf16) {
             const uint16_t *emb_end = ctx->decoder.tok_embeddings_bf16 + (size_t)DS_TOKEN_IMAGE_END * hidden;
-            float *last_pos = input_embeds + (prefix_len - 1) * hidden;
             for (int i = 0; i < hidden; i++) {
                 uint32_t f32_bits = ((uint32_t)emb_end[i]) << 16;
-                memcpy(&last_pos[i], &f32_bits, sizeof(float));
+                memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
             }
         }
+        pos++;
+
+        /* Text after image: "\nFree OCR." */
+        for (int t = 0; t < n_text_after; t++) {
+            int tid = text_after_ids[t];
+            if (ctx->decoder.tok_embeddings_bf16 && tid >= 0 && tid < cfg->vocab_size) {
+                const uint16_t *emb = ctx->decoder.tok_embeddings_bf16 + (size_t)tid * hidden;
+                for (int i = 0; i < hidden; i++) {
+                    uint32_t f32_bits = ((uint32_t)emb[i]) << 16;
+                    memcpy(&input_embeds[pos * hidden + i], &f32_bits, sizeof(float));
+                }
+            }
+            pos++;
+        }
+
+        free(text_after_ids);
+        if (ds_verbose >= 1)
+            fprintf(stderr, "V1 prompt: BOS + img_start + enc(%d) + img_end + text(%d) = %d tokens\n",
+                    n_encoder_tokens, n_text_after, prefix_len);
     }
     free(encoder_output);
 
