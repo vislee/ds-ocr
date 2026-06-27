@@ -89,7 +89,13 @@ static void clip_layer_forward(float *out, const float *x,
     free(x_norm); free(fc1); free(fc2);
 }
 
-/* Full CLIP encoder forward pass */
+/* Full CLIP encoder forward pass
+ * For Unlimited-OCR (V3): patch_embeds is SAM's final output [1024, h_sam, w_sam] spatial,
+ *   CLIP skips its patch_embedding Conv2d, directly flatten+transpose → [N, 1024]
+ * For V1: patch_embeds is SAM's patch_embed [768, h, w], CLIP applies its Conv2d → [N, 1024]
+ *
+ * sam_features: SAM's downsampled output [n_sam_tokens, 1024] (for feature fusion with CLIP output)
+ */
 float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
                                 int n_patches, const float *sam_features,
                                 int n_sam_tokens, int *out_seq_len) {
@@ -97,8 +103,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
     ds_config_t *cfg = &ctx->config;
     int clip_dim = DS_CLIP_HIDDEN; /* 1024 */
 
-    if (ds_verbose >= 1)
-        fprintf(stderr, "CLIP encoder: %d patch_embeds from SAM\n", n_patches);
+    int clip_n_patches;
+    float *clip_tokens;  /* [clip_n_patches, clip_dim] — CLIP patch tokens */
 
     /* Step 1: Build CLIP input embeddings
      *
@@ -116,9 +122,6 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
      * For V1, n_patches is 4096 (64×64 SAM patches) and data is 768-dim.
      * For V3, n_patches is 256 (16×16 SAM downsampled) and data is 1024-dim.
      */
-
-    int clip_n_patches;
-    float *clip_tokens;  /* [clip_n_patches, clip_dim] — CLIP patch tokens */
 
     if (cfg->model_version == 3) {
         /* Unlimited-OCR: SAM downsampled features used directly as CLIP patch_embeds.
@@ -182,10 +185,65 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
 
     /* Add position embedding */
     if (clip->position_embedding) {
-        for (int i = 0; i < total_len; i++) {
-            for (int d = 0; d < clip_dim; d++) {
-                x[i * clip_dim + d] += clip->position_embedding[i * clip_dim + d];
+        /* Position embedding shape: [257, 1024] (1 CLS + 256 patches for 224x224/14=16x16)
+         * For Unlimited-OCR with 1024x1024: clip_n_patches = 256, total_len = 257 → matches!
+         * For V1: clip_n_patches may differ, need interpolation via get_abs_pos.
+         *
+         * Python's get_abs_pos: bicubic interpolation of spatial part to target size.
+         * C implementation: for V3 with total_len=257, position_embedding[257][1024] matches exactly.
+         * For other sizes, we need to interpolate. */
+        if (total_len <= 257) {
+            /* Direct copy — positions 0..total_len-1 fit within stored embedding */
+            for (int i = 0; i < total_len; i++) {
+                for (int d = 0; d < clip_dim; d++) {
+                    x[i * clip_dim + d] += clip->position_embedding[i * clip_dim + d];
+                }
             }
+        } else {
+            /* Need bicubic interpolation for larger sizes.
+             * This follows Python's get_abs_pos:
+             * 1. Split CLS and spatial part
+             * 2. Reshape spatial to [1, dim, src_h, src_w]
+             * 3. Bicubic interpolate to [1, dim, tgt_h, tgt_w]
+             * 4. Reshape back and concatenate with CLS */
+            int src_size = (int)sqrtf(256.0f);  /* 16x16 for original CLIP */
+            int tgt_size = (int)sqrtf((float)clip_n_patches);
+
+            /* Interpolate spatial part: position_embedding[1:257] = [256, 1024] */
+            float *spatial_pos = (float *)malloc(256 * clip_dim * sizeof(float));
+            memcpy(spatial_pos, clip->position_embedding + clip_dim, 256 * clip_dim * sizeof(float));
+
+            /* Reshape [256, 1024] → [1024, 16, 16] (CHW), bicubic resize → [1024, tgt_h, tgt_w] */
+            float *resized_pos = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
+            /* Simple bilinear interpolation (approximate — for non-standard sizes only) */
+            for (int d = 0; d < clip_dim; d++) {
+                for (int th = 0; th < tgt_size; th++) {
+                    for (int tw = 0; tw < tgt_size; tw++) {
+                        float src_h = (float)th * (float)src_size / (float)tgt_size;
+                        float src_w = (float)tw * (float)src_size / (float)tgt_size;
+                        int sh = (int)src_h; if (sh >= src_size - 1) sh = src_size - 1;
+                        int sw = (int)src_w; if (sw >= src_size - 1) sw = src_size - 1;
+                        float fh = src_h - sh, fw = src_w - sw;
+                        float v = spatial_pos[(sh * src_size + sw) * clip_dim + d] * (1-fh) * (1-fw)
+                                + spatial_pos[(sh * src_size + (sw+1)) * clip_dim + d] * (1-fh) * fw
+                                + spatial_pos[((sh+1) * src_size + sw) * clip_dim + d] * fh * (1-fw)
+                                + spatial_pos[((sh+1) * src_size + (sw+1)) * clip_dim + d] * fh * fw;
+                        resized_pos[(th * tgt_size + tw) * clip_dim + d] = v;
+                    }
+                }
+            }
+            free(spatial_pos);
+
+            /* Apply: CLS + interpolated spatial */
+            for (int d = 0; d < clip_dim; d++) {
+                x[d] += clip->position_embedding[d]; /* CLS */
+            }
+            for (int p = 0; p < clip_n_patches; p++) {
+                for (int d = 0; d < clip_dim; d++) {
+                    x[(1 + p) * clip_dim + d] += resized_pos[p * clip_dim + d];
+                }
+            }
+            free(resized_pos);
         }
     }
 
@@ -208,7 +266,7 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
             fprintf(stderr, "CLIP layer %d/%d done\n", l + 1, DS_CLIP_LAYERS);
     }
 
-    /* Post-LayerNorm (not always present, but typically is) */
+    /* Post-LayerNorm (optional — Unlimited-OCR doesn't have it) */
     if (clip->final_norm_weight) {
         float *tmp = (float *)malloc(total_len * clip_dim * sizeof(float));
         ds_layer_norm(tmp, x, clip->final_norm_weight, clip->final_norm_bias,
@@ -217,8 +275,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx, const float *patch_embeds,
         x = tmp;
     }
 
-    /* Extract CLIP output: remove CLS token (take [:, 1:]) */
-    int clip_output_len = clip_n_patches; /* without CLS */
+    /* Extract CLIP output: remove CLS token (take [:, 1:]) → [clip_n_patches, 1024] */
+    int clip_output_len = clip_n_patches;
     float *clip_output = (float *)malloc(clip_output_len * clip_dim * sizeof(float));
     memcpy(clip_output, x + clip_dim, clip_output_len * clip_dim * sizeof(float));
     free(x); /* Free CLIP transformer output */

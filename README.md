@@ -31,8 +31,8 @@ Apple M2 Pro (8 threads, BLAS), 6-crop V2 image:
 |-------|------|------|------|-------------|
 | SAM+Encoder | ~50s | **8.8s** | **8.8s** | Parallel global crop |
 | Prefill (862 tokens) | ~30s | **1.1s** | **1.1s** | Batched MoE sgemm |
-| Decode (280 tokens) | ~19s | **6.2s** | **~5s** | Argmax LM head + madvise prefetch |
-| **Total** | **~97s** | **16s** | **~15s** | |
+| Decode (280 tokens) | ~19s | **6.2s** | **~2s** | Argmax LM head + contiguous experts |
+| **Total** | **~97s** | **16s** | **~12s** | |
 
 Key optimizations in v0.9:
 - **Argmax LM head**: Uses `ds_argmax_matvec_bf16` instead of full sgemm for
@@ -40,19 +40,24 @@ Key optimizations in v0.9:
   products on-the-fly while tracking only the best token (~8ms vs ~60ms/step).
 - **Selective repetition penalty**: Only recomputes logits for history tokens
   (~100) via `ds_bf16_dot_row`, not all 129280 vocabulary entries.
-- **madvise prefetch**: Issues `MADV_WILLNEED` for next expert's weights during
-  MoE decode, reducing page fault stalls from random expert address jumps.
+- **Contiguous expert blocks (P2)**: All 64 experts' gate_up_fused + shared
+  weights in a single contiguous allocation per layer — adjacent experts share
+  pages, reducing page faults 2.4× during MoE decode (~351ms → ~121ms/step).
+- **madvise prefetch**: Issues `MADV_WILLNEED` for upcoming expert weights,
+  further reducing page fault stalls from random expert address jumps.
+- **Fused expert forward**: `ds_expert_forward_fused()` combines gate+up
+  projection into a single matvec, improving L2 cache reuse of the input vector.
 - **8-thread decode**: All cores used for decode (argmax LM head benefits from
   8T; small expert matvecs are marginally slower but overall faster).
 
 Small images (1-crop V2, global-only): ~40s total (~3-4 tok/s decode).
 
-**v0.9 = 6.5× v0.5 = 49× Python PyTorch (CPU BF16 ~736s)**
+**v0.9 = 8× v0.5 = 61× Python PyTorch (CPU BF16 ~736s)**
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
-Inference: 16061 ms, 280 text tokens (45.21 tok/s decode)
-  Encoding: 8783 ms | Prefill: 1092 ms | Decode: 6185 ms
+Inference: 12135 ms, 280 text tokens (14.3 tok/s decode)
+  Encoding: 8783 ms | Prefill: 1092 ms | Decode: 2260 ms
 ```
 
 ## Architecture

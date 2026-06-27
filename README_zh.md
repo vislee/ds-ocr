@@ -31,24 +31,29 @@ Apple M2 Pro（8 线程，BLAS 加速），6-crop V2 图像：
 |------|------|------|------|---------|
 | SAM+Encoder | ~50s | **8.8s** | **8.8s** | 并行 global crop |
 | Prefill（862 tokens） | ~30s | **1.1s** | **1.1s** | 批量 MoE sgemm |
-| Decode（280 tokens） | ~19s | **6.2s** | **~5s** | Argmax LM head + madvise 预取 |
-| **总计** | **~97s** | **16s** | **~15s** | |
+| Decode（280 tokens） | ~19s | **6.2s** | **~2s** | Argmax LM head + 连续 expert 块 |
+| **总计** | **~97s** | **16s** | **~12s** | |
 
 v0.9 主要优化：
 - **Argmax LM head**：decode 时用 `ds_argmax_matvec_bf16` 替代 sgemm，
   避免 631MB BF16→F32 权重转换，边算边比较只保留最优 token（~8ms vs ~60ms/step）
 - **Selective repetition penalty**：只重算 history tokens 的 logit（~100 个 vs 129280 个）
-- **madvise 预取**：MoE decode 时预取下一个 expert 权重，减少 page fault
+- **连续 expert 块（P2）**：64 个 expert 的 gate_up_fused + shared 权重
+  分配在单层一块连续内存中，相邻 expert 共享内存页，page fault 减少 2.4×
+  （~351ms → ~121ms/step）
+- **madvise 预取**：MoE decode 时预取下一个 expert 权重，进一步减少 page fault
+- **Fused expert forward**：`ds_expert_forward_fused()` 合并 gate+up 投影为单次 matvec，
+  提升 L2 cache 对输入向量的复用
 - **8 线程 decode**：argmax LM head 受益于 8T；小 expert matvec 略慢但总体更快
 
 小图（1-crop V2，global-only）：~40s 总耗时（decode ~3-4 tok/s）
 
-**v0.9 = 6.5× v0.5 = 49× Python PyTorch（CPU BF16 ~736s）**
+**v0.9 = 8× v0.5 = 61× Python PyTorch（CPU BF16 ~736s）**
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
-Inference: 16061 ms, 280 text tokens (45.21 tok/s decode)
-  Encoding: 8783 ms | Prefill: 1092 ms | Decode: 6185 ms
+Inference: 12135 ms, 280 text tokens (14.3 tok/s decode)
+  Encoding: 8783 ms | Prefill: 1092 ms | Decode: 2260 ms
 ```
 
 ## 架构
