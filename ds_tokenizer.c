@@ -691,8 +691,67 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
     }
 
     /* Load added_tokens from tokenizer.json (special tokens like <image>, <td>, etc.)
-     * These are in a top-level "added_tokens" array, separate from the vocab object. */
+     * These are in a top-level "added_tokens" array, separate from the vocab object.
+     * Added tokens may have ids beyond vocab_size (e.g. 128815 for <image>), so
+     * we need to expand id_to_bpe/id_to_text arrays if any added token id exceeds vocab_size. */
     {
+        /* Pre-scan: find max id in added_tokens */
+        int64_t max_added_id = -1;
+        {
+            const char *ps = json;
+            while (*ps) {
+                const char *pf = strstr(ps, "\"added_tokens\"");
+                if (!pf) break;
+                const char *pb = pf - 1;
+                while (pb > json && (*pb == ' ' || *pb == '\t' || *pb == '\n' || *pb == '\r'))
+                    pb--;
+                if (*pb == '{' || *pb == ',') {
+                    const char *pa = pf + strlen("\"added_tokens\"");
+                    skip_ws(&pa);
+                    if (*pa == ':') {
+                        pa++; skip_ws(&pa);
+                        if (*pa == '[') {
+                            pa++;
+                            while (*pa && *pa != ']') {
+                                skip_ws(&pa); if (*pa==']') break; if (*pa==','){pa++;continue;}
+                                if (*pa!='{'){pa++;continue;} pa++;
+                                int64_t ps_id = -1;
+                                while (*pa && *pa != '}') {
+                                    skip_ws(&pa); if (*pa=='}') break; if (*pa==','){pa++;continue;}
+                                    char psk[256];
+                                    if (parse_json_string(&pa, psk, sizeof(psk)) != 0) { pa++; continue; }
+                                    skip_ws(&pa); if (*pa != ':') break; pa++; skip_ws(&pa);
+                                    if (strcmp(psk, "id") == 0) ps_id = parse_json_int(&pa);
+                                    else { if (*pa=='"') {char t[4096];parse_json_string(&pa,t,sizeof(t));}
+                                        else if (*pa=='{'||*pa=='[') {int d=1;pa++;while(*pa&&d>0){if(*pa=='{'||*pa=='[')d++;if(*pa=='}'||*pa==']')d--;pa++;}}
+                                        else {while(*pa&&*pa!=','&&*pa!='}') pa++;} }
+                                }
+                                if (*pa == '}') pa++;
+                                if (ps_id > max_added_id) max_added_id = ps_id;
+                            }
+                        }
+                        break; /* only first added_tokens array */
+                    }
+                }
+                ps = pf + 1;
+            }
+        }
+
+        /* Expand arrays if needed */
+        if (max_added_id >= 0 && max_added_id >= vocab_size) {
+            int new_size = (int)max_added_id + 1;
+            char **new_bpe = (char **)realloc(tok->id_to_bpe, (size_t)new_size * sizeof(char *));
+            char **new_text = (char **)realloc(tok->id_to_text, (size_t)new_size * sizeof(char *));
+            if (new_bpe && new_text) {
+                memset(new_bpe + vocab_size, 0, (size_t)(new_size - vocab_size) * sizeof(char *));
+                memset(new_text + vocab_size, 0, (size_t)(new_size - vocab_size) * sizeof(char *));
+                tok->id_to_bpe = new_bpe;
+                tok->id_to_text = new_text;
+                vocab_size = new_size;
+                tok->vocab_size = new_size;
+            }
+        }
+
         int n_added = 0;
         const char *at = json;
         /* Find "added_tokens" key */
@@ -747,9 +806,6 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
                                 tok->id_to_bpe[(int)at_id] = strdup(at_content);
                                 /* Special tokens are stored as-is (not byte-level encoded) */
                                 tok->id_to_text[(int)at_id] = strdup(at_content);
-                                /* Update vocab_map for encoding */
-                                map_insert((str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap,
-                                           at_content, (int)at_id);
                                 n_added++;
                             }
                         }
@@ -759,8 +815,22 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
             }
             at = found + 1;
         }
-        if (ds_verbose >= 1 && n_added > 0) {
-            fprintf(stderr, "Tokenizer: loaded %d added_tokens\n", n_added);
+
+        if (n_added > 0) {
+            /* Rebuild vocab_map with expanded vocab to include added_tokens */
+            free(tok->vocab_map);
+            int nve = 0;
+            for (int i = 0; i < vocab_size; i++) if (tok->id_to_bpe[i]) nve++;
+            tok->vocab_map_cap = next_pow2(nve * 2 + 1);
+            tok->vocab_map = calloc((size_t)tok->vocab_map_cap, sizeof(str_int_entry_t));
+            if (tok->vocab_map) {
+                for (int i = 0; i < vocab_size; i++) {
+                    if (tok->id_to_bpe[i])
+                        map_insert((str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap, tok->id_to_bpe[i], i);
+                }
+            }
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Tokenizer: loaded %d added_tokens (vocab expanded to %d)\n", n_added, vocab_size);
         }
     }
 
@@ -976,8 +1046,64 @@ found_vocab:
         if (tok->id_to_bpe[i]) map_insert((str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap, tok->id_to_bpe[i], i);
     }
 
-    /* Load added_tokens from tokenizer.json */
+    /* Load added_tokens from tokenizer.json
+     * Added tokens may have ids beyond vocab_size (e.g. 128815 for <image>,
+     * 128816-128819 for <|ref|>/<|det|> etc.), so we need to expand
+     * id_to_bpe/id_to_text arrays if any added token id exceeds vocab_size. */
     {
+        /* Pre-scan: find max id in added_tokens to determine if expansion needed */
+        int64_t max_added_id = -1;
+        {
+            const char *ps = json;
+            while (*ps) {
+                const char *pf = strstr(ps, "\"added_tokens\"");
+                if (!pf) break;
+                const char *pb = pf - 1;
+                while (pb > json && (*pb==' '||*pb=='\t'||*pb=='\n'||*pb=='\r')) pb--;
+                if (*pb == '{' || *pb == ',') {
+                    const char *pa = pf + strlen("\"added_tokens\"");
+                    skip_ws(&pa);
+                    if (*pa == ':') { pa++; skip_ws(&pa);
+                        if (*pa == '[') { pa++;
+                            while (*pa && *pa != ']') {
+                                skip_ws(&pa); if (*pa==']') break; if (*pa==','){pa++;continue;}
+                                if (*pa!='{'){pa++;continue;} pa++;
+                                int64_t ps_id = -1;
+                                while (*pa && *pa != '}') {
+                                    skip_ws(&pa); if (*pa=='}') break; if (*pa==','){pa++;continue;}
+                                    char psk[256];
+                                    if (parse_json_string(&pa, psk, sizeof(psk)) != 0) { pa++; continue; }
+                                    skip_ws(&pa); if (*pa != ':') break; pa++; skip_ws(&pa);
+                                    if (strcmp(psk, "id") == 0) ps_id = parse_json_int(&pa);
+                                    else { if (*pa=='"') {char t[4096];parse_json_string(&pa,t,sizeof(t));}
+                                        else if (*pa=='{'||*pa=='[') {int d=1;pa++;while(*pa&&d>0){if(*pa=='{'||*pa=='[')d++;if(*pa=='}'||*pa==']')d--;pa++;}}
+                                        else {while(*pa&&*pa!=','&&*pa!='}') pa++;} }
+                                }
+                                if (*pa == '}') pa++;
+                                if (ps_id > max_added_id) max_added_id = ps_id;
+                            }
+                        }
+                    }
+                }
+                ps = pf + 1;
+            }
+        }
+
+        /* Expand arrays if needed */
+        if (max_added_id >= 0 && max_added_id >= vocab_size) {
+            int new_size = (int)max_added_id + 1;
+            char **new_bpe = (char **)realloc(tok->id_to_bpe, (size_t)new_size * sizeof(char *));
+            char **new_text = (char **)realloc(tok->id_to_text, (size_t)new_size * sizeof(char *));
+            if (new_bpe && new_text) {
+                memset(new_bpe + vocab_size, 0, (size_t)(new_size - vocab_size) * sizeof(char *));
+                memset(new_text + vocab_size, 0, (size_t)(new_size - vocab_size) * sizeof(char *));
+                tok->id_to_bpe = new_bpe;
+                tok->id_to_text = new_text;
+                tok->vocab_size = new_size;
+                vocab_size = new_size;  /* Update local variable for aid < vocab_size check below */
+            }
+        }
+
         int n_added = 0;
         const char *at = json;
         while (*at) {
@@ -1018,8 +1144,22 @@ found_vocab:
             }
             at = found + 1;
         }
-        if (n_added > 0 && ds_verbose >= 1)
-            fprintf(stderr, "Tokenizer: %d added_tokens from tokenizer.json\n", n_added);
+        if (n_added > 0) {
+            /* Rebuild vocab_map with expanded vocab_size to include added_tokens */
+            free(tok->vocab_map);
+            int nve = 0;
+            for (int i = 0; i < tok->vocab_size; i++) if (tok->id_to_bpe[i]) nve++;
+            tok->vocab_map_cap = next_pow2(nve * 2 + 1);
+            tok->vocab_map = calloc((size_t)tok->vocab_map_cap, sizeof(str_int_entry_t));
+            if (tok->vocab_map) {
+                for (int i = 0; i < tok->vocab_size; i++) {
+                    if (tok->id_to_bpe[i])
+                        map_insert((str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap, tok->id_to_bpe[i], i);
+                }
+            }
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Tokenizer: %d added_tokens from tokenizer.json (vocab expanded to %d)\n", n_added, tok->vocab_size);
+        }
     }
 
     /* Load merges from model.merges */
