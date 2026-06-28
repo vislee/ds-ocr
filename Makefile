@@ -15,9 +15,11 @@ SRCS = ds_ocr.c ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_a
        ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
        ds_tokenizer.c ds_safetensors.c
 ifeq ($(UNAME_S),Darwin)
-SRCS += ds_platform_ocr.m
+SRCS += ds_platform_ocr.m ds_metal.m
+METALLIB = ds_metal_shaders.metallib
 else
 SRCS += ds_platform_ocr.c
+METALLIB =
 endif
 OBJS = $(SRCS:.c=.o)
 OBJS := $(OBJS:.m=.o)
@@ -38,7 +40,7 @@ help:
 	@echo "ds_ocr — DeepSeek-OCR Pure C Inference - Build Targets"
 	@echo ""
 	@echo "Choose a backend:"
-	@echo "  make blas        - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make blas        - With BLAS + Metal GPU acceleration"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test        - Build and run all tests (BLAS backend)"
@@ -59,16 +61,29 @@ help:
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_APPLE_VISION -DACCELERATE_NEW_LAPACK
-BLAS_LDFLAGS = -lm -lpthread -framework Accelerate -framework ApplicationServices -framework Foundation -framework Vision -framework ImageIO
+BLAS_LDFLAGS = -lm -lpthread -framework Accelerate -framework ApplicationServices -framework Foundation -framework Vision -framework ImageIO -framework Metal -framework CoreGraphics
 else
 BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 BLAS_LDFLAGS = -lm -lpthread -lopenblas
 endif
 
+# Metal shader compilation (macOS only)
+# Use runtime source compilation as fallback if metallib build fails.
+# The ds_metal.m wrapper will compile from .metal source at runtime if
+# precompiled metallib is not available.
+ifeq ($(UNAME_S),Darwin)
+ds_metal_shaders.metallib: ds_metal_shaders.metal
+	-xcrun -sdk macosx metal -std=metal3.1 -c $< -o $(@:.metallib=.air) 2>/dev/null && \
+	xcrun -sdk macosx metallib $(@:.metallib=.air) -o $@ && \
+	rm -f $(@:.metallib=.air) || \
+	(echo "Note: Metal shader precompilation skipped (will compile at runtime)" && rm -f $(@:.metallib=.air))
+endif
+
 blas: clean
+	$(MAKE) $(METALLIB)
 	$(MAKE) $(TARGET) CFLAGS="$(BLAS_CFLAGS)" LDFLAGS="$(BLAS_LDFLAGS)"
 	@echo ""
-	@echo "Built with BLAS backend"
+	@echo "Built with BLAS + Metal GPU backend"
 
 # =============================================================================
 # Test suite
@@ -106,6 +121,9 @@ $(TARGET): $(OBJS) main.o
 %.o: %.m ds_platform_ocr.h
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
+ds_metal.o: ds_metal.m ds_metal.h ds_metal_shaders.metal
+	$(CC) $(CFLAGS) -fobjc-arc -framework Metal -framework Foundation -c -o $@ $<
+
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
@@ -117,7 +135,7 @@ debug:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) main.o test.o $(TARGET) $(TEST_TARGET)
+	rm -f $(OBJS) main.o test.o $(TARGET) $(TEST_TARGET) ds_metal_shaders.metallib ds_metal_shaders.air
 
 info:
 	@echo "Platform: $(UNAME_S)"
@@ -140,7 +158,7 @@ ds_kernels_avx.o: ds_kernels_avx.c ds_kernels_impl.h
 ds_image.o: ds_image.c ds_image.h
 ds_visual_tokenizer.o: ds_visual_tokenizer.c ds_visual_tokenizer.h ds_kernels.h ds_safetensors.h
 ds_deep_encoder.o: ds_deep_encoder.c ds_deep_encoder.h ds_kernels.h ds_safetensors.h
-ds_moe_decoder.o: ds_moe_decoder.c ds_moe_decoder.h ds_kernels.h ds_safetensors.h
+ds_moe_decoder.o: ds_moe_decoder.c ds_moe_decoder.h ds_kernels.h ds_safetensors.h ds_metal.h
 ds_tokenizer.o: ds_tokenizer.c ds_tokenizer.h
 ds_safetensors.o: ds_safetensors.c ds_safetensors.h
 main.o: main.c ds_ocr.h ds_kernels.h

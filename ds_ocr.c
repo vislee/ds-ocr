@@ -939,6 +939,17 @@ ds_ctx_t *ds_load(const char *model_dir) {
         return NULL;
     }
 
+    /* Initialize Metal GPU acceleration (optional, no error if unavailable) */
+    ctx->metal_ctx = ds_metal_init();
+    ctx->metal_enabled = (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx)) ? 1 : 0;
+    if (ctx->metal_enabled && getenv("DS_NO_METAL")) {
+        ctx->metal_enabled = 0;
+        if (ds_verbose >= 1) fprintf(stderr, "Metal GPU acceleration: disabled by DS_NO_METAL\n");
+    } else if (ctx->metal_enabled && ds_verbose >= 1)
+        fprintf(stderr, "Metal GPU acceleration: ENABLED\n");
+    else if (ds_verbose >= 1)
+        fprintf(stderr, "Metal GPU acceleration: disabled (CPU only)\n");
+
     if (ds_verbose >= 1)
         fprintf(stderr, "Model loaded successfully (version %d, %d layers)\n",
                 version, ctx->config.dec_layers);
@@ -948,6 +959,12 @@ ds_ctx_t *ds_load(const char *model_dir) {
 
 void ds_free(ds_ctx_t *ctx) {
     if (!ctx) return;
+
+    /* Free Metal GPU context */
+    if (ctx->metal_ctx) {
+        ds_metal_free(ctx->metal_ctx);
+        ctx->metal_ctx = NULL;
+    }
 
     /* Free safetensors */
     if (ctx->safetensors) {
