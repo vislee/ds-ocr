@@ -112,7 +112,7 @@ void ds_kernels_dispatch_init(void) {
 }
 
 /* Auto-initialize on first matvec call (thread-safe via simple flag). */
-static void ds_dispatch_ensure_init(void) {
+void ds_dispatch_ensure_init(void) {
     if (!ds_dispatch_initialized) ds_kernels_dispatch_init();
 }
 
@@ -559,7 +559,7 @@ int ds_get_num_cpus(void) {
 }
 
 /* Dispatch work to all threads; main thread is tid=0 */
-static void ds_parallel_for(ds_parallel_fn_t fn, void *arg) {
+void ds_parallel_for(ds_parallel_fn_t fn, void *arg) {
     if (tp.n_threads <= 1) {
         fn(0, 1, arg);
         return;

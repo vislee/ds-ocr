@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "ds_metal.h"
+#include "ds_quantize.h"
 
 /* ========================================================================
  * Constants
@@ -327,6 +328,17 @@ typedef struct {
     uint16_t *shared_up_weight_bf16;   /* [shared_experts * moe_inter, hidden] */
     uint16_t *shared_down_weight_bf16; /* [hidden, shared_experts * moe_inter] */
     uint16_t *shared_gate_up_fused_bf16; /* [2*shared_experts*moe_inter, hidden] gate+up concatenated (decode) */
+
+    /* INT4 quantized expert weights (optional, enabled by --int4) */
+    struct {
+        ds_int4_block_t gate_up_fused;  /* [2*moe_inter, hidden] INT4 */
+        ds_int4_block_t down_weight;    /* [hidden, moe_inter] INT4 */
+    } experts_int4[DS_MAX_EXPERTS];
+    ds_int4_block_t shared_gate_up_int4;   /* [2*n_shared*moe_inter, hidden] INT4 */
+    ds_int4_block_t shared_down_int4;      /* [hidden, n_shared*moe_inter] INT4 */
+    ds_int4_block_t dense_gate_up_int4;    /* [2*intermediate, hidden] INT4 (layer 0 dense) */
+    ds_int4_block_t dense_down_int4;       /* [hidden, intermediate] INT4 (layer 0 dense) */
+    int int4_enabled;                       /* 1 if INT4 quantization was applied */
 } ds_dec_layer_t;
 
 typedef struct {
@@ -436,6 +448,7 @@ typedef struct {
 
     /* Per-layer profiler stats (enabled by --profile) */
     int profile_enabled;                       /* 0=off, 1=on */
+    int int4_enabled;                          /* 0=off, 1=INT8 quant for MoE experts (flag name is --int4 for compatibility) */
     double perf_layer_qkv_ms[DS_MAX_DEC_LAYERS];      /* QKV projection time per layer */
     double perf_layer_attn_ms[DS_MAX_DEC_LAYERS];     /* Attention time per layer */
     double perf_layer_proj_ms[DS_MAX_DEC_LAYERS];     /* Output projection time per layer */
@@ -466,6 +479,10 @@ typedef struct {
 
 /* Load model from directory */
 ds_ctx_t *ds_load(const char *model_dir);
+
+/* INT4 quantize MoE expert weights (call after ds_load, when --int4 is set).
+ * Reduces memory bandwidth ~4x for decode, with minimal accuracy loss. */
+int ds_quantize_moe_int4(ds_ctx_t *ctx);
 
 /* Free all resources */
 void ds_free(ds_ctx_t *ctx);

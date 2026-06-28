@@ -2,9 +2,34 @@
 # Makefile
 
 CC = gcc
-# Apple M2+: -mcpu=apple-m2 enables FEAT_BF16 and better scheduling
-# For Linux: use -march=native
-CFLAGS_BASE = -Wall -Wextra -O3 -mcpu=apple-m2
+
+# Platform-specific CPU tuning
+# Apple Silicon: auto-detect M1/M2/M3/M4 for optimal -mcpu flag
+# Linux/x86: use -march=native
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+  # Detect Apple Silicon chip via sysctl
+  APPLE_CHIP := $(shell sysctl -n hw.optional.arm64 2>/dev/null)
+  ifeq ($(APPLE_CHIP),1)
+    # Check for FEAT_BF16 support (M2+) vs M1
+    HAS_BF16 := $(shell sysctl -n hw.optional.arm_FeatBF16 2>/dev/null)
+    ifeq ($(HAS_BF16),1)
+      MARCH_FLAG = -mcpu=apple-m2
+    else
+      MARCH_FLAG = -mcpu=apple-m1
+    endif
+  else
+    MARCH_FLAG = -mcpu=apple-m2
+  endif
+else ifeq ($(UNAME_M),x86_64)
+  MARCH_FLAG = -march=native
+else ifeq ($(UNAME_M),aarch64)
+  MARCH_FLAG = -mcpu=native
+else
+  MARCH_FLAG =
+endif
+
+CFLAGS_BASE = -Wall -Wextra -O3 $(MARCH_FLAG)
 LDFLAGS = -lm -lpthread
 
 # Platform detection
@@ -13,7 +38,7 @@ UNAME_S := $(shell uname -s)
 # Source files (shared between main binary and test binary)
 SRCS = ds_ocr.c ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_avx.c \
        ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
-       ds_tokenizer.c ds_safetensors.c
+       ds_tokenizer.c ds_safetensors.c ds_quantize.c
 ifeq ($(UNAME_S),Darwin)
 SRCS += ds_platform_ocr.m ds_metal.m
 METALLIB = ds_metal_shaders.metallib
@@ -107,6 +132,13 @@ $(TEST_TARGET): $(OBJS) test.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 test.o: test.c ds_ocr.h ds_kernels.h ds_safetensors.h ds_tokenizer.h ds_image.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# INT4 kernel test
+test_int4: $(OBJS) test_int4.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_int4.o: test_int4.c ds_ocr.h ds_kernels.h ds_quantize.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # =============================================================================

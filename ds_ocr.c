@@ -12,6 +12,7 @@
 #include "ds_deep_encoder.h"
 #include "ds_moe_decoder.h"
 #include "ds_tokenizer.h"
+#include "ds_quantize.h"
 
 #include "ds_dump.h"
 #include <stdio.h>
@@ -766,9 +767,76 @@ static int load_all_weights(ds_ctx_t *ctx) {
         }
     }
 
+    /* ── INT8 quantization (optional, enabled by --int4) ── */
     if (ds_verbose >= 1)
         fprintf(stderr, "All weights loaded\n");
 
+    return 0;
+}
+
+/* ========================================================================
+ * INT4 Quantization (called after ds_load, when --int4 flag is set)
+ * ======================================================================== */
+
+int ds_quantize_moe_int4(ds_ctx_t *ctx) {
+    if (!ctx || !ctx->int4_enabled) return 0;
+    ds_config_t *cfg = &ctx->config;
+    int moe_inter = cfg->dec_moe_inter;
+    int hidden = cfg->dec_hidden;
+    int n_shared = cfg->dec_n_shared_experts;
+    int n_exp = cfg->dec_n_routed_experts;
+    double t0 = ds_time_sec();
+
+    for (int l = 0; l < cfg->dec_layers; l++) {
+        ds_dec_layer_t *ly = &ctx->decoder.layers[l];
+        if (l < cfg->dec_first_k_dense) {
+            /* Dense FFN (layer 0): skip */
+        } else {
+            for (int e = 0; e < n_exp; e++) {
+                if (ly->experts[e].gate_up_fused_bf16) {
+                    ds_int4_quantize_bf16(&ly->experts_int4[e].gate_up_fused,
+                                          ly->experts[e].gate_up_fused_bf16,
+                                          2 * moe_inter, hidden);
+                }
+                if (ly->experts[e].down_weight_bf16) {
+                    ds_int4_quantize_bf16(&ly->experts_int4[e].down_weight,
+                                          ly->experts[e].down_weight_bf16,
+                                          hidden, moe_inter);
+                }
+            }
+            if (ly->shared_gate_up_fused_bf16) {
+                ds_int4_quantize_bf16(&ly->shared_gate_up_int4,
+                                      ly->shared_gate_up_fused_bf16,
+                                      2 * n_shared * moe_inter, hidden);
+            }
+            if (ly->shared_down_weight_bf16) {
+                ds_int4_quantize_bf16(&ly->shared_down_int4,
+                                      ly->shared_down_weight_bf16,
+                                      hidden, n_shared * moe_inter);
+            }
+        }
+        ly->int4_enabled = 1;
+    }
+
+    double dt = ds_time_sec() - t0;
+    if (ds_verbose >= 1) {
+        size_t int4_total = 0;
+        for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++) {
+            ds_dec_layer_t *ly2 = &ctx->decoder.layers[l];
+            for (int e = 0; e < n_exp; e++) {
+                int4_total += ly2->experts_int4[e].gate_up_fused.bytes;
+                int4_total += ly2->experts_int4[e].down_weight.bytes;
+            }
+            int4_total += ly2->shared_gate_up_int4.bytes;
+            int4_total += ly2->shared_down_int4.bytes;
+        }
+        size_t bf16_total = 0;
+        for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++)
+            bf16_total += ctx->decoder.layers[l].expert_block_size;
+        fprintf(stderr, "INT8 quantization: %.2fs, %zu MB INT8 vs %.1f MB BF16 (%.1fx smaller)\n",
+                dt, int4_total / 1048576, bf16_total / 1048576.0,
+                bf16_total > 0 ? (double)bf16_total / int4_total : 0.0);
+    }
     return 0;
 }
 

@@ -81,6 +81,27 @@ Key optimizations in v0.9:
 
 **v0.9 = 8× v0.5 = 61× Python PyTorch (CPU BF16 ~736s)**
 
+### INT8 Quantization (`--int4`)
+
+Per-row asymmetric INT8 quantization for MoE expert weights, reducing memory
+bandwidth ~2× while maintaining OCR accuracy (RMS < 0.01 vs BF16).
+
+| | BF16 | INT8 (`--int4`) |
+|---|---|---|
+| **Expert weight size** | 3176 MB | 2399 MB (1.3× smaller) |
+| **Quantization RMS** | — | 0.007–0.010 |
+| **OCR accuracy** | ✅ Reference | ✅ Matches BF16 |
+
+```bash
+# INT8 quantization is applied at load time (~3s one-time cost)
+./ds_ocr -d ./models/DeepSeek-OCR-2 -i doc.png --rp 1.03 --int4
+```
+
+> **Note**: On Apple Silicon (M2+), hardware BF16 dot-product instructions are
+> faster than software INT8 dequantize+MLA for single-token decode. INT8
+> benefits memory-constrained devices and x86 platforms without BF16 hardware.
+> Quantization overhead is ~3s at model load; inference decode speed is similar.
+
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
 Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
@@ -254,6 +275,7 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | `--vision` | macOS Vision OCR backend | Off |
 | `--vision-fast` | macOS Vision OCR backend (fast) | Off |
 | `--profile` | Per-stage timing | Off |
+| `--int4` | INT8 quantize MoE expert weights (2× less memory) | Off |
 | `--debug` | Verbose debug output | Off |
 | `--silent` | OCR text output only | Off |
 
@@ -392,6 +414,7 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 
 ### Version History
 
+- **v0.10** — INT8 per-row MoE expert quantization (`--int4`, RMS<0.01), platform auto-detect (M1/M2+/x86)
 - **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), tokenizer.json fallback, download_model.sh v1/v2/v3
 - **v0.8** — Batched MoE prefill + parallel encoding: 16s end-to-end (6× v0.5)
 - **v0.7** — F32 KV cache + fused residual+norm + direct SwiGLU + batched decode
