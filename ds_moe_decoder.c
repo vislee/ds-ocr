@@ -14,6 +14,7 @@
 #include "ds_moe_decoder.h"
 #include "ds_kernels.h"
 #include "ds_safetensors.h"
+#include "ds_metal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,7 @@
 
 /* Forward declaration */
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg,
+                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
@@ -103,7 +104,7 @@ static void dense_ffn_forward(float *output, const float *x,
 }
 
 static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, int layer_idx,
+                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx, int layer_idx,
                          float *dense_gate_buf, float *dense_up_buf, float *dense_swiglu_buf,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
@@ -116,7 +117,7 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
         dense_ffn_forward(output, x, layer, cfg, dense_gate_buf, dense_up_buf, dense_swiglu_buf);
     } else {
         /* MoE */
-        moe_forward(output, x, layer, cfg,
+        moe_forward(output, x, layer, cfg, metal_ctx,
                     expert_gate_buf, expert_up_buf,
                     expert_gate_up_buf, expert_hidden_buf,
                     shared_gate_buf, shared_up_buf,
@@ -127,7 +128,7 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
 }
 
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg,
+                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
@@ -182,13 +183,30 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     if (scores != scores_buf) free(scores);
 
     /* Step 3: Forward through each selected routed expert.
-     * Prefetch next expert's weights while current expert is computing,
-     * to reduce page fault stalls from random expert address jumps.
-     * With contiguous expert blocks, gate_up_fused for all experts are
-     * in one allocation — a single madvise on the block covers upcoming
-     * experts. We also prefetch the down weight (still in mmap'd region). */
+     * Metal GPU path: batch all experts on GPU for massive parallelism.
+     * CPU path: sequential per-expert matvec with prefetch optimization. */
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
+
+    if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE")) {
+        /* ── Metal GPU path: MoE expert forward ── */
+        const uint16_t *gate_up_ptrs[DS_MAX_EXPERTS];
+        const uint16_t *down_ptrs[DS_MAX_EXPERTS];
+        for (int k = 0; k < top_k; k++) {
+            gate_up_ptrs[k] = layer->experts[top_indices[k]].gate_up_fused_bf16;
+            down_ptrs[k] = layer->experts[top_indices[k]].down_weight_bf16;
+        }
+        /* GPU computes combined expert output directly into 'output' */
+        ds_metal_moe_experts(metal_ctx, x, gate_up_ptrs, down_ptrs,
+                              top_weights, top_k, hidden, moe_inter, output);
+        /* Skip CPU combine since GPU already combines */
+        if (!expert_outputs_buf) free(expert_outputs);
+        goto shared_experts;
+    }
+
+    /* ── CPU path ── */
+    /* Prefetch the entire range of selected experts' gate_up_fused weights
+     * experts. We also prefetch the down weight (still in mmap'd region). */
     /* Prefetch the entire range of selected experts' gate_up_fused weights
      * within the contiguous block. This covers all top-k experts' gate_up
      * in one system call, letting the kernel async-read-ahead. */
@@ -233,13 +251,22 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
         }
     }
 
-    /* Step 4: Combine routed expert outputs */
+    /* Step 4: Combine routed expert outputs (CPU path) */
     ds_expert_combine(output, expert_outputs, top_indices, top_weights, top_k, hidden);
     if (!expert_outputs_buf) free(expert_outputs);
     else memset(expert_outputs_buf, 0, top_k * hidden * sizeof(float));
 
+shared_experts:
     /* Step 5: Add shared expert outputs (always active) */
-    if (layer->shared_gate_up_fused_bf16) {
+    if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE") &&
+        layer->shared_gate_up_fused_bf16 && layer->shared_down_weight_bf16) {
+        /* ── Metal GPU path: shared experts ── */
+        int shared_inter = n_shared * moe_inter;
+        ds_metal_shared_experts(metal_ctx, x,
+                                 layer->shared_gate_up_fused_bf16,
+                                 layer->shared_down_weight_bf16,
+                                 hidden, shared_inter, output);
+    } else if (layer->shared_gate_up_fused_bf16) {
         /* Fused gate+up path: single matvec [hidden → 2*shared_inter] */
         int shared_inter = n_shared * moe_inter;
         ds_linear_nobias_bf16(shared_gate_up_buf, x, layer->shared_gate_up_fused_bf16,
@@ -410,7 +437,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *mlp_out = ctx->dec_expert_out;  /* reuse preallocated buffer */
-    mlp_forward(mlp_out, x_norm, layer, cfg, layer_idx,
+    mlp_forward(mlp_out, x_norm, layer, cfg, ctx->metal_ctx, layer_idx,
                 ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                 ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                 ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
@@ -951,8 +978,13 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     if (ctx->temperature <= 0.0f && lm_w) {
         double t_lm = ctx->profile_enabled ? ds_time_sec() : 0;
 
-        /* Step 1: Argmax over all rows — returns best token and value */
-        int best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
+        /* Step 1: Argmax over all rows — GPU path if Metal available */
+        int best_token;
+        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx)) {
+            best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
+        } else {
+            best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
+        }
         float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);
         if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
             /* First: if the argmax winner is in history, apply penalty */
@@ -1286,7 +1318,7 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
             /* MoE — per-token (same as decode path, no batch benefit for MoE routing) */
             for (int s = 0; s < n_tokens; s++) {
                 float *mlp_out = ctx->dec_expert_out;
-                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, l,
+                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, ctx->metal_ctx, l,
                             ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                             ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                             ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,

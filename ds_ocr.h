@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "ds_metal.h"
 
 /* ========================================================================
  * Constants
@@ -453,6 +454,10 @@ typedef struct {
     /* V3 streaming det tag filter state */
     char _det_buf[256];             /* Buffer for accumulating potential det/ref tags */
     int _det_buf_len;               /* Current length of buffered text */
+
+    /* Metal GPU acceleration context (NULL if Metal unavailable) */
+    struct ds_metal_ctx *metal_ctx;
+    int metal_enabled;              /* 1 = use Metal for MoE/LM head, 0 = CPU only */
 } ds_ctx_t;
 
 /* ========================================================================
