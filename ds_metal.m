@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+
 typedef struct { const void *ptr; id<MTLBuffer> buf; size_t sz; } wbuf_t;
 #define MAX_WBUFS 4096
 typedef struct { float value; int index; } argmax_pair_t;
@@ -31,6 +32,12 @@ struct ds_metal_ctx {
     id<MTLBuffer> q_b;  int q_n;
     id<MTLBuffer> k_b;  int kv_n;
     id<MTLBuffer> v_b;  int v_n2;
+
+    /* Expert block for offset-based weight access */
+    id<MTLBuffer> expert_block_bf16;
+    size_t expert_block_size;
+    const void *expert_block_host;
+
     int ndispatch;
 };
 
@@ -58,6 +65,24 @@ static id<MTLBuffer> get_wbuf(ds_metal_ctx_t *c, const void *p, size_t bytes) {
     c->wb[c->nwb] = (wbuf_t){p, b, bytes};
     c->nwb++;
     return b;
+}
+
+/* Get weight buffer with byte offset for setBuffer:offset:atIndex:
+ * If the pointer falls within the expert block, return the block buffer
+ * with appropriate offset. Otherwise, create individual buffer. */
+static id<MTLBuffer> get_wbuf_offset(ds_metal_ctx_t *c, const void *p, size_t bytes,
+                                       NSUInteger *out_offset) {
+    if (c->expert_block_host && c->expert_block_bf16) {
+        uintptr_t host = (uintptr_t)p;
+        uintptr_t block_start = (uintptr_t)c->expert_block_host;
+        uintptr_t block_end = block_start + c->expert_block_size;
+        if (host >= block_start && host + bytes <= block_end) {
+            *out_offset = (NSUInteger)(host - block_start);
+            return c->expert_block_bf16;
+        }
+    }
+    *out_offset = 0;
+    return get_wbuf(c, p, bytes);
 }
 
 static id<MTLComputePipelineState> get_ps(ds_metal_ctx_t *c, const char *name) {
@@ -181,7 +206,8 @@ ds_metal_ctx_t *ds_metal_init(void) {
     }
 
     const char *names[] = {"bf16_matvec","bf16_matvec_bias","bf16_matvec_qkv",
-        "swiglu","expert_combine","add_inplace","argmax_partial","zero_fill","scale_add",NULL};
+        "swiglu","swiglu_offset","expert_combine","add_inplace",
+        "argmax_partial","zero_fill","scale_add","scale_add_offset",NULL};
     for (int i = 0; names[i]; i++) {
         if (!get_ps(c, names[i])) {
             fprintf(stderr, "Metal: kernel '%s' missing\n", names[i]);
@@ -199,6 +225,7 @@ void ds_metal_free(ds_metal_ctx_t *c) {
     c->x_b=nil; c->y_b=nil; c->gu_b=nil; c->sw_b=nil;
     c->eo_b=nil; c->cb_b=nil; c->ar_b=nil;
     c->q_b=nil; c->k_b=nil; c->v_b=nil;
+    c->expert_block_bf16=nil;
     for (int i = 0; i < c->nwb; i++) c->wb[i].buf = nil;
     free(c);
 }
@@ -212,6 +239,22 @@ int ds_metal_register_bf16(ds_metal_ctx_t *c, const uint16_t *d, size_t n) {
 }
 int ds_metal_register_f32(ds_metal_ctx_t *c, const float *d, size_t n) {
     return (c && d && get_wbuf(c, d, n*4)) ? 0 : -1;
+}
+
+void ds_metal_register_expert_block(ds_metal_ctx_t *c, const void *block_ptr, size_t block_bytes) {
+    if (!c || !block_ptr) return;
+    c->expert_block_host = block_ptr;
+    c->expert_block_size = block_bytes;
+    c->expert_block_bf16 = [c->dev newBufferWithBytesNoCopy:(void*)block_ptr
+                                                      length:block_bytes
+                                                     options:MTLResourceStorageModeShared
+                                                 deallocator:nil];
+    if (!c->expert_block_bf16)
+        c->expert_block_bf16 = [c->dev newBufferWithBytes:block_ptr
+                                                   length:block_bytes
+                                                  options:MTLResourceStorageModeShared];
+    if (ds_verbose >= 2 && c->expert_block_bf16)
+        fprintf(stderr, "Metal: registered expert block %p (%zu bytes)\n", block_ptr, block_bytes);
 }
 
 void ds_metal_matvec_bf16(ds_metal_ctx_t *c, float *y, const float *x,
@@ -273,49 +316,198 @@ void ds_metal_moe_experts(ds_metal_ctx_t *c, const float *x,
                            const float *wts, int top_k,
                            int hidden, int inter, float *output) {
     if (!c||!x||!output) return;
-    int gu_dim = 2*inter;
+
+    id<MTLComputePipelineState> matvec_ps = get_ps(c, "bf16_matvec");
+    id<MTLComputePipelineState> swiglu_ps = get_ps(c, "swiglu_offset");
+    id<MTLComputePipelineState> scale_ps  = get_ps(c, "scale_add_offset");
+    id<MTLComputePipelineState> zero_ps   = get_ps(c, "zero_fill");
+    if (!matvec_ps || !swiglu_ps || !scale_ps || !zero_ps) return;
+
+    int gu_dim = 2 * inter;
+    NSUInteger sw = matvec_ps.threadExecutionWidth;
+
+    /* Allocate GPU scratch buffers */
     c->x_b  = ensure_buf(c->dev, c->x_b,  &c->x_n,  hidden);
-    c->gu_b = ensure_buf(c->dev, c->gu_b, &c->gu_n, gu_dim);
-    c->sw_b = ensure_buf(c->dev, c->sw_b, &c->sw_n, inter);
-    c->eo_b = ensure_buf(c->dev, c->eo_b, &c->eo_n, hidden);
+    c->gu_b = ensure_buf(c->dev, c->gu_b, &c->gu_n, top_k * gu_dim);
+    c->sw_b = ensure_buf(c->dev, c->sw_b, &c->sw_n, top_k * inter);
+    c->eo_b = ensure_buf(c->dev, c->eo_b, &c->eo_n, top_k * hidden);
     c->cb_b = ensure_buf(c->dev, c->cb_b, &c->cb_n, hidden);
 
-    memcpy(c->x_b.contents, x, hidden*sizeof(float));
-    dzero(c, c->cb_b, hidden);
+    /* Copy input to GPU */
+    memcpy(c->x_b.contents, x, hidden * sizeof(float));
 
-    for (int k = 0; k < top_k; k++) {
-        id<MTLBuffer> Wgu = get_wbuf(c, gu_ptrs[k], (size_t)gu_dim*hidden*2);
-        dmatvec(c, c->gu_b, c->x_b, Wgu, hidden, gu_dim);
-        dswiglu(c, c->sw_b, c->gu_b, inter);
-        memcpy(c->x_b.contents, c->sw_b.contents, inter*sizeof(float));
-        id<MTLBuffer> Wdn = get_wbuf(c, dn_ptrs[k], (size_t)hidden*inter*2);
-        dmatvec(c, c->eo_b, c->x_b, Wdn, inter, hidden);
-        dscale_add(c, c->cb_b, c->eo_b, wts[k], hidden);
-        if (k+1 < top_k) memcpy(c->x_b.contents, x, hidden*sizeof(float));
+    /* ── Single command buffer for all MoE operations ── */
+    id<MTLCommandBuffer> cmd = [c->q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    /* Step 0: Clear combined output buffer */
+    {
+        [enc setComputePipelineState:zero_ps];
+        [enc setBuffer:c->cb_b offset:0 atIndex:0];
+        int n = hidden;
+        [enc setBytes:&n length:4 atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake((hidden+63)/64,1,1)
+              threadsPerThreadgroup:MTLSizeMake(64,1,1)];
     }
-    memcpy(output, c->cb_b.contents, hidden*sizeof(float));
+
+    /* Process each expert: gate_up matvec -> swiglu -> down matvec -> scale_add
+     * All in one command buffer — GPU executes sequentially, zero CPU sync. */
+    for (int k = 0; k < top_k; k++) {
+        int gu_off = k * gu_dim;     /* float offset in gu_b */
+        int sw_off = k * inter;      /* float offset in sw_b */
+        int eo_off = k * hidden;     /* float offset in eo_b */
+
+        /* Step 1: gate_up_fused matvec: x[hidden] -> gate_up[k*2*inter .. (k+1)*2*inter] */
+        {
+            NSUInteger w_off = 0;
+            size_t w_bytes = (size_t)gu_dim * hidden * 2; /* BF16 bytes */
+            id<MTLBuffer> Wgu = get_wbuf_offset(c, gu_ptrs[k], w_bytes, &w_off);
+            [enc setComputePipelineState:matvec_ps];
+            [enc setBuffer:c->gu_b offset:gu_off*sizeof(float) atIndex:0]; /* y with offset */
+            [enc setBuffer:c->x_b  offset:0 atIndex:1];                    /* x */
+            [enc setBuffer:Wgu    offset:w_off atIndex:2];                  /* W with offset */
+            int y_off = 0; /* y offset is handled by buffer offset above */
+            [enc setBytes:&hidden length:4 atIndex:3];
+            [enc setBytes:&gu_dim length:4 atIndex:4];
+            [enc setBytes:&y_off  length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(gu_dim,1,1)
+                  threadsPerThreadgroup:MTLSizeMake(sw,1,1)];
+        }
+
+        /* Step 2: SwiGLU: gate_up[k*2*inter] -> swiglu[k*inter] */
+        {
+            [enc setComputePipelineState:swiglu_ps];
+            [enc setBuffer:c->sw_b offset:sw_off*sizeof(float) atIndex:0];
+            [enc setBuffer:c->gu_b offset:gu_off*sizeof(float) atIndex:1];
+            [enc setBytes:&inter   length:4 atIndex:2];
+            [enc setBytes:&sw_off  length:4 atIndex:3]; /* out_offset in shader */
+            int in_off = 0; /* input starts at gu_off, no extra offset needed */
+            [enc setBytes:&in_off  length:4 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((inter+63)/64,1,1)
+                  threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        }
+
+        /* Step 3: down matvec: swiglu[k*inter] -> expert_out[k*hidden] */
+        {
+            NSUInteger w_off = 0;
+            size_t w_bytes = (size_t)hidden * inter * 2;
+            id<MTLBuffer> Wdn = get_wbuf_offset(c, dn_ptrs[k], w_bytes, &w_off);
+            [enc setComputePipelineState:matvec_ps];
+            [enc setBuffer:c->eo_b offset:eo_off*sizeof(float) atIndex:0];
+            [enc setBuffer:c->sw_b offset:sw_off*sizeof(float) atIndex:1];
+            [enc setBuffer:Wdn    offset:w_off atIndex:2];
+            int y_off2 = 0;
+            [enc setBytes:&inter  length:4 atIndex:3];
+            [enc setBytes:&hidden length:4 atIndex:4];
+            [enc setBytes:&y_off2 length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(hidden,1,1)
+                  threadsPerThreadgroup:MTLSizeMake(sw,1,1)];
+        }
+
+        /* Step 4: scale_add: combined += wts[k] * expert_out[k*hidden] */
+        {
+            [enc setComputePipelineState:scale_ps];
+            [enc setBuffer:c->cb_b offset:0 atIndex:0];
+            [enc setBuffer:c->eo_b offset:eo_off*sizeof(float) atIndex:1];
+            float w = wts[k];
+            int n = hidden;
+            int dst = 0;
+            int src = 0;
+            [enc setBytes:&w    length:4 atIndex:2];
+            [enc setBytes:&n    length:4 atIndex:3];
+            [enc setBytes:&dst  length:4 atIndex:4];
+            [enc setBytes:&src  length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((hidden+63)/64,1,1)
+                  threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        }
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    /* Copy combined output back to host */
+    memcpy(output, c->cb_b.contents, hidden * sizeof(float));
+    c->ndispatch++;
 }
+
+/* ─── Shared experts (single command buffer) ─── */
 
 void ds_metal_shared_experts(ds_metal_ctx_t *c, const float *x,
                               const uint16_t *gu_bf16, const uint16_t *dn_bf16,
                               int hidden, int shared_inter, float *output) {
     if (!c||!x||!output) return;
-    int gu_dim = 2*shared_inter;
+
+    id<MTLComputePipelineState> matvec_ps = get_ps(c, "bf16_matvec");
+    id<MTLComputePipelineState> swiglu_ps = get_ps(c, "swiglu");
+    if (!matvec_ps || !swiglu_ps) return;
+
+    int gu_dim = 2 * shared_inter;
+    NSUInteger sw = matvec_ps.threadExecutionWidth;
+
     c->x_b  = ensure_buf(c->dev, c->x_b,  &c->x_n,  hidden);
     c->gu_b = ensure_buf(c->dev, c->gu_b, &c->gu_n, gu_dim);
     c->sw_b = ensure_buf(c->dev, c->sw_b, &c->sw_n, shared_inter);
     c->eo_b = ensure_buf(c->dev, c->eo_b, &c->eo_n, hidden);
 
-    memcpy(c->x_b.contents, x, hidden*sizeof(float));
-    id<MTLBuffer> Wgu = get_wbuf(c, gu_bf16, (size_t)gu_dim*hidden*2);
-    dmatvec(c, c->gu_b, c->x_b, Wgu, hidden, gu_dim);
-    dswiglu(c, c->sw_b, c->gu_b, shared_inter);
-    memcpy(c->x_b.contents, c->sw_b.contents, shared_inter*sizeof(float));
-    id<MTLBuffer> Wdn = get_wbuf(c, dn_bf16, (size_t)hidden*shared_inter*2);
-    dmatvec(c, c->eo_b, c->x_b, Wdn, shared_inter, hidden);
+    memcpy(c->x_b.contents, x, hidden * sizeof(float));
+
+    id<MTLCommandBuffer> cmd = [c->q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    /* gate_up matvec */
+    {
+        NSUInteger w_off = 0;
+        id<MTLBuffer> Wgu = get_wbuf_offset(c, gu_bf16, (size_t)gu_dim*hidden*2, &w_off);
+        [enc setComputePipelineState:matvec_ps];
+        [enc setBuffer:c->gu_b offset:0 atIndex:0];
+        [enc setBuffer:c->x_b  offset:0 atIndex:1];
+        [enc setBuffer:Wgu    offset:w_off atIndex:2];
+        int z=0;
+        [enc setBytes:&hidden  length:4 atIndex:3];
+        [enc setBytes:&gu_dim  length:4 atIndex:4];
+        [enc setBytes:&z       length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(gu_dim,1,1)
+              threadsPerThreadgroup:MTLSizeMake(sw,1,1)];
+    }
+
+    /* SwiGLU */
+    {
+        [enc setComputePipelineState:swiglu_ps];
+        [enc setBuffer:c->sw_b offset:0 atIndex:0];
+        [enc setBuffer:c->gu_b offset:0 atIndex:1];
+        [enc setBytes:&shared_inter length:4 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((shared_inter+63)/64,1,1)
+              threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+    }
+
+    /* down matvec — use sw_b as input */
+    {
+        NSUInteger w_off = 0;
+        id<MTLBuffer> Wdn = get_wbuf_offset(c, dn_bf16, (size_t)hidden*shared_inter*2, &w_off);
+        [enc setComputePipelineState:matvec_ps];
+        [enc setBuffer:c->eo_b offset:0 atIndex:0];
+        [enc setBuffer:c->sw_b offset:0 atIndex:1];
+        [enc setBuffer:Wdn    offset:w_off atIndex:2];
+        int z=0;
+        [enc setBytes:&shared_inter length:4 atIndex:3];
+        [enc setBytes:&hidden       length:4 atIndex:4];
+        [enc setBytes:&z            length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(hidden,1,1)
+              threadsPerThreadgroup:MTLSizeMake(sw,1,1)];
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    /* Add to output (matches CPU: output += shared_out) */
     float *r = (float*)c->eo_b.contents;
     for (int i = 0; i < hidden; i++) output[i] += r[i];
+    c->ndispatch++;
 }
+
+/* ─── LM head argmax ─── */
 
 int ds_metal_lm_head_argmax(ds_metal_ctx_t *c, const float *x,
                               const uint16_t *W, int hidden, int vocab) {

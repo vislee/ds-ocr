@@ -978,9 +978,9 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     if (ctx->temperature <= 0.0f && lm_w) {
         double t_lm = ctx->profile_enabled ? ds_time_sec() : 0;
 
-        /* Step 1: Argmax over all rows — GPU path if Metal available */
+        /* Step 1: Argmax over all rows — GPU path if DS_METAL_LM env var set */
         int best_token;
-        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx)) {
+        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx) && getenv("DS_METAL_LM")) {
             best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
         } else {
             best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);

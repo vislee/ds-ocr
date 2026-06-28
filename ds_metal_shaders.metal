@@ -1,19 +1,10 @@
 /*
  * ds_metal_shaders.metal - Metal Compute Shaders for DeepSeek-OCR
  *
- * GPU kernels for MoE decode acceleration:
- *   1. bf16_matvec       — BF16×F32 matrix-vector multiply (core kernel)
- *   2. bf16_matvec_qkv   — Fused QKV matvec (3 outputs from single input)
- *   3. swiglu             — SiLU(gate) * up activation
- *   4. expert_combine     — Weighted sum of expert outputs
- *   5. add_inplace        — output += addend
- *   6. argmax_partial     — Partial argmax per threadgroup
- *   7. zero_fill          — Fill buffer with zeros
- *   8. scale_add          — output += scale * input
- *
- * BF16→F32: (uint16)val << 16 → reinterpret as float32.
- * Dispatch: one threadgroup per output row, SIMD_WIDTH=32 threads per threadgroup.
- * Each threadgroup computes one row via SIMD-group reduction (simd_shuffle_down).
+ * GPU kernels for MoE decode acceleration.
+ * BF16->F32: (uint16)val << 16 -> reinterpret as float32.
+ * One threadgroup per output row, SIMD_W=32 threads per TG.
+ * SIMD-group reduction via simd_shuffle_down.
  */
 
 #include <metal_stdlib>
@@ -22,91 +13,88 @@ using namespace metal;
 #define SIMD_W 32
 
 /* ========================================================================
- * BF16 Matvec — Core Kernel
- * y[row] = Σ_col BF16→F32(W[row, col]) * x[col]
- * Grid: threadgroups = out_dim, threads_per_threadgroup = SIMD_W (32)
+ * bf16_matvec — Core BF16×F32 matrix-vector multiply
+ * y[row] = sum_col BF16(W[row,col]) * x[col]
+ *
+ * Dispatch: 1 threadgroup per row, SIMD_W threads per threadgroup.
+ * Supports W offset via setBuffer offset parameter.
  * ======================================================================== */
 
 kernel void bf16_matvec(
-    device float* y                        [[buffer(0)]],
-    device const float* x                  [[buffer(1)]],
-    device const ushort* W                 [[buffer(2)]],
-    constant int& in_dim                   [[buffer(3)]],
-    constant int& out_dim                  [[buffer(4)]],
-    constant int& out_offset               [[buffer(5)]],
-    uint gid    [[thread_position_in_grid]],
-    uint simd_id [[thread_index_in_simdgroup]],
-    uint simd_n  [[simdgroups_per_threadgroup]],
-    uint simd_gi [[threadgroup_position_in_grid]]
+    device float* y             [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device const ushort* W      [[buffer(2)]],   /* BF16 weights, may use offset */
+    constant int& in_dim        [[buffer(3)]],
+    constant int& out_dim       [[buffer(4)]],
+    constant int& y_offset      [[buffer(5)]],   /* write offset into y (in floats) */
+    uint simd_id  [[thread_index_in_simdgroup]],
+    uint simd_gi  [[threadgroup_position_in_grid]]
 ) {
     int row = (int)simd_gi;
     if (row >= out_dim) return;
 
-    device const ushort* w_row = W + (size_t)(out_offset + row) * in_dim;
+    /* W row pointer — W already includes the base offset from setBuffer */
+    device const ushort* w_row = W + (size_t)row * in_dim;
     float sum = 0.0f;
     for (int col = (int)simd_id; col < in_dim; col += SIMD_W) {
         float w_f32 = as_type<float>((uint32_t)w_row[col] << 16);
         sum += w_f32 * x[col];
     }
-
-    /* SIMD reduction */
     for (int o = 16; o > 0; o >>= 1)
         sum += simd_shuffle_down(sum, o);
 
     if (simd_id == 0)
-        y[row] = sum;
+        y[y_offset + row] = sum;
 }
 
+/* ========================================================================
+ * bf16_matvec_bias — same as bf16_matvec with bias addition
+ * ======================================================================== */
+
 kernel void bf16_matvec_bias(
-    device float* y                        [[buffer(0)]],
-    device const float* x                  [[buffer(1)]],
-    device const ushort* W                 [[buffer(2)]],
-    device const float* bias               [[buffer(3)]],
-    constant int& in_dim                   [[buffer(4)]],
-    constant int& out_dim                  [[buffer(5)]],
-    constant int& out_offset               [[buffer(6)]],
-    uint gid    [[thread_position_in_grid]],
-    uint simd_id [[thread_index_in_simdgroup]],
-    uint simd_n  [[simdgroups_per_threadgroup]],
-    uint simd_gi [[threadgroup_position_in_grid]]
+    device float* y             [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device const ushort* W      [[buffer(2)]],
+    device const float* bias    [[buffer(3)]],
+    constant int& in_dim        [[buffer(4)]],
+    constant int& out_dim       [[buffer(5)]],
+    constant int& y_offset      [[buffer(6)]],
+    uint simd_id  [[thread_index_in_simdgroup]],
+    uint simd_gi  [[threadgroup_position_in_grid]]
 ) {
     int row = (int)simd_gi;
     if (row >= out_dim) return;
-    device const ushort* w_row = W + (size_t)(out_offset + row) * in_dim;
+    device const ushort* w_row = W + (size_t)row * in_dim;
     float sum = 0.0f;
     for (int col = (int)simd_id; col < in_dim; col += SIMD_W) {
         float w_f32 = as_type<float>((uint32_t)w_row[col] << 16);
         sum += w_f32 * x[col];
     }
     for (int o = 16; o > 0; o >>= 1) sum += simd_shuffle_down(sum, o);
-    if (simd_id == 0) y[row] = sum + bias[row];
+    if (simd_id == 0) y[y_offset + row] = sum + bias[y_offset + row];
 }
 
 /* ========================================================================
- * Fused QKV Matvec
- * Computes q=Wq@x, k=Wk@x, v=Wv@x in one dispatch.
- * Grid: threadgroups = q_dim + 2*kv_dim, threads = SIMD_W
+ * bf16_matvec_qkv — Fused QKV: q=Wq@x, k=Wk@x, v=Wv@x in one dispatch
  * ======================================================================== */
 
 kernel void bf16_matvec_qkv(
-    device float* q_out                    [[buffer(0)]],
-    device float* k_out                    [[buffer(1)]],
-    device float* v_out                    [[buffer(2)]],
-    device const float* x                  [[buffer(3)]],
-    device const ushort* Wq                [[buffer(4)]],
-    device const ushort* Wk                [[buffer(5)]],
-    device const ushort* Wv                [[buffer(6)]],
-    constant int& in_dim                   [[buffer(7)]],
-    constant int& q_dim                    [[buffer(8)]],
-    constant int& kv_dim                   [[buffer(9)]],
-    uint gid    [[thread_position_in_grid]],
-    uint simd_id [[thread_index_in_simdgroup]],
-    uint simd_n  [[simdgroups_per_threadgroup]],
-    uint simd_gi [[threadgroup_position_in_grid]]
+    device float* q_out         [[buffer(0)]],
+    device float* k_out         [[buffer(1)]],
+    device float* v_out         [[buffer(2)]],
+    device const float* x       [[buffer(3)]],
+    device const ushort* Wq     [[buffer(4)]],
+    device const ushort* Wk     [[buffer(5)]],
+    device const ushort* Wv     [[buffer(6)]],
+    constant int& in_dim        [[buffer(7)]],
+    constant int& q_dim         [[buffer(8)]],
+    constant int& kv_dim        [[buffer(9)]],
+    uint simd_id  [[thread_index_in_simdgroup]],
+    uint simd_gi  [[threadgroup_position_in_grid]]
 ) {
-    int total_rows = q_dim + kv_dim * 2;
+    int total = q_dim + kv_dim * 2;
     int row = (int)simd_gi;
-    if (row >= total_rows) return;
+    if (row >= total) return;
 
     device const ushort* w_row;
     device float* out_buf;
@@ -114,18 +102,15 @@ kernel void bf16_matvec_qkv(
 
     if (row < q_dim) {
         w_row = Wq + (size_t)row * in_dim;
-        out_buf = q_out;
-        out_idx = row;
+        out_buf = q_out; out_idx = row;
     } else if (row < q_dim + kv_dim) {
-        int k_row = row - q_dim;
-        w_row = Wk + (size_t)k_row * in_dim;
-        out_buf = k_out;
-        out_idx = k_row;
+        int kr = row - q_dim;
+        w_row = Wk + (size_t)kr * in_dim;
+        out_buf = k_out; out_idx = kr;
     } else {
-        int v_row = row - q_dim - kv_dim;
-        w_row = Wv + (size_t)v_row * in_dim;
-        out_buf = v_out;
-        out_idx = v_row;
+        int vr = row - q_dim - kv_dim;
+        w_row = Wv + (size_t)vr * in_dim;
+        out_buf = v_out; out_idx = vr;
     }
 
     float sum = 0.0f;
@@ -138,32 +123,51 @@ kernel void bf16_matvec_qkv(
 }
 
 /* ========================================================================
- * SwiGLU — SiLU(gate) * up
- * gate_up layout: [gate_0..gate_n-1, up_0..up_n-1]
+ * swiglu — SiLU(gate) * up, split layout: gate_up[0..n-1]=gate, [n..2n-1]=up
  * ======================================================================== */
 
 kernel void swiglu(
-    device float* out                      [[buffer(0)]],
-    device const float* gate_up            [[buffer(1)]],
-    constant int& inter                    [[buffer(2)]],
+    device float* out           [[buffer(0)]],
+    device const float* gate_up [[buffer(1)]],
+    constant int& inter         [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= (uint)inter) return;
-    float gate = gate_up[gid];
-    float up   = gate_up[inter + gid];
-    out[gid] = gate * (1.0f / (1.0f + exp(-gate))) * up;
+    float g = gate_up[gid];
+    float u = gate_up[inter + gid];
+    out[gid] = g * (1.0f / (1.0f + exp(-g))) * u;
 }
 
 /* ========================================================================
- * Expert Combine — weighted sum of expert outputs
+ * swiglu_offset — SwiGLU with output and input offsets
+ * For batched expert processing in a single command buffer:
+ *   out[out_offset + i] = SiLU(gate_up[in_offset + i]) * gate_up[in_offset + inter + i]
+ * ======================================================================== */
+
+kernel void swiglu_offset(
+    device float* out           [[buffer(0)]],
+    device const float* gate_up [[buffer(1)]],
+    constant int& inter         [[buffer(2)]],
+    constant int& out_offset    [[buffer(3)]],
+    constant int& in_offset     [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= (uint)inter) return;
+    float g = gate_up[in_offset + gid];
+    float u = gate_up[in_offset + inter + gid];
+    out[out_offset + gid] = g * (1.0f / (1.0f + exp(-g))) * u;
+}
+
+/* ========================================================================
+ * expert_combine — output[i] = sum_k weights[k] * expert_outs[k * hidden + i]
  * ======================================================================== */
 
 kernel void expert_combine(
-    device float* output                   [[buffer(0)]],
-    device const float* expert_outs        [[buffer(1)]],
-    device const float* weights            [[buffer(2)]],
-    constant int& top_k                    [[buffer(3)]],
-    constant int& hidden                   [[buffer(4)]],
+    device float* output        [[buffer(0)]],
+    device const float* expert_outs [[buffer(1)]],
+    device const float* weights [[buffer(2)]],
+    constant int& top_k         [[buffer(3)]],
+    constant int& hidden        [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= (uint)hidden) return;
@@ -174,9 +178,9 @@ kernel void expert_combine(
 }
 
 kernel void add_inplace(
-    device float* output                   [[buffer(0)]],
-    device const float* addend             [[buffer(1)]],
-    constant int& n                        [[buffer(2)]],
+    device float* output        [[buffer(0)]],
+    device const float* addend  [[buffer(1)]],
+    constant int& n             [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= (uint)n) return;
@@ -184,20 +188,18 @@ kernel void add_inplace(
 }
 
 /* ========================================================================
- * Partial Argmax — per-threadgroup chunk reduction for LM head
- * Each threadgroup handles rows_per_chunk rows and finds local argmax.
- * Output: (value, index) pair per threadgroup; CPU does final reduce.
+ * argmax_partial — per-TG chunk argmax for LM head
  * ======================================================================== */
 
 struct argmax_pair { float value; int index; };
 
 kernel void argmax_partial(
-    device struct argmax_pair* results      [[buffer(0)]],
-    device const float* x                  [[buffer(1)]],
-    device const ushort* W                 [[buffer(2)]],
-    constant int& in_dim                   [[buffer(3)]],
-    constant int& vocab                    [[buffer(4)]],
-    constant int& rows_per_chunk           [[buffer(5)]],
+    device struct argmax_pair* results [[buffer(0)]],
+    device const float* x             [[buffer(1)]],
+    device const ushort* W            [[buffer(2)]],
+    constant int& in_dim              [[buffer(3)]],
+    constant int& vocab               [[buffer(4)]],
+    constant int& rows_per_chunk      [[buffer(5)]],
     uint gid    [[thread_position_in_grid]],
     uint simd_id [[thread_index_in_simdgroup]],
     uint simd_n  [[simdgroups_per_threadgroup]],
@@ -212,7 +214,7 @@ kernel void argmax_partial(
     if (row < chunk_end) {
         device const ushort* w_row = W + (size_t)row * in_dim;
         row_sum = 0.0f;
-        for (int col = (int)gid % SIMD_W; col < in_dim; col += SIMD_W) {
+        for (int col = (int)simd_id; col < in_dim; col += SIMD_W) {
             float w_f32 = as_type<float>((uint32_t)w_row[col] << 16);
             row_sum += w_f32 * x[col];
         }
@@ -240,8 +242,8 @@ kernel void argmax_partial(
 }
 
 kernel void zero_fill(
-    device float* buf    [[buffer(0)]],
-    constant int& n      [[buffer(1)]],
+    device float* buf [[buffer(0)]],
+    constant int& n   [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= (uint)n) return;
@@ -249,12 +251,31 @@ kernel void zero_fill(
 }
 
 kernel void scale_add(
-    device float* output [[buffer(0)]],
+    device float* output  [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant float& scale [[buffer(2)]],
-    constant int& n      [[buffer(3)]],
+    constant int& n       [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= (uint)n) return;
     output[gid] += scale * input[gid];
+}
+
+/* ========================================================================
+ * scale_add_offset — scale_add with dst/src offsets
+ * output[dst_off + i] += scale * input[src_off + i]
+ * For accumulating each expert's output into combined buffer.
+ * ======================================================================== */
+
+kernel void scale_add_offset(
+    device float* output  [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    constant float& scale [[buffer(2)]],
+    constant int& n       [[buffer(3)]],
+    constant int& dst_off [[buffer(4)]],
+    constant int& src_off [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= (uint)n) return;
+    output[dst_off + gid] += scale * input[src_off + gid];
 }
