@@ -945,9 +945,18 @@ ds_ctx_t *ds_load(const char *model_dir) {
     if (ctx->metal_enabled && getenv("DS_NO_METAL")) {
         ctx->metal_enabled = 0;
         if (ds_verbose >= 1) fprintf(stderr, "Metal GPU acceleration: disabled by DS_NO_METAL\n");
-    } else if (ctx->metal_enabled && ds_verbose >= 1)
-        fprintf(stderr, "Metal GPU acceleration: ENABLED\n");
-    else if (ds_verbose >= 1)
+    } else if (ctx->metal_enabled) {
+        /* Register expert weight blocks with Metal for zero-copy offset access */
+        for (int l = 0; l < ctx->config.dec_layers; l++) {
+            if (ctx->decoder.layers[l].expert_block_bf16) {
+                ds_metal_register_expert_block(ctx->metal_ctx,
+                    ctx->decoder.layers[l].expert_block_bf16,
+                    ctx->decoder.layers[l].expert_block_size);
+            }
+        }
+        if (ds_verbose >= 1)
+            fprintf(stderr, "Metal GPU acceleration: ENABLED\n");
+    } else if (ds_verbose >= 1)
         fprintf(stderr, "Metal GPU acceleration: disabled (CPU only)\n");
 
     if (ds_verbose >= 1)

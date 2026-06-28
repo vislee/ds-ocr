@@ -58,6 +58,13 @@ int ds_metal_register_bf16(ds_metal_ctx_t *ctx, const uint16_t *data, size_t n);
 /* Register a F32 weight buffer as a Metal buffer. */
 int ds_metal_register_f32(ds_metal_ctx_t *ctx, const float *data, size_t n);
 
+/* Register the contiguous expert weight block for zero-copy offset access.
+ * When expert weights are stored contiguously (expert_block_bf16), a single
+ * Metal buffer is created and each expert's weights are accessed via byte offset.
+ * This avoids creating 64+ separate Metal buffers for individual expert weights. */
+void ds_metal_register_expert_block(ds_metal_ctx_t *ctx, const void *block_ptr,
+                                     size_t block_bytes);
+
 /* ========================================================================
  * MoE Expert Batch Forward (decode hot path)
  * ======================================================================== */
