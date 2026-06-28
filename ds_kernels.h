@@ -269,6 +269,12 @@ int ds_get_num_cpus(void);
 extern int ds_verbose;
 extern int ds_bf16_simulate_python;
 
+/* Thread pool (public for use by ds_quantize.c etc.) */
+typedef void (*ds_parallel_fn_t)(int tid, int n_threads, void *arg);
+void ds_dispatch_ensure_init(void);
+void ds_parallel_for(ds_parallel_fn_t fn, void *arg);
+int ds_get_threads(void);
+
 /* ========================================================================
  * Timing Utilities
  * ======================================================================== */

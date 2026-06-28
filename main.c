@@ -35,6 +35,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --vision      Use macOS Vision OCR backend (no model required)\n");
     fprintf(stderr, "  --vision-fast Use macOS Vision OCR backend in fast mode\n");
     fprintf(stderr, "  --profile     Profile per-layer timing breakdown\n");
+    fprintf(stderr, "  --int4        INT8 quantize MoE expert weights (2x less memory bandwidth)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only recognition on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -53,6 +54,7 @@ int main(int argc, char **argv) {
     int use_platform_ocr = 0;
     int platform_accurate = 1;
     int profile = 0;
+    int int4 = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -79,6 +81,8 @@ int main(int argc, char **argv) {
             platform_accurate = 0;
         } else if (strcmp(argv[i], "--profile") == 0) {
             profile = 1;
+        } else if (strcmp(argv[i], "--int4") == 0) {
+            int4 = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -130,6 +134,10 @@ int main(int argc, char **argv) {
     ctx->no_repeat_ngram_size = no_repeat_ngram_size;
     if (min_new_tokens >= 0) ctx->min_new_tokens = min_new_tokens;
     if (profile) ctx->profile_enabled = 1;
+    if (int4) {
+        ctx->int4_enabled = 1;
+        ds_quantize_moe_int4(ctx);
+    }
 
     /* Unlimited-OCR (V3) defaults: ngram=35 for repeat suppression.
      * Python uses SlidingWindowNoRepeatNgramProcessor(ngram_size=35, window=128). */

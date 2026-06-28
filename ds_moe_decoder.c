@@ -15,6 +15,7 @@
 #include "ds_kernels.h"
 #include "ds_safetensors.h"
 #include "ds_metal.h"
+#include "ds_quantize.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -232,8 +233,15 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
             size_t down_bytes = (size_t)hidden * moe_inter * 2;
             madvise((void *)layer->experts[next_id].down_weight_bf16, down_bytes, MADV_WILLNEED);
         }
-        /* Use fused gate+up path if available (faster: 1 matvec vs 2) */
-        if (layer->experts[expert_id].gate_up_fused_bf16) {
+        /* Use INT4 path if quantized weights available, otherwise BF16 */
+        if (layer->int4_enabled && layer->experts_int4[expert_id].gate_up_fused.qweight) {
+            ds_expert_forward_fused_int4(expert_outputs + k * hidden, x,
+                                          &layer->experts_int4[expert_id].gate_up_fused,
+                                          &layer->experts_int4[expert_id].down_weight,
+                                          hidden, moe_inter,
+                                          expert_gate_up_buf, expert_gate_buf,
+                                          expert_up_buf, expert_hidden_buf);
+        } else if (layer->experts[expert_id].gate_up_fused_bf16) {
             ds_expert_forward_fused(expert_outputs + k * hidden, x,
                                      layer->experts[expert_id].gate_up_fused_bf16,
                                      layer->experts[expert_id].down_weight_bf16,
@@ -258,7 +266,17 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
 
 shared_experts:
     /* Step 5: Add shared expert outputs (always active) */
-    if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE") &&
+    if (layer->int4_enabled && layer->shared_gate_up_int4.qweight) {
+        /* ── INT4 path for shared experts ── */
+        int shared_inter = n_shared * moe_inter;
+        ds_expert_forward_fused_int4(shared_out_buf, x,
+                                      &layer->shared_gate_up_int4,
+                                      &layer->shared_down_int4,
+                                      hidden, shared_inter,
+                                      shared_gate_up_buf, shared_gate_buf,
+                                      shared_up_buf, shared_swiglu_buf);
+        ds_vec_add(output, output, shared_out_buf, hidden);
+    } else if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE") &&
         layer->shared_gate_up_fused_bf16 && layer->shared_down_weight_bf16) {
         /* ── Metal GPU path: shared experts ── */
         int shared_inter = n_shared * moe_inter;
