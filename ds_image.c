@@ -350,19 +350,21 @@ ds_image_t *ds_image_crop_box(const ds_image_t *img, int left, int top, int righ
 
 /* Find closest aspect ratio — matches Python find_closest_aspect_ratio() */
 static int find_closest_aspect_ratio(float aspect_ratio, int width, int height,
-                                       int image_size, int *out_rows, int *out_cols) {
+                                       int image_size, int *out_rows, int *out_cols,
+                                       int min_num, int max_num) {
     /* Generate target ratios: (i, j) where min_num <= i*j <= max_num
-     * For DeepSeek-OCR V2: min_num=2, max_num=6
      * Python: target_ratios = set((i, j) ...) where i=width_blocks, j=height_blocks.
-     * ratio[0]=i is width direction, ratio[1]=j is height direction. */
+     * ratio[0]=i is width direction, ratio[1]=j is height direction.
+     * V2: min_num=2, max_num=6 → at most 6 crops
+     * V3: min_num=2, max_num=32 → up to 32 crops for large images */
     int best_width_blocks = 1, best_height_blocks = 1;
     float best_diff = 1e30f;
-    int area = width * height;
+    long long area = (long long)width * height;
 
-    for (int n = 2; n <= 6; n++) {
+    for (int n = min_num; n <= max_num; n++) {
         for (int i = 1; i <= n; i++) {
             for (int j = 1; j <= n; j++) {
-                if (i * j < 2 || i * j > 6) continue;
+                if (i * j < min_num || i * j > max_num) continue;
                 float target_ar = (float)i / (float)j;  /* i=width, j=height */
                 float diff = fabsf(aspect_ratio - target_ar);
                 if (diff < best_diff) {
@@ -371,7 +373,7 @@ static int find_closest_aspect_ratio(float aspect_ratio, int width, int height,
                     best_height_blocks = j;  /* height direction */
                 } else if (diff == best_diff) {
                     /* Tie-break: prefer larger ratio if image area is large */
-                    if (area > 0.5f * image_size * image_size * i * j) {
+                    if (area > (long long)(0.5f * image_size * image_size * i * j)) {
                         best_width_blocks = i;
                         best_height_blocks = j;
                     }
@@ -408,8 +410,7 @@ ds_image_t **ds_dynamic_preprocess(const ds_image_t *img, int image_size,
 
     int block_rows, block_cols;
     int blocks = find_closest_aspect_ratio(aspect_ratio, orig_w, orig_h, image_size,
-                                            &block_rows, &block_cols);
-    (void)min_num; (void)max_num; /* embedded in find_closest_aspect_ratio */
+                                            &block_rows, &block_cols, min_num, max_num);
 
     int target_w = image_size * block_cols;
     int target_h = image_size * block_rows;
