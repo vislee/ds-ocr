@@ -1136,7 +1136,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     ds_tokenizer_t *tokenizer = NULL;
 
     if (cfg->model_version == 2 && cfg->enc_type != 1) {
-        /* V2 multi-crop path */
+        /* V2 multi-crop path (DeepEncoder V2, crop_size=768) */
         ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
 
         /* Fast-path: skip encoding entirely and load from Python reference dump */
@@ -1485,9 +1485,125 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             free(crops);
             if (!encoder_output) return NULL;
         } /* end else (large image) */
+    } else if (cfg->model_version == 3 && cfg->enc_type == 1) {
+        /* ── V3 (Unlimited-OCR) multi-crop path ──
+         *
+         * Python logic:
+         *   1. Global: pad(1024) → SAM → CLIP → Projector → [256, 1280]
+         *      → view(16,16,dim), cat(newline per row) → [16,17,dim] → [272, 1280]
+         *   2. Local: dynamic_preprocess(640) → N crops, each → [100, 1280]
+         *      → view(crop_h, crop_w, 10, 10, dim).permute→reshape(h*10, w*10, dim)
+         *      → cat(newline per row) → [h*10, w*10+1, dim]
+         *   3. Concat: [local, global, view_seperator]
+         *
+         * CLIP encoder returns tokens WITH newlines (273/111).
+         * We strip newlines, then re-insert in correct grid layout.
+         */
+        ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
+        int use_crop = (width > 640 || height > 640);
+        int ggrid = 16;  /* 1024/16/4 */
+        int lgrid = 10;  /* 640/16/4 */
+        float *nl = ctx->vis_tokenizer.image_newline;
+        float *vsep = ctx->vis_tokenizer.view_seperator;
 
+        /* ── Global view ── */
+        ds_image_t *gimg = ds_image_pad(&img, 1024, 127);
+        if (!gimg) return NULL;
+        int n_sg; float *sg = ds_sam_forward_image(ctx, gimg, &n_sg, NULL);
+        ds_image_free(gimg);
+        if (!sg) return NULL;
+        int n_cg; float *cg = ds_clip_encoder_forward(ctx, NULL, 0, 0, 0, sg, n_sg, &n_cg);
+        free(sg);
+        if (!cg) return NULL;
+
+        /* Strip newlines: CLIP 273 = 16 rows × (16+1) + 1 view_sep → 256 raw features */
+        int n_global_raw = ggrid * ggrid;
+        float *global_raw = (float *)malloc(n_global_raw * hidden * sizeof(float));
+        for (int r = 0; r < ggrid; r++)
+            memcpy(global_raw + r * ggrid * hidden,
+                   cg + r * (ggrid + 1) * hidden, ggrid * hidden * sizeof(float));
+        free(cg);
+
+        /* Reassemble global with newlines: [16, 17, dim] = 272 tokens */
+        int n_gnl = ggrid * (ggrid + 1);
+        float *gnl = (float *)malloc(n_gnl * hidden * sizeof(float));
+        for (int r = 0; r < ggrid; r++) {
+            memcpy(gnl + r * (ggrid + 1) * hidden, global_raw + r * ggrid * hidden, ggrid * hidden * sizeof(float));
+            if (nl) memcpy(gnl + (r * (ggrid + 1) + ggrid) * hidden, nl, hidden * sizeof(float));
+        }
+        free(global_raw);
+
+        if (!use_crop) {
+            /* Small image: [global(272), view_sep(1)] = 273 tokens */
+            n_encoder_tokens = n_gnl + 1;
+            encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
+            memcpy(encoder_output, gnl, n_gnl * hidden * sizeof(float));
+            if (vsep) memcpy(encoder_output + n_gnl * hidden, vsep, hidden * sizeof(float));
+            free(gnl);
+            if (ds_verbose >= 1) fprintf(stderr, "V3: Small: %d+1=%d tokens\n", n_gnl, n_encoder_tokens);
+        } else {
+            /* ── Local crops ── */
+            int nc = 0;
+            ds_image_t **crops = ds_dynamic_preprocess(&img, 640, 2, 32, 0, &nc);
+            if (!crops || nc < 1) { free(gnl); return NULL; }
+
+            float iar = (float)width / height;
+            int cw = 1, ch = 1; float bd = 1e10f;
+            for (int tw = 1; tw <= 32; tw++)
+                for (int th = 1; th <= 32; th++) {
+                    if (tw * th != nc) continue;
+                    float d = fabsf(iar - (float)tw / th);
+                    if (d < bd) { bd = d; cw = tw; ch = th; }
+                }
+
+            int lh = ch * lgrid, lw = cw * lgrid, lrw = lw + 1;
+            int n_lnl = lh * lrw;
+
+            if (ds_verbose >= 1)
+                fprintf(stderr, "V3: %d crops (%dx%d), local %dx%d→%d tokens\n", nc, cw, ch, lh, lw, n_lnl);
+
+            float *lf = (float *)calloc(n_lnl, hidden * sizeof(float));
+            for (int ci = 0; ci < nc; ci++) {
+                int cr = ci / cw, cc = ci % cw;
+                int nsc; float *sc = ds_sam_forward_image(ctx, crops[ci], &nsc, NULL);
+                if (!sc) continue;
+                int ncc; float *cc2 = ds_clip_encoder_forward(ctx, NULL, 0, 0, 0, sc, nsc, &ncc);
+                free(sc);
+                if (!cc2) continue;
+                /* Strip newlines: 111 → 100 */
+                for (int lr = 0; lr < lgrid; lr++) {
+                    int so = lr * (lgrid + 1) * hidden;
+                    int dr = cr * lgrid + lr, dc = cc * lgrid;
+                    int do_ = (dr * lrw + dc) * hidden;
+                    memcpy(lf + do_, cc2 + so, lgrid * hidden * sizeof(float));
+                }
+                free(cc2);
+            }
+            /* Insert newlines in local grid */
+            if (nl) {
+                float *lnl = (float *)malloc(n_lnl * hidden * sizeof(float));
+                for (int r = 0; r < lh; r++) {
+                    memcpy(lnl + r * lrw * hidden, lf + r * lw * hidden, lw * hidden * sizeof(float));
+                    memcpy(lnl + (r * lrw + lw) * hidden, nl, hidden * sizeof(float));
+                }
+                free(lf); lf = lnl;
+            }
+
+            /* Concat [local, global, view_seperator] */
+            n_encoder_tokens = n_lnl + n_gnl + 1;
+            encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
+            int off = 0;
+            memcpy(encoder_output + off * hidden, lf, n_lnl * hidden * sizeof(float)); off += n_lnl;
+            memcpy(encoder_output + off * hidden, gnl, n_gnl * hidden * sizeof(float)); off += n_gnl;
+            if (vsep) memcpy(encoder_output + off * hidden, vsep, hidden * sizeof(float));
+            free(lf); free(gnl);
+            for (int i = 0; i < nc; i++) ds_image_free(crops[i]);
+            free(crops);
+            if (ds_verbose >= 1)
+                fprintf(stderr, "V3: Multi-crop: %d local + %d global + 1 sep = %d tokens\n", n_lnl, n_gnl, n_encoder_tokens);
+        }
     } else {
-        /* V1 or single-image V2 path (no cropping) */
+        /* V1 path (no multi-crop) */
         /* Step 1: Visual tokenizer (SAM) — resize to 1024x1024 */
         int n_visual_tokens;
         float *patch_embeds = NULL;
@@ -1499,11 +1615,8 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             return NULL;
         }
 
-        /* Step 2: Encoder (CLIP V1/V3 or DeepEncoder V2) */
+        /* Step 2: Encoder (CLIP V1 or DeepEncoder V2) */
         if (cfg->enc_type == 1) {
-            /* CLIP V1/V3: receives SAM features directly as patch_embeds.
-             * The patch_embedding Conv2d is NOT used — SAM's 16x compression
-             * already produces 256 tokens that CLIP processes directly. */
             encoder_output = ds_clip_encoder_forward(ctx,
                                                       NULL, 0, 0, 0,
                                                       visual_tokens, n_visual_tokens,
@@ -1519,22 +1632,6 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         if (!encoder_output) {
             fprintf(stderr, "Encoder forward failed\n");
             return NULL;
-        }
-
-        /* Debug: dump C encoder output for comparison */
-        {
-            const char *dump_dir = getenv("DS_DUMP_ENCODER");
-            if (dump_dir) {
-                char path[512];
-                snprintf(path, sizeof(path), "%s/c_encoder_output.bin", dump_dir);
-                FILE *f = fopen(path, "wb");
-                if (f) {
-                    fwrite(encoder_output, sizeof(float), n_encoder_tokens * hidden, f);
-                    fclose(f);
-                    fprintf(stderr, "Dumped C encoder output (%d x %d) to %s\n",
-                            n_encoder_tokens, hidden, path);
-                }
-            }
         }
     }
 
@@ -1775,23 +1872,15 @@ prompt_construction:
          * Python: format_messages with sft_format='plain' → "<image>\ndocument parsing."
          * Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
          *
-         * Image token layout (from Python infer):
-         *   num_queries_base = ceil(1024/16/4) = 16
-         *   tokenized_image = ([128815]*16 + [128815]) * 16 + [128815] = 273
+         * Image token count = n_encoder_tokens (from CLIP+SAM+Projector):
+         *   - Small image (<=640): [global(273), view_sep(1)] = 274
+         *   - Large image (>640):  [local(N), global(273), view_sep(1)] = N+274
+         *     where N = (crop_h*10)*(crop_w*10+1)
          *
-         * The CLIP+SAM+Projector encoder now returns 273 tokens:
-         *   - 256 projected tokens (16x16 grid of CLIP+SAM features)
-         *   - 16 image_newline tokens (inserted after each grid row)
-         *   - 1 view_seperator token (appended at end)
-         *
-         * Python's masked_scatter places all 273 encoder tokens into the
-         * 273 image positions (all True in images_seq_mask).
-         * For C: embed all image positions with 128815, then overwrite
-         * ALL 273 with encoder_output (n_encoder_tokens should equal n_img_tokens).
+         * Python's masked_scatter places all encoder tokens into the
+         * image positions (all True in images_seq_mask).
          */
-        int base_size = 1024;
-        int num_queries_base = (base_size + 15) / 16 / 4;  /* 16 */
-        int n_img_tokens = (num_queries_base + 1) * num_queries_base + 1;  /* 273 */
+        int n_img_tokens = n_encoder_tokens;  /* Dynamic: matches encoder output */
 
         int n_text_after = 0;
         int *text_after_ids = NULL;
