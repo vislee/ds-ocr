@@ -508,6 +508,14 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         ds_linear_nobias_bf16(K, x_norm, layer->wk_weight_bf16, seq_len, hidden, kv_dim);
         ds_linear_nobias_bf16(V, x_norm, layer->wv_weight_bf16, seq_len, hidden, kv_dim);
 
+        /* BF16 truncation after QKV to match Python's autocast BF16 matmul output */
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) {
+            ds_bf16_truncate_array(Q, seq_len * q_dim);
+            ds_bf16_truncate_array(K, seq_len * kv_dim);
+            ds_bf16_truncate_array(V, seq_len * kv_dim);
+        }
+
         /* Per-head RMSNorm (optional: V2/OCR-2 does not use these) */
         if (layer->q_norm_weight)
             ds_rms_norm_per_head(Q, layer->q_norm_weight, seq_len, n_heads, head_dim, cfg->dec_rms_norm_eps);
@@ -563,6 +571,9 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             /* Output projection + residual */
             float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
             ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, seq_len, q_dim, hidden);
+            /* BF16 truncation after output projection */
+            extern int ds_bf16_simulate_python;
+            if (ds_bf16_simulate_python) ds_bf16_truncate_array(proj_out, seq_len * hidden);
             free(attn_out);
 
             ds_vec_add(x, x, proj_out, seq_len * hidden);
@@ -598,11 +609,20 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
                                    seq_len, hidden, cfg->dec_intermediate);
             ds_linear_nobias_bf16(up_buf, x_norm, layer->dense_up_weight_bf16,
                                    seq_len, hidden, cfg->dec_intermediate);
+            if (ds_bf16_simulate_python) {
+                ds_bf16_truncate_array(gate_buf, seq_len * cfg->dec_intermediate);
+                ds_bf16_truncate_array(up_buf, seq_len * cfg->dec_intermediate);
+            }
 
             /* Direct SwiGLU — no gate_up interleaving needed */
             ds_swiglu_direct(swiglu_buf, gate_buf, up_buf, seq_len, cfg->dec_intermediate);
+            if (ds_bf16_simulate_python) ds_bf16_truncate_array(swiglu_buf, seq_len * cfg->dec_intermediate);
             ds_linear_nobias_bf16(mlp_out, swiglu_buf, layer->dense_down_weight_bf16,
                                    seq_len, cfg->dec_intermediate, hidden);
+
+            /* BF16 truncation after dense FFN down projection */
+            extern int ds_bf16_simulate_python;
+            if (ds_bf16_simulate_python) ds_bf16_truncate_array(mlp_out, seq_len * hidden);
 
             ds_vec_add(x, x, mlp_out, seq_len * hidden);
             free(gate_buf); free(up_buf); free(swiglu_buf); free(mlp_out);
@@ -857,6 +877,12 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         float *last_x = x + (seq_len - 1) * hidden;
         float *norm_x = (float *)malloc(hidden * sizeof(float));
         ds_rms_norm(norm_x, last_x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
+        /* BF16 truncation of final hidden state before LM head.
+         * Python's autocast("cuda", dtype=bfloat16) computes the entire
+         * decoder in BF16, so norm_x is BF16 before the LM head matmul.
+         * Truncating here makes logits closer to Python's distribution. */
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) ds_bf16_truncate_array(norm_x, hidden);
         if (dec->lm_head_bf16)
             ds_bf16_matvec_pub(ctx->dec_logits, norm_x, dec->lm_head_bf16, NULL, hidden, cfg->vocab_size);
         else
@@ -979,6 +1005,17 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         snprintf(path, sizeof(path), "dump/c_dec_step%d_norm_last.bin", _step_before);
         FILE *df = fopen(path, "wb");
         if (df) { fwrite(x, sizeof(float), hidden, df); fclose(df); }
+    }
+
+    /* BF16 intermediate truncation: match Python's autocast("cuda", dtype=bfloat16).
+     * Python computes the entire decoder in BF16, including attention Q/K/V,
+     * attention scores, and the final RMSNorm output before LM head.
+     * C's F32 path produces higher-precision logits where EOS tends to dominate.
+     * Truncating the final hidden state to BF16 before LM head makes logits
+     * closer to Python's distribution, reducing the EOS-vs-content logit gap. */
+    extern int ds_bf16_simulate_python;
+    if (ds_bf16_simulate_python && cfg->model_version == 3) {
+        ds_bf16_truncate_array(x, hidden);
     }
 
     /* LM head: compute logits then sample with optional repetition penalty */
