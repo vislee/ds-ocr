@@ -35,22 +35,27 @@ make blas
 | **Input** | 1024×1024 (stretch) | Dynamic multi-crop | 640×640 (pad) |
 | **Visual tokens** | 256 | 857 (6-crop) | 273 |
 | **Prompt** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
-| **C support** | ✅ Full | ✅ Full | ✅ Full |
+| **C support** | ✅ Full | ✅ Full | ✅ Full + EOS fix |
 | **Model size** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
-### Benchmark (Apple M2 Pro, 1794×1578 test image)
+### Benchmark (Apple M4 Max, 1794×1578 test image, CPU BLAS)
 
-| Metric | V1 | V2 (recommended) | V3 (Unlimited-OCR) |
-|--------|----|-------------------|---------------------|
-| **Total time** | 12.2s | 15.0s | 17.6s |
-| **Encoding** | 6.4s | 9.0s | 6.4s |
-| **Prefill** | 0.72s | 0.93s | 0.70s |
-| **Decode** | 5.1s (233 tokens) | 5.1s (226 tokens) | 10.5s (464 tokens) |
-| **Decode speed** | 45.7 tok/s | 44.4 tok/s | 44.0 tok/s |
-| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags stripped) |
+| Metric | V1 | V3 (Unlimited-OCR) |
+|--------|----|---------------------|
+| **Total time** | 11.6s | 76.4s (30 crops) |
+| **Encoding** | 6.0s | 42.6s (30 crops × SAM+CLIP) |
+| **Prefill** | 0.7s (286 tokens) | 3.9s (3328 tokens) |
+| **Decode** | 5.0s (233 tokens) | 30.0s (499 tokens) |
+| **Decode speed** | 47.0 tok/s | 16.6 tok/s |
+| **Output quality** | ⚠️ Minor typos | ✅ Correct (det tags stripped) |
 
-> V2 is recommended for best quality and formatting. V1 has minor precision-induced typos (e.g. "raletimit" vs "ratelimit").
-> V3 outputs detection/reference tags (`<|det|>`, `<|ref|>`) that are automatically stripped in post-processing.
+> V1 is faster but has minor precision-induced typos (e.g. "raletimit" vs "ratelimit").
+> V3 produces more accurate and detailed output, but is significantly slower for large
+> images due to sequential crop encoding (30 crops × SAM+CLIP) and MHA attention
+> (instead of V1's MLA). V3's decode speed is ~3× slower than V1 due to LlamaAttention
+> (10 heads × 128 dim) vs DeepSeek-V2 MLA compression.
+>
+> For small images (≤640px), V3 matches V1 decode speed at ~47 tok/s.
 
 ## Performance
 
@@ -244,7 +249,7 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 ./ds_ocr -d ./models/DeepSeek-OCR-2 -i document.png --rp 1.03
 
 # Unlimited-OCR V3
-./ds_ocr -d ./models/Unlimited-OCR -i document.png --rp 1.01 --ngram 35
+./ds_ocr -d ./models/Unlimited-OCR -i document.png
 
 # DeepSeek-OCR V1
 ./ds_ocr -d ./models/DeepSeek-OCR -i document.png --rp 1.03
@@ -270,8 +275,8 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | `-n <n>` | Max generated tokens | 4096 |
 | `--temp <f>` | Sampling temperature | 0 (greedy) |
 | `--rp <f>` | Repetition penalty (1.0=off, rec 1.01-1.1) | 1.0 |
-| `--ngram <n>` | No-repeat n-gram (0=off, rec 20-35) | 0 (V3: 35) |
-| `--min-tokens <n>` | Min generated tokens (prevent early EOS) | 256 |
+| `--ngram <n>` | No-repeat n-gram (0=off, rec 20-35) | 0 |
+| `--min-tokens <n>` | Min generated tokens (prevent early EOS) | 32 (V3: 32) |
 | `--vision` | macOS Vision OCR backend | Off |
 | `--vision-fast` | macOS Vision OCR backend (fast) | Off |
 | `--profile` | Per-stage timing | Off |
