@@ -194,6 +194,43 @@ static void skip_ws(const char **p) {
     while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++;
 }
 
+/* Skip a JSON value (string, number, object, array, bool, null) at *p.
+ * Correctly handles nested strings containing { } [ ] characters. */
+static void skip_json_value(const char **p) {
+    skip_ws(p);
+    if (**p == '"') {
+        /* String: skip past closing quote, handling escapes */
+        (*p)++;
+        while (**p && **p != '"') {
+            if (**p == '\\') (*p)++;  /* skip escaped char */
+            if (**p) (*p)++;
+        }
+        if (**p == '"') (*p)++;
+    } else if (**p == '{' || **p == '[') {
+        /* Object or array: track nesting depth, skip strings inside */
+        char open = **p, close = (**p == '{') ? '}' : ']';
+        int depth = 1;
+        (*p)++;
+        while (**p && depth > 0) {
+            if (**p == '"') {
+                (*p)++;
+                while (**p && **p != '"') {
+                    if (**p == '\\') (*p)++;
+                    if (**p) (*p)++;
+                }
+                if (**p == '"') (*p)++;
+            } else {
+                if (**p == open) depth++;
+                else if (**p == close) depth--;
+                (*p)++;
+            }
+        }
+    } else {
+        /* Number, bool, null */
+        while (**p && **p != ',' && **p != '}' && **p != ']') (*p)++;
+    }
+}
+
 static int parse_json_string(const char **p, char *out, size_t max_len) {
     skip_ws(p);
     if (**p != '"') return -1;
@@ -722,9 +759,7 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
                                     if (parse_json_string(&pa, psk, sizeof(psk)) != 0) { pa++; continue; }
                                     skip_ws(&pa); if (*pa != ':') break; pa++; skip_ws(&pa);
                                     if (strcmp(psk, "id") == 0) ps_id = parse_json_int(&pa);
-                                    else { if (*pa=='"') {char t[4096];parse_json_string(&pa,t,sizeof(t));}
-                                        else if (*pa=='{'||*pa=='[') {int d=1;pa++;while(*pa&&d>0){if(*pa=='{'||*pa=='[')d++;if(*pa=='}'||*pa==']')d--;pa++;}}
-                                        else {while(*pa&&*pa!=','&&*pa!='}') pa++;} }
+                                    else { skip_json_value(&pa); }
                                 }
                                 if (*pa == '}') pa++;
                                 if (ps_id > max_added_id) max_added_id = ps_id;
@@ -945,17 +980,11 @@ ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json
                         goto found_vocab;
                     }
                     /* Skip non-vocab value */
-                    if (*p == '{') { int d=1; p++; while(*p&&d>0){if(*p=='{')d++;if(*p=='}')d--;p++;} }
-                    else if (*p == '[') { int d=1; p++; while(*p&&d>0){if(*p=='[')d++;if(*p==']')d--;p++;} }
-                    else if (*p == '"') { char t[4096]; parse_json_string(&p,t,sizeof(t)); }
-                    else { while(*p&&*p!=','&&*p!='}') p++; }
+                    skip_json_value(&p);
                 }
             }
             /* Skip non-model value */
-            if (*p == '{') { int d=1; p++; while(*p&&d>0){if(*p=='{')d++;if(*p=='}')d--;p++;} }
-            else if (*p == '[') { int d=1; p++; while(*p&&d>0){if(*p=='[')d++;if(*p==']')d--;p++;} }
-            else if (*p == '"') { char t[4096]; parse_json_string(&p,t,sizeof(t)); }
-            else { while(*p&&*p!=','&&*p!='}') p++; }
+            skip_json_value(&p);
         }
     }
 found_vocab:
@@ -1075,9 +1104,7 @@ found_vocab:
                                     if (parse_json_string(&pa, psk, sizeof(psk)) != 0) { pa++; continue; }
                                     skip_ws(&pa); if (*pa != ':') break; pa++; skip_ws(&pa);
                                     if (strcmp(psk, "id") == 0) ps_id = parse_json_int(&pa);
-                                    else { if (*pa=='"') {char t[4096];parse_json_string(&pa,t,sizeof(t));}
-                                        else if (*pa=='{'||*pa=='[') {int d=1;pa++;while(*pa&&d>0){if(*pa=='{'||*pa=='[')d++;if(*pa=='}'||*pa==']')d--;pa++;}}
-                                        else {while(*pa&&*pa!=','&&*pa!='}') pa++;} }
+                                    else { skip_json_value(&pa); }
                                 }
                                 if (*pa == '}') pa++;
                                 if (ps_id > max_added_id) max_added_id = ps_id;
@@ -1127,9 +1154,7 @@ found_vocab:
                                 skip_ws(&at); if(*at!=':')break; at++; skip_ws(&at);
                                 if(strcmp(ak,"id")==0) aid=parse_json_int(&at);
                                 else if(strcmp(ak,"content")==0) parse_json_string(&at,ac,sizeof(ac));
-                                else { if(*at=='"'){char t[4096];parse_json_string(&at,t,sizeof(t));}
-                                    else if(*at=='{'||*at=='['){int d=1;at++;while(*at&&d>0){if(*at=='{'||*at=='[')d++;if(*at=='}'||*at==']')d--;at++;}}
-                                    else{while(*at&&*at!=','&&*at!='}')at++;} }
+                                else { skip_json_value(&at); }
                             }
                             if(*at=='}')at++;
                             if(aid>=0&&aid<vocab_size&&ac[0]){
@@ -1162,35 +1187,24 @@ found_vocab:
         }
     }
 
-    /* Load merges from model.merges */
+    /* Load merges from model.merges
+     * vocab_end points just past the vocab object's closing }.
+     * Continue scanning within the model object for "merges" key. */
     {
-        const char *mp = vocab_end; /* resume after vocab in model object */
-        /* Scan for "merges" key within the model object */
-        /* We need to go back to the model object start and find merges */
-        const char *model_obj = NULL;
-        { const char *s = json; skip_ws(&s); if(*s=='{')s++;
-            while(*s&&*s!='}'){
-                skip_ws(&s); if(*s==','){s++;continue;} if(*s=='}')break;
-                char k[256]; if(parse_json_string(&s,k,sizeof(k))!=0){s++;continue;}
-                skip_ws(&s); if(*s!=':')break; s++; skip_ws(&s);
-                if(strcmp(k,"model")==0&&*s=='{'){model_obj=s;break;}
-                if(*s=='{'){int d=1;s++;while(*s&&d>0){if(*s=='{')d++;if(*s=='}')d--;s++;}}
-                else if(*s=='['){int d=1;s++;while(*s&&d>0){if(*s=='[')d++;if(*s==']')d--;s++;}}
-                else if(*s=='"'){char t[4096];parse_json_string(&s,t,sizeof(t));}
-                else{while(*s&&*s!=','&&*s!='}')s++;}
-            }
-        }
-        if (model_obj) {
-            const char *mp2 = model_obj; mp2++; /* skip { */
-            while(*mp2&&*mp2!='}'){
-                skip_ws(&mp2); if(*mp2==','){mp2++;continue;} if(*mp2=='}')break;
-                char mk[256]; if(parse_json_string(&mp2,mk,sizeof(mk))!=0){mp2++;continue;}
-                skip_ws(&mp2); if(*mp2!=':')break; mp2++; skip_ws(&mp2);
-                if(strcmp(mk,"merges")==0&&*mp2=='['){
+        const char *mp2 = vocab_end;
+        while(*mp2&&*mp2!='}'){
+            skip_ws(&mp2); if(*mp2==','){mp2++;continue;} if(*mp2=='}')break;
+            char mk[256]; if(parse_json_string(&mp2,mk,sizeof(mk))!=0){mp2++;continue;}
+            skip_ws(&mp2); if(*mp2!=':')break; mp2++; skip_ws(&mp2);
+            if(strcmp(mk,"merges")==0&&*mp2=='['){
                     mp2++; int mi=0;
                     while(*mp2&&*mp2!=']'){
                         skip_ws(&mp2); if(*mp2==']')break; if(*mp2==','){mp2++;continue;}
+                        /* Support two merge formats:
+                         *   Simple:  ["a b", "c d", ...]          (string per merge pair)
+                         *   Nested:  [["a","b"], ["c","d"], ...]  (array per merge pair) */
                         if(*mp2=='"'){
+                            /* Simple format: "a b" */
                             char ms[4096];
                             if(parse_json_string(&mp2,ms,sizeof(ms))==0){
                                 char*space=strchr(ms,' ');
@@ -1198,9 +1212,39 @@ found_vocab:
                                     *space='\0';
                                     char mk2[8192]; snprintf(mk2,sizeof(mk2),"%s %s",ms,space+1);
                                     if(!tok->merge_map){tok->merge_map_cap=262144;tok->merge_map=calloc((size_t)tok->merge_map_cap,sizeof(str_int_entry_t));}
-                                    if(tok->merge_map&&mi<tok->merge_map_cap) map_insert((str_int_entry_t*)tok->merge_map,tok->merge_map_cap,mk2,mi);
+                                    if(tok->merge_map&&mi<tok->merge_map_cap){
+                                        char *mk2_dup = strdup(mk2);
+                                        if(mk2_dup) map_insert((str_int_entry_t*)tok->merge_map,tok->merge_map_cap,mk2_dup,mi);
+                                    }
                                     mi++;
                                 }
+                            }
+                        } else if(*mp2=='['){
+                            /* Nested format: ["a","b"] */
+                            mp2++; /* skip [ */
+                            char a_str[4096]="", b_str[4096]="";
+                            int got_a=0, got_b=0;
+                            while(*mp2&&*mp2!=']'){
+                                skip_ws(&mp2); if(*mp2==']')break; if(*mp2==','){mp2++;continue;}
+                                if(*mp2=='"'){
+                                    if(!got_a){
+                                        if(parse_json_string(&mp2,a_str,sizeof(a_str))==0) got_a=1;
+                                    } else if(!got_b){
+                                        if(parse_json_string(&mp2,b_str,sizeof(b_str))==0) got_b=1;
+                                    } else {
+                                        char t[4096]; parse_json_string(&mp2,t,sizeof(t));
+                                    }
+                                } else mp2++;
+                            }
+                            if(*mp2==']') mp2++;
+                            if(got_a&&got_b){
+                                char mk2[8192]; snprintf(mk2,sizeof(mk2),"%s %s",a_str,b_str);
+                                if(!tok->merge_map){tok->merge_map_cap=next_pow2(mi*4+262144);tok->merge_map=calloc((size_t)tok->merge_map_cap,sizeof(str_int_entry_t));}
+                                if(tok->merge_map&&mi<tok->merge_map_cap){
+                                    char *mk2_dup = strdup(mk2);
+                                    if(mk2_dup) map_insert((str_int_entry_t*)tok->merge_map,tok->merge_map_cap,mk2_dup,mi);
+                                }
+                                mi++;
                             }
                         } else mp2++;
                     }
@@ -1208,12 +1252,8 @@ found_vocab:
                     break;
                 }
                 /* Skip non-merges value */
-                if(*mp2=='{'){int d=1;mp2++;while(*mp2&&d>0){if(*mp2=='{')d++;if(*mp2=='}')d--;mp2++;}}
-                else if(*mp2=='['){int d=1;mp2++;while(*mp2&&d>0){if(*mp2=='[')d++;if(*mp2==']')d--;mp2++;}}
-                else if(*mp2=='"'){char t[4096];parse_json_string(&mp2,t,sizeof(t));}
-                else{while(*mp2&&*mp2!=','&&*mp2!='}')mp2++;}
+                skip_json_value(&mp2);
             }
-        }
     }
 
     free(vjs);
