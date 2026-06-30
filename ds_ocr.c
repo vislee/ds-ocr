@@ -950,10 +950,12 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->repeat_penalty = 1.0f; /* No penalty by default */
     ctx->no_repeat_ngram_size = 0; /* Disabled by default; ngram blocking causes premature EOS in OCR.
                                       Use --ngram N to enable (Python: 20 non-eval, 35 eval) */
-    ctx->min_new_tokens = 0;        /* Don't suppress EOS — let model stop naturally.
-                                      With BF16 intermediate truncation (ds_bf16_simulate_python=1),
-                                      the numerical path matches Python's, and EOS is output correctly.
-                                      Python generate() has no min_new_tokens; it stops at EOS. */
+    ctx->min_new_tokens = (cfg->model_version == 3) ? 32 : 0;
+    /* V3 needs min_new_tokens because the model's F32 logits make EOS
+     * dominate early decode steps. The 32-step warmup with EOS+Ġ ban
+     * lets the model settle into stable content generation.
+     * After warmup, the model's context window has enough content to
+     * generate naturally without reverting to EOS. */
 
     return 0;
 }
@@ -2099,8 +2101,45 @@ prompt_construction:
                     if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
                 }
                 first_token = best_id;
-                if (ds_verbose >= 1)
-                    fprintf(stderr, "Prefill first token=%d (from prefill logits, %.3f)\n", first_token, best_val);
+                /* V3 EOS-first fix: suppress EOS and common spurious tokens
+                 * for first token selection. Must be OUTSIDE verbose block!
+                 * V3 model trained with BF16 autocast tends to output EOS
+                 * as top-1 in F32 precision. Suppressing EOS alone picks Ġ(space)
+                 * which leads to "10." loops. Also suppress Ġ and <|/det|>
+                 * so the model picks a meaningful content/detection token. */
+                if (cfg->model_version == 3 && first_token == 1) { /* EOS */
+                    /* V3 model in F32 precision outputs EOS as first token.
+                     * Ban EOS + Ġ to avoid "10." loops. The model then picks
+                     * a content token (e.g., ĠThe) which may produce a short
+                     * hallucination prefix before actual OCR content. */
+                    logits[1] = -1e30f;   /* Ban EOS */
+                    logits[223] = -1e30f;  /* Ban Ġ (space prefix → "10." loops) */
+                    best_val = -1e30f; best_id = 0;
+                    for (int i = 0; i < vocab; i++) {
+                        if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
+                    }
+                    first_token = best_id;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "V3: EOS+Ġ suppressed, first_token=%d (%.2f)\n",
+                                first_token, best_val);
+                }
+                if (ds_verbose >= 1) {
+                    /* Print top-5 prefill logits */
+                    int top_ids[5]; float top_vals[5];
+                    for (int i = 0; i < 5; i++) { top_ids[i] = -1; top_vals[i] = -1e30f; }
+                    for (int i = 0; i < vocab; i++) {
+                        for (int j = 0; j < 5; j++) {
+                            if (logits[i] > top_vals[j]) {
+                                for (int k = 4; k > j; k--) { top_vals[k] = top_vals[k-1]; top_ids[k] = top_ids[k-1]; }
+                                top_vals[j] = logits[i]; top_ids[j] = i; break;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "Prefill top5: [%d:%.2f, %d:%.2f, %d:%.2f, %d:%.2f, %d:%.2f]\n",
+                            top_ids[0], top_vals[0], top_ids[1], top_vals[1],
+                            top_ids[2], top_vals[2], top_ids[3], top_vals[3],
+                            top_ids[4], top_vals[4]);
+                }
             }
         }
     } else {
@@ -2187,8 +2226,11 @@ prompt_construction:
              * replaced with newline and generation continues. */
             if (step < ctx->min_new_tokens && ctx->dec_logits) {
                 float *logits = ctx->dec_logits;
-                /* Ban EOS token and find next best */
+                /* Ban EOS and Ġ during warmup. V3 model tends to oscillate
+                 * between EOS and Ġ (space prefix), producing "10." loops.
+                 * Banning both forces the model to pick meaningful content tokens. */
                 logits[eos_token] = -1e30f;
+                if (cfg->model_version == 3) logits[223] = -1e30f; /* Ban Ġ for V3 */
                 int best_id = 0;
                 float best_val = logits[0];
                 for (int i = 1; i < cfg->vocab_size; i++) {
@@ -2295,6 +2337,31 @@ prompt_construction:
      * This removes bounding box coordinates while keeping the descriptive text. */
     if (output && out_len > 0 && cfg->model_version == 3) {
         out_len = ds_strip_det_tags(output, out_len);
+        /* V3 hallucination prefix removal: when the model's first token
+         * is forced past EOS, it may generate a short English hallucination
+         * before the actual OCR content. Common pattern:
+         * "The image contains no text... [No text detected]\n<actual OCR>"
+         * Strip everything up to and including "[No text detected]" marker.
+         * Only strip if the marker appears early (within first 200 chars). */
+        if (out_len > 20) {
+            const char *marker = "[No text detected]";
+            int mlen = 18;
+            /* Search for marker in first 400 chars */
+            int search_len = out_len < 400 ? out_len : 400;
+            for (int i = 0; i + mlen <= search_len; i++) {
+                if (memcmp(output + i, marker, mlen) == 0) {
+                    int skip = i + mlen;
+                    /* Skip whitespace/newlines after marker */
+                    while (skip < out_len && (output[skip] == '\n' || output[skip] == ' '))
+                        skip++;
+                    if (skip < out_len) {
+                        memmove(output, output + skip, out_len - skip + 1);
+                        out_len -= skip;
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     return output;
