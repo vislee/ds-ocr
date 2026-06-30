@@ -4,10 +4,11 @@
 
 A pure C inference implementation of [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR) and [Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR), following the architecture patterns of [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
 
-- **3 model variants** — DeepSeek-OCR V1, V2, and Unlimited-OCR (V3)
+- **3 model variants** — DeepSeek-OCR V1, V2 (DeepEncoder + multi-crop), and Unlimited-OCR V3 (R-SWA)
 - **Zero external dependencies** — only BLAS (Accelerate/OpenBLAS) + stb_image.h
 - **Zero-copy weight loading** — mmap BF16 safetensors, on-the-fly F32 conversion
 - **Platform-optimized kernels** — NEON / AVX2 / AVX-512 / scalar auto-dispatch
+- **Metal GPU acceleration** — MoE decode on Apple GPU (single command buffer batching)
 
 ## Quick Start
 
@@ -16,80 +17,75 @@ A pure C inference implementation of [DeepSeek-OCR](https://github.com/deepseek-
 #    v1 = DeepSeek-OCR, v2 = DeepSeek-OCR-2 (recommended), v3 = Unlimited-OCR
 ./download_model.sh v2 ./models/DeepSeek-OCR-2
 
-# 2. Build (macOS defaults to Accelerate BLAS)
+# 2. Build (macOS defaults to Accelerate BLAS + Metal GPU)
 make blas
 
 # 3. Run OCR
 ./ds_ocr -d ./models/DeepSeek-OCR-2 -i document.png --rp 1.03
 ```
 
-> Linux: `make blas` auto-detects OpenBLAS. See [Building](#building) for cross-compilation.
+> Linux: `make blas` auto-detects OpenBLAS. See [Building](#building) for details.
 
 ## Model Comparison
 
-| | DeepSeek-OCR V1 | DeepSeek-OCR V2 | Unlimited-OCR V3 |
+| | DeepSeek-OCR V1 | DeepSeek-OCR V2 ⭐ | Unlimited-OCR V3 |
 |---|---|---|---|
 | **HuggingFace ID** | `deepseek-ai/DeepSeek-OCR` | `deepseek-ai/DeepSeek-OCR-2` | `baidu/Unlimited-OCR` |
 | **Encoder** | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 + R-SWA |
 | **Decoder** | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA |
-| **Input** | 1024×1024 (stretch) | Dynamic multi-crop | 640×640 (pad) |
-| **Visual tokens** | 256 | 857 (6-crop) | 273 |
+| **Input** | 1024×1024 (stretch) | Dynamic multi-crop | 640×640 (pad) + multi-crop |
+| **Visual tokens** | 256 | 857 (6-crop) | 273 ~ 3323 (1~30 crops) |
 | **Prompt** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
-| **C support** | ✅ Full | ✅ Full | ✅ Full + EOS fix |
 | **Model size** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
-### Benchmark (Apple M4 Max, 1794×1578 test image, CPU BLAS)
+### Benchmark (Apple M4 Max, 1794×1578 test image, BLAS + Metal GPU)
 
-| Metric | V1 | V3 (Unlimited-OCR) |
-|--------|----|---------------------|
-| **Total time** | 11.6s | 76.4s (30 crops) |
-| **Encoding** | 6.0s | 42.6s (30 crops × SAM+CLIP) |
-| **Prefill** | 0.7s (286 tokens) | 3.9s (3328 tokens) |
-| **Decode** | 5.0s (233 tokens) | 30.0s (499 tokens) |
-| **Decode speed** | 47.0 tok/s | 16.6 tok/s |
-| **Output quality** | ⚠️ Minor typos | ✅ Correct (det tags stripped) |
+| Metric | V1 | V2 ⭐ | V3 |
+|--------|----|----|-----|
+| **Total time** | 14.3s | 15.6s | 77.0s (30 crops) |
+| **Encoding** | 6.1s | 9.5s | 42.8s (30 crops × SAM+CLIP) |
+| **Prefill** | 3.0s (286 tok) | 3.3s (1162 tok) | 4.1s (3323 tok) |
+| **Decode** | 5.2s (238 tok) | 2.8s (112 tok) | 30.1s (499 tok) |
+| **Decode speed** | 45.9 tok/s | 40.3 tok/s | 16.6 tok/s |
+| **Output quality** | ✅ Complete | ✅ Correct | ✅ Detailed (det tags stripped) |
 
-> V1 is faster but has minor precision-induced typos (e.g. "raletimit" vs "ratelimit").
-> V3 produces more accurate and detailed output, but is significantly slower for large
-> images due to sequential crop encoding (30 crops × SAM+CLIP) and MHA attention
-> (instead of V1's MLA). V3's decode speed is ~3× slower than V1 due to LlamaAttention
-> (10 heads × 128 dim) vs DeepSeek-V2 MLA compression.
->
-> For small images (≤640px), V3 matches V1 decode speed at ~47 tok/s.
+### Small Image (≤640px, 1-crop)
+
+| Metric | V1 | V2 | V3 |
+|--------|----|----|-----|
+| **Total time** | 6.9s | 8.6s | 9.6s |
+| **Decode speed** | 43.7 tok/s | 45.4 tok/s | 47.4 tok/s |
+
+> **Recommendation**: V2 is the best all-round choice — multi-crop handles any image size,
+> DeepEncoder V2 produces the most accurate encoder output.
+> V1 is faster but stretches images to 1024×1024 (aspect distortion) and has minor precision typos.
+> V3 supports language detection and detailed document parsing but is significantly slower for large
+> images due to sequential 30-crop encoding and MHA attention (vs V2's MLA).
 
 ## Performance
 
-Apple M2 Pro (8 threads, BLAS), 6-crop V2 image:
+### Optimization History (Apple M2 Pro, 8 threads, BLAS, 6-crop V2 image)
 
-| Stage | v0.5 | v0.8 | v0.9 | Optimization |
+| Stage | v0.5 | v0.8 | v1.0 | Optimization |
 |-------|------|------|------|-------------|
-| SAM+Encoder | ~50s | **8.8s** | **8.8s** | Parallel global crop |
-| Prefill (~660 tokens) | ~30s | **1.1s** | **0.93s** | Batched MoE sgemm |
-| Decode (226 tokens) | ~19s | **6.2s** | **5.1s** | Argmax LM head + contiguous experts |
+| SAM+Encoder | ~50s | **8.8s** | **9.0s** | Parallel global crop |
+| Prefill (~660 tok) | ~30s | **1.1s** | **0.93s** | Batched MoE sgemm |
+| Decode (226 tok) | ~19s | **6.2s** | **5.1s** | Argmax LM head + contiguous experts |
 | **Total** | **~97s** | **16s** | **15.0s** | |
 
-Key optimizations in v0.9:
-- **Argmax LM head**: Uses `ds_argmax_matvec_bf16` instead of full sgemm for
-  greedy decoding — avoids 631MB BF16→F32 weight conversion, computes dot
-  products on-the-fly while tracking only the best token (~8ms vs ~60ms/step).
-- **Selective repetition penalty**: Only recomputes logits for history tokens
-  (~100) via `ds_bf16_dot_row`, not all 129280 vocabulary entries.
-- **Contiguous expert blocks (P2)**: All 64 experts' gate_up_fused + shared
-  weights in a single contiguous allocation per layer — adjacent experts share
-  pages, reducing page faults 2.4× during MoE decode (~351ms → ~121ms/step).
-- **madvise prefetch**: Issues `MADV_WILLNEED` for upcoming expert weights,
-  further reducing page fault stalls from random expert address jumps.
-- **Fused expert forward**: `ds_expert_forward_fused()` combines gate+up
-  projection into a single matvec, improving L2 cache reuse of the input vector.
-- **8-thread decode**: All cores used for decode (argmax LM head benefits from
-  8T; small expert matvecs are marginally slower but overall faster).
+**v1.0 = 8× v0.5 = 61× Python PyTorch (CPU BF16 ~736s)**
 
-**v0.9 = 8× v0.5 = 61× Python PyTorch (CPU BF16 ~736s)**
+### Key Optimizations
+
+- **Argmax LM head**: `ds_argmax_matvec_bf16` replaces full sgemm for greedy decode — computes dot products on-the-fly while tracking only the best token (~8ms vs ~60ms/step), avoiding 631MB BF16→F32 weight conversion.
+- **Contiguous expert blocks**: All 64 experts' gate_up_fused + shared weights in a single contiguous allocation per layer — adjacent experts share pages, reducing page faults 2.4×.
+- **Fused expert forward**: `ds_expert_forward_fused()` combines gate+up projection into a single matvec, improving L2 cache reuse.
+- **Metal GPU MoE**: Single command buffer batching for Apple GPU — gate_up + SwiGLU + down + expert combine in one dispatch.
+- **BPE tokenizer fix**: Correct merge loading from tokenizer.json (nested array format + strdup key copy + safe JSON skip), fixing V2's degenerate "4.4.4." output.
 
 ### INT8 Quantization (`--int4`)
 
-Per-row asymmetric INT8 quantization for MoE expert weights, reducing memory
-bandwidth ~2× while maintaining OCR accuracy (RMS < 0.01 vs BF16).
+Per-row asymmetric INT8 quantization for MoE expert weights, reducing memory bandwidth ~2× while maintaining OCR accuracy (RMS < 0.01 vs BF16).
 
 | | BF16 | INT8 (`--int4`) |
 |---|---|---|
@@ -98,14 +94,12 @@ bandwidth ~2× while maintaining OCR accuracy (RMS < 0.01 vs BF16).
 | **OCR accuracy** | ✅ Reference | ✅ Matches BF16 |
 
 ```bash
-# INT8 quantization is applied at load time (~3s one-time cost)
 ./ds_ocr -d ./models/DeepSeek-OCR-2 -i doc.png --rp 1.03 --int4
 ```
 
-> **Note**: On Apple Silicon (M2+), hardware BF16 dot-product instructions are
-> faster than software INT8 dequantize+MLA for single-token decode. INT8
-> benefits memory-constrained devices and x86 platforms without BF16 hardware.
-> Quantization overhead is ~3s at model load; inference decode speed is similar.
+> **Note**: On Apple Silicon (M2+), hardware BF16 dot-product instructions are faster than
+> software INT8 dequantize+MLA for single-token decode. INT8 benefits memory-constrained
+> devices and x86 platforms without BF16 hardware.
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
@@ -116,7 +110,7 @@ Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
 ## Architecture
 
 ```
-  DeepSeek-OCR V1          DeepSeek-OCR V2          Unlimited-OCR (V3)
+  DeepSeek-OCR V1          DeepSeek-OCR V2 ⭐       Unlimited-OCR (V3)
   ─────────────────         ─────────────────         ─────────────────
   Image (1024×1024)         Any Image                 Image (640×640 padded)
        │                         │                          │
@@ -129,7 +123,7 @@ Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
   │  CLIP   │ ← SAM feat  │ SAM ×(N+1)│               │ ViT-L/14│   (bypass Conv2d)
   │ ViT-L/14│              │local→896×12²              │ 24 blocks│
   │ 24 blocks│              │global→896×16²              └────┬────┘
-  └────┬────┘              └─────┬─────┘                     │
+  └────┬────┘              └─────┴─────┘                     │
        │                         │                           ▼
        ▼                         ▼                    Concat(SAM,CLIP)
   Concat(SAM,CLIP)         DeepEncoder V2             → 2048-dim
@@ -161,7 +155,7 @@ Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
 | SAM Vision Tokenizer | ViT-B | ViT-B | ViT-B | ~86M |
 | Encoder | CLIP ViT-L/14 | DeepEncoder V2 | CLIP ViT-L/14 (bypass Conv2d) | ~300M / ~500M / ~300M |
 | Projector | 2048→1280 | 896→1280 | 2048→1280 | ~2.6M / ~1.1M / ~2.6M |
-| MoE Decoder | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA | ~3B |
+| MoE Decoder | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA | ~3B (570M active) |
 
 ### Key Architecture Details
 
@@ -248,7 +242,7 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 # DeepSeek-OCR V2 (recommended)
 ./ds_ocr -d ./models/DeepSeek-OCR-2 -i document.png --rp 1.03
 
-# Unlimited-OCR V3
+# Unlimited-OCR V3 (document parsing + language detection)
 ./ds_ocr -d ./models/Unlimited-OCR -i document.png
 
 # DeepSeek-OCR V1
@@ -276,11 +270,11 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | `--temp <f>` | Sampling temperature | 0 (greedy) |
 | `--rp <f>` | Repetition penalty (1.0=off, rec 1.01-1.1) | 1.0 |
 | `--ngram <n>` | No-repeat n-gram (0=off, rec 20-35) | 0 |
-| `--min-tokens <n>` | Min generated tokens (prevent early EOS) | 32 (V3: 32) |
+| `--min-tokens <n>` | Min generated tokens (prevent early EOS) | 32 |
+| `--int4` | INT8 quantize MoE expert weights (2× less memory) | Off |
 | `--vision` | macOS Vision OCR backend | Off |
 | `--vision-fast` | macOS Vision OCR backend (fast) | Off |
 | `--profile` | Per-stage timing | Off |
-| `--int4` | INT8 quantize MoE expert weights (2× less memory) | Off |
 | `--debug` | Verbose debug output | Off |
 | `--silent` | OCR text output only | Off |
 
@@ -288,7 +282,7 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 
 | Model | `--rp` | `--ngram` | Notes |
 |-------|--------|-----------|-------|
-| V2 | 1.03 | 0 | Best quality, fast |
+| V2 ⭐ | 1.03 | 0 | Best quality, fast |
 | V3 | 1.01 | 35 | ngram required to prevent repetition |
 | V1 | 1.03 | 0 | Minor precision-induced typos |
 
@@ -335,26 +329,28 @@ ds-ocr/
 ├── ds_visual_tokenizer.h/c    # SAM ViT-B (window attn, rel pos, neck, downsample)
 ├── ds_deep_encoder.h/c        # CLIP ViT-L/14 (V1/V3) + DeepEncoder V2 (Qwen2-0.5B)
 ├── ds_moe_decoder.h/c         # MoE decoder (dense L0 + MoE L1-11 + R-SWA V3)
-├── ds_kernels.h/c              # Math kernel API + thread pool + dispatch
-├── ds_kernels_impl.h           # Architecture dispatch macros (NEON/AVX/generic)
-├── ds_kernels_generic.c        # Scalar fallback
-├── ds_kernels_neon.c           # ARM NEON optimizations (incl. BF16 dot product)
-├── ds_kernels_avx.c            # x86 AVX2/AVX-512 optimizations
-├── ds_safetensors.h/c          # Multi-shard safetensors reader (BF16 + FP32)
-├── ds_image.h/c                # Image loading + preprocessing (stb_image + bicubic resize)
-├── ds_tokenizer.h/c            # BPE tokenizer (GPT-2 byte-level + DeepSeek ▁format)
-├── ds_platform_ocr.h/c/m       # macOS Vision OCR bridge (.m=ObjC, .c=Linux stub)
-├── ds_dump.h                    # Debug tensor dump utilities
-├── main.c                       # CLI entry point
-├── test.c                       # Test suite
-├── stb_image.h                  # Single-header image loader (public domain)
-├── Makefile                     # Build system
-├── download_model.sh            # Model download script (v1/v2/v3/all)
-├── README.md                    # This file (English)
-└── README_zh.md                 # Chinese documentation
+├── ds_kernels.h/c             # Math kernel API + thread pool + dispatch
+├── ds_kernels_impl.h          # Architecture dispatch macros (NEON/AVX/generic)
+├── ds_kernels_generic.c       # Scalar fallback
+├── ds_kernels_neon.c          # ARM NEON optimizations (incl. BF16 dot product)
+├── ds_kernels_avx.c           # x86 AVX2/AVX-512 optimizations
+├── ds_safetensors.h/c         # Multi-shard safetensors reader (BF16 + FP32)
+├── ds_image.h/c               # Image loading + preprocessing (stb_image + bicubic resize)
+├── ds_tokenizer.h/c           # BPE tokenizer (GPT-2 byte-level + DeepSeek format)
+├── ds_quantize.h/c            # INT8 per-row quantization for MoE experts
+├── ds_metal.h                 # Metal GPU acceleration (Apple Silicon)
+├── ds_platform_ocr.h/c/m      # macOS Vision OCR bridge (.m=ObjC, .c=Linux stub)
+├── ds_dump.h                  # Debug tensor dump utilities
+├── main.c                     # CLI entry point
+├── test.c                     # Test suite
+├── stb_image.h                # Single-header image loader (public domain)
+├── Makefile                   # Build system
+├── download_model.sh          # Model download script (v1/v2/v3/all)
+├── README.md                  # This file (English)
+└── README_zh.md               # Chinese documentation
 ```
 
-**Code size**: ~13K lines of custom code (excluding stb_image.h), compiled binary ~331KB.
+**Code size**: ~15K lines of custom code (excluding stb_image.h), compiled binary ~400KB.
 
 ## Testing
 
@@ -404,23 +400,10 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 | **x86 (Intel/AMD)** | AVX2+FMA / AVX-512 | BF16→F32, RMSNorm, matmul, SwiGLU |
 | **Other** | Generic (scalar) | Portable C fallback |
 
-## Status
+## Version History
 
-| Component | V1 | V2 | V3 |
-|-----------|----|----|----|
-| SAM Vision Tokenizer | ✅ | ✅ | ✅ |
-| Encoder (CLIP/DeepEnc) | ✅ | ✅ | ✅ |
-| Projector | ✅ | ✅ | ✅ |
-| MoE Decoder | ✅ | ✅ | ✅ |
-| R-SWA Decode Attention | N/A | N/A | ✅ |
-| Tokenizer | ✅ | ✅ | ✅ |
-| Multi-crop | N/A | ✅ | ✅ (single crop) |
-| End-to-end OCR | ⚠️ | ✅ | ✅ |
-
-### Version History
-
-- **v0.10** — INT8 per-row MoE expert quantization (`--int4`, RMS<0.01), platform auto-detect (M1/M2+/x86)
-- **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), tokenizer.json fallback, download_model.sh v1/v2/v3
+- **v1.0** — BPE tokenizer merge loading fix (3 bugs: JSON skip, nested array format, strdup key copy), V2 output quality fix, Metal GPU MoE batching, INT8 quantization (`--int4`)
+- **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), V3 multi-crop, tokenizer.json fallback, download_model.sh v1/v2/v3
 - **v0.8** — Batched MoE prefill + parallel encoding: 16s end-to-end (6× v0.5)
 - **v0.7** — F32 KV cache + fused residual+norm + direct SwiGLU + batched decode
 - **v0.6** — sgemm LM head + BF16 KV cache + fused decode attention + fast exp
@@ -428,10 +411,10 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 
 ### Known Issues
 
-1. **V1 CLIP encoder**: V1 and V3 share the same CLIP architecture (bypass Conv2d, receive SAM features directly). V1 output has minor BF16 precision-induced typos (e.g. "raletimit" vs "ratelimit") — within normal precision range.
-2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing. The 830 added_tokens (including `<|det|>`, `<|ref|>`, `<|grounding|>`, `<td>`, `<tr>`, etc.) are now correctly loaded from `tokenizer.json` with vocab expansion beyond 128K.
-3. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
-4. **Independent lm_head weights**: `lm_head.weight` ≠ `embed_tokens.weight`; C correctly loads the independent weights.
+1. **V1 precision**: V1 output has minor BF16 precision-induced typos (e.g. "raletimit" vs "ratelimit") — within normal precision range for F32 accumulation through 36 encoder layers.
+2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing.
+3. **V2 EOS timing**: V2 may stop earlier than V1 for some images (fewer output tokens). This is an encoder-level difference, not a decoding issue.
+4. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
 
 ## Differences from Python Implementation
 
