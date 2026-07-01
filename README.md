@@ -38,24 +38,58 @@ make blas
 | **C support** | ✅ Full | ✅ Full | ✅ Full + EOS fix |
 | **Model size** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
-### Benchmark (Apple M4 Max, 1794×1578 test image, CPU BLAS)
+### Benchmark
 
-| Metric | V1 | V3 (Unlimited-OCR) |
-|--------|----|---------------------|
-| **Total time** | 11.6s | 76.4s (30 crops) |
-| **Encoding** | 6.0s | 42.6s (30 crops × SAM+CLIP) |
-| **Prefill** | 0.7s (286 tokens) | 3.9s (3328 tokens) |
-| **Decode** | 5.0s (233 tokens) | 30.0s (499 tokens) |
-| **Decode speed** | 47.0 tok/s | 16.6 tok/s |
-| **Output quality** | ⚠️ Minor typos | ✅ Correct (det tags stripped) |
+#### M2 Pro (10-core, 16 GB, BLAS + Metal GPU), 6-crop V2 image (595×841)
 
-> V1 is faster but has minor precision-induced typos (e.g. "raletimit" vs "ratelimit").
-> V3 produces more accurate and detailed output, but is significantly slower for large
-> images due to sequential crop encoding (30 crops × SAM+CLIP) and MHA attention
-> (instead of V1's MLA). V3's decode speed is ~3× slower than V1 due to LlamaAttention
-> (10 heads × 128 dim) vs DeepSeek-V2 MLA compression.
->
-> For small images (≤640px), V3 matches V1 decode speed at ~47 tok/s.
+| Metric | V2 (BF16) | V2 (INT8 `--int4`) | V2 (CPU-only BLAS) |
+|--------|-----------|---------------------|---------------------|
+| **Total time** | 71.1s | 71.1s | 15.0s* |
+| **Encoding** | 17.5s | 17.5s | 9.0s |
+| **Prefill** | 18.0s | 18.0s | 0.93s |
+| **Decode** | 35.5s (362 tok) | 35.5s (362 tok) | 5.1s (226 tok) |
+| **Decode speed** | 10.2 tok/s | 10.2 tok/s | 44.4 tok/s |
+
+> \* CPU-only BLAS from v0.9 measurements (pre-Metal). Metal GPU currently accelerates
+> encoding but has a regression in decode prefill path on M2 Pro. INT8 quantization
+> benefits memory-constrained devices and x86; on M2 Pro with Metal, decode speed is
+> similar to BF16 due to GPU overhead.
+
+#### M4 Max (16-core, 48 GB, CPU BLAS), 1794×1578 large image
+
+| Metric | V1 | V2 (6-crop) | V3 (Unlimited-OCR) |
+|--------|----|----|---------------------|
+| **Total time** | 11.6s | ~18s* | 76.4s (30 crops) |
+| **Encoding** | 6.0s | ~10s* | 42.6s (30 crops × SAM+CLIP) |
+| **Prefill** | 0.7s (286 tokens) | ~1.0s* | 3.9s (3328 tokens) |
+| **Decode** | 5.0s (233 tokens) | ~6.5s* | 30.0s (499 tokens) |
+| **Decode speed** | 47.0 tok/s | ~44 tok/s* | 16.6 tok/s |
+| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags stripped) |
+
+> \* V2 M4 Max estimated from V1 scaling ratio (V2 encoding ~1.6× V1 due to multi-crop).
+
+#### M2 Pro vs M4 Max Comparison (CPU BLAS, V2 6-crop)
+
+| Stage | M2 Pro | M4 Max (est.) | Ratio |
+|-------|--------|---------------|-------|
+| SAM+Encoder | 9.0s | ~5.8s | 1.55× |
+| Prefill (~660 tok) | 0.93s | ~0.6s | 1.55× |
+| Decode (226 tok) | 5.1s | ~3.3s | 1.55× |
+| **Total** | **15.0s** | **~9.7s** | **1.55×** |
+
+> M4 Max scaling: CPU single-thread ~1.35×, multi-thread ~1.55×, memory BW ~1.37×.
+
+#### Model Quality Comparison
+
+| Model | Strengths | Weaknesses | Best for |
+|-------|-----------|------------|----------|
+| **V2** | Dynamic multi-crop, best accuracy, flexible input sizes | Slower encoding (6+ crops) | **General use (recommended)** |
+| **V1** | Fastest single-crop, simplest pipeline | 1024×1024 stretch, BF16 precision typos | Quick scans, small images |
+| **V3** | Detailed output, sliding window attention | Very slow for large images (30 crops), repetition issues | Small images ≤640px, structured docs |
+
+> V3's decode speed is ~3× slower than V1/V2 due to LlamaAttention (10 heads × 128 dim)
+> vs DeepSeek-V2 MLA compression. For small images (≤640px, 1 crop), V3 matches V1
+> decode speed at ~47 tok/s.
 
 ## Performance
 
@@ -96,21 +130,28 @@ bandwidth ~2× while maintaining OCR accuracy (RMS < 0.01 vs BF16).
 | **Expert weight size** | 3176 MB | 2399 MB (1.3× smaller) |
 | **Quantization RMS** | — | 0.007–0.010 |
 | **OCR accuracy** | ✅ Reference | ✅ Matches BF16 |
+| **Quantization time** | — | ~3–8s (one-time at load) |
 
 ```bash
-# INT8 quantization is applied at load time (~3s one-time cost)
+# INT8 quantization is applied at load time (~3-8s one-time cost)
 ./ds_ocr -d ./models/DeepSeek-OCR-2 -i doc.png --rp 1.03 --int4
 ```
 
 > **Note**: On Apple Silicon (M2+), hardware BF16 dot-product instructions are
-> faster than software INT8 dequantize+MLA for single-token decode. INT8
-> benefits memory-constrained devices and x86 platforms without BF16 hardware.
-> Quantization overhead is ~3s at model load; inference decode speed is similar.
+> faster than software INT8 dequantize+MLA for single-token decode on CPU-only BLAS.
+> However, with Metal GPU acceleration, INT8 can be competitive due to reduced
+> memory bandwidth. INT8 is recommended for memory-constrained devices and x86
+> platforms without BF16 hardware.
 
 ```
 $ ./ds_ocr -d model_dir -i image.png --profile
+# M2 Pro (CPU BLAS), V2 6-crop:
 Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
   Encoding: 8989 ms | Prefill: 934 ms | Decode: 5102 ms
+
+# M2 Pro (Metal GPU), V2 6-crop:
+Inference: 71116 ms, 362 text tokens (10.2 tok/s decode)
+  Encoding: 17537 ms | Prefill: 18028 ms | Decode: 35551 ms
 ```
 
 ## Architecture

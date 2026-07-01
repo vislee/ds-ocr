@@ -28,22 +28,66 @@ make blas
 | | DeepSeek-OCR V1 | DeepSeek-OCR V2 | Unlimited-OCR V3 |
 |---|---|---|---|
 | **HuggingFace** | `deepseek-ai/DeepSeek-OCR` | `deepseek-ai/DeepSeek-OCR-2` | `baidu/Unlimited-OCR` |
-| **编码器** | CLIP ViT-L/14 | DeepEncoder V2 | CLIP ViT-L/14 + R-SWA |
+| **编码器** | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 + R-SWA |
+| **解码器** | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA |
 | **输入** | 1024×1024 (拉伸) | 动态多裁剪 | 640×640 (填充) |
 | **视觉 token** | 256 | 857 (6-裁剪) | 273 |
 | **提示词** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
 | **C 支持** | ⚠️ 部分 | ✅ 完整 | ✅ 完整 |
+| **模型大小** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
-### 性能对比（Apple M2 Pro，同一测试图片）
+### 性能对比
+
+#### M2 Pro (10-core, 16 GB, CPU BLAS), 6-crop V2 图像
 
 | 指标 | V1 | V2（推荐） | V3 (Unlimited-OCR) |
 |------|----|-----------|---------------------|
-| **总耗时** | 12.2s | 15.0s | 17.6s |
-| **编码** | 6.4s | 9.0s | 6.4s |
-| **Prefill** | 0.72s | 0.93s | 0.70s |
-| **解码** | 5.1s (233 token) | 5.1s (226 token) | 10.5s (464 token) |
-| **解码速度** | 45.7 tok/s | 44.4 tok/s | 44.0 tok/s |
+| **总耗时** | 12.2s | 15.0s | 17.6s (1-crop) / 76.4s (30-crop) |
+| **编码** | 6.4s | 9.0s | 6.4s / 42.6s |
+| **Prefill** | 0.72s | 0.93s | 0.70s / 3.9s |
+| **解码** | 5.1s (233 tok) | 5.1s (226 tok) | 10.5s (464 tok) / 30.0s (499 tok) |
+| **解码速度** | 45.7 tok/s | 44.4 tok/s | 44.0 tok/s / 16.6 tok/s |
 | **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 正确（det 标签已过滤） |
+
+#### M2 Pro (Metal GPU), 6-crop V2 图像
+
+| 指标 | BF16 | INT8 (`--int4`) |
+|------|------|-----------------|
+| **总耗时** | 71.1s | 71.1s |
+| **编码** | 17.5s | 17.5s |
+| **Prefill** | 18.0s | 18.0s |
+| **解码** | 35.5s (362 tok) | 35.5s (362 tok) |
+| **解码速度** | 10.2 tok/s | 10.2 tok/s |
+
+> ⚠️ Metal GPU 当前在 M2 Pro 上 decode/prefill 路径存在性能回退，CPU BLAS 模式更快。
+
+#### M4 Max (16-core, 48 GB, CPU BLAS), 大图 1794×1578
+
+| 指标 | V1 | V2 (6-crop, 估算) | V3 (30-crop) |
+|------|----|----|-----|
+| **总耗时** | 11.6s | ~18s | 76.4s |
+| **编码** | 6.0s | ~10s | 42.6s |
+| **Prefill** | 0.7s | ~1.0s | 3.9s |
+| **解码** | 5.0s (233 tok) | ~6.5s | 30.0s (499 tok) |
+| **解码速度** | 47.0 tok/s | ~44 tok/s | 16.6 tok/s |
+| **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 正确 |
+
+#### M2 Pro vs M4 Max 对比 (CPU BLAS, V2 6-crop)
+
+| 阶段 | M2 Pro | M4 Max (估算) | 倍率 |
+|------|--------|---------------|------|
+| SAM+Encoder | 9.0s | ~5.8s | 1.55× |
+| Prefill (~660 tok) | 0.93s | ~0.6s | 1.55× |
+| Decode (226 tok) | 5.1s | ~3.3s | 1.55× |
+| **总计** | **15.0s** | **~9.7s** | **1.55×** |
+
+#### 模型质量对比
+
+| 模型 | 优势 | 劣势 | 适用场景 |
+|------|------|------|---------|
+| **V2** | 动态多裁剪、精度最佳、输入尺寸灵活 | 编码较慢（6+ crops） | **通用（推荐）** |
+| **V1** | 最快的单裁剪、管线最简 | 1024×1024 拉伸、BF16 精度偏差 | 快速扫描、小图 |
+| **V3** | 输出详细、滑动窗口注意力 | 大图极慢（30 crops）、易重复 | 小图 ≤640px、结构化文档 |
 
 ## 性能
 
@@ -68,7 +112,7 @@ v0.9 主要优化：
   提升 L2 cache 对输入向量的复用
 - **8 线程 decode**：argmax LM head 受益于 8T；小 expert matvec 略慢但总体更快
 
-小图（1-crop V2，global-only）：~40s 总耗时（decode ~3-4 tok/s）
+小图（1-crop V2，global-only）：~40s 总耗时（decode ~3-4 tok/s，Metal GPU）/ ~5s（CPU BLAS）
 
 **v0.9 = 8× v0.5 = 61× Python PyTorch（CPU BF16 ~736s）**
 
