@@ -97,8 +97,19 @@ endif
 # The ds_metal.m wrapper will compile from .metal source at runtime if
 # precompiled metallib is not available.
 ifeq ($(UNAME_S),Darwin)
+# Metal shader version: auto-detect macOS for max compatibility
+# metal3.1 requires macOS 14+, metal3.0 works on macOS 13+
+MACOS_MAJOR := $(shell sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+ifeq ($(MACOS_MAJOR),)
+  METAL_STD_VAL = metal3.0
+else ifeq ($(shell test $(MACOS_MAJOR) -ge 14 && echo yes),yes)
+  METAL_STD_VAL = metal3.1
+else
+  METAL_STD_VAL = metal3.0
+endif
+
 ds_metal_shaders.metallib: ds_metal_shaders.metal
-	-xcrun -sdk macosx metal -std=metal3.1 -c $< -o $(@:.metallib=.air) 2>/dev/null && \
+	-xcrun -sdk macosx metal -std=$(METAL_STD_VAL) -c $< -o $(@:.metallib=.air) 2>/dev/null && \
 	xcrun -sdk macosx metallib $(@:.metallib=.air) -o $@ && \
 	rm -f $(@:.metallib=.air) || \
 	(echo "Note: Metal shader precompilation skipped (will compile at runtime)" && rm -f $(@:.metallib=.air))
