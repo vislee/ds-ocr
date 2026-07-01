@@ -150,31 +150,30 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
          *
          * Python's get_abs_pos: bicubic interpolation of spatial part to target size.
          * C implementation: for V3 with total_len=257, position_embedding[257][1024] matches exactly.
-         * For other sizes, we need to interpolate. */
-        if (total_len <= 257) {
-            /* Direct copy — positions 0..total_len-1 fit within stored embedding */
+         * For other sizes, we need to interpolate (both smaller and larger). */
+        int src_size = (int)sqrtf(256.0f);  /* 16x16 for original CLIP position embedding */
+        int tgt_size = (int)sqrtf((float)clip_n_patches);
+        if (tgt_size == src_size && total_len <= 257) {
+            /* Direct copy — no interpolation needed */
             for (int i = 0; i < total_len; i++) {
                 for (int d = 0; d < clip_dim; d++) {
                     x[i * clip_dim + d] += clip->position_embedding[i * clip_dim + d];
                 }
             }
         } else {
-            /* Need bicubic interpolation for larger sizes.
+            /* Need bicubic interpolation (tgt_size != src_size).
              * This follows Python's get_abs_pos:
              * 1. Split CLS and spatial part
              * 2. Reshape spatial to [1, dim, src_h, src_w]
              * 3. Bicubic interpolate to [1, dim, tgt_h, tgt_w]
              * 4. Reshape back and concatenate with CLS */
-            int src_size = (int)sqrtf(256.0f);  /* 16x16 for original CLIP */
-            int tgt_size = (int)sqrtf((float)clip_n_patches);
 
             /* Interpolate spatial part: position_embedding[1:257] = [256, 1024] */
             float *spatial_pos = (float *)malloc(256 * clip_dim * sizeof(float));
             memcpy(spatial_pos, clip->position_embedding + clip_dim, 256 * clip_dim * sizeof(float));
 
-            /* Reshape [256, 1024] → [1024, 16, 16] (CHW), bicubic resize → [1024, tgt_h, tgt_w] */
+            /* Bilinear interpolation from [src_size, src_size] to [tgt_size, tgt_size] */
             float *resized_pos = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
-            /* Simple bilinear interpolation (approximate — for non-standard sizes only) */
             for (int d = 0; d < clip_dim; d++) {
                 for (int th = 0; th < tgt_size; th++) {
                     for (int tw = 0; tw < tgt_size; tw++) {

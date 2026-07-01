@@ -1220,7 +1220,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         }
 
         if (use_crop && !pil_pixels) {
-            crops = ds_dynamic_preprocess(&img, 768, 1, 12, 0, &n_crops);
+            crops = ds_dynamic_preprocess(&img, 768, 2, 6, 0, &n_crops);
             if (!crops || n_crops < 1) {
                 fprintf(stderr, "dynamic_preprocess failed\n");
                 return NULL;
@@ -1490,26 +1490,33 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     } else if (cfg->model_version == 3 && cfg->enc_type == 1) {
         /* ── V3 (Unlimited-OCR) multi-crop path ──
          *
-         * Python logic:
-         *   1. Global: pad(1024) → SAM → CLIP → Projector → [256, 1280]
-         *      → view(16,16,dim), cat(newline per row) → [16,17,dim] → [272, 1280]
-         *   2. Local: dynamic_preprocess(640) → N crops, each → [100, 1280]
-         *      → view(crop_h, crop_w, 10, 10, dim).permute→reshape(h*10, w*10, dim)
-         *      → cat(newline per row) → [h*10, w*10+1, dim]
-         *   3. Concat: [local, global, view_seperator]
+         * Python logic (infer() default: base_size=1024, image_size=640):
+         *   Small image (≤640): pad(image_size=640) → SAM(100) → CLIP(100) → Proj(111)
+         *     tokenized_image = ([128815]*10+[128815])*10+[128815] = 111 tokens
+         *   Large image (>640):
+         *     Global: pad(base_size=1024) → SAM(256) → CLIP(256) → Proj(273)
+         *     Local: dynamic_preprocess(640) → N crops, each → SAM(100)→CLIP(100)→Proj(111)
+         *       strip newlines, reassemble grid, re-insert newlines
+         *     Concat: [local, global(272), view_seperator]
          *
-         * CLIP encoder returns tokens WITH newlines (273/111).
+         * CLIP encoder returns tokens WITH newlines (273 for 1024², 111 for 640²).
          * We strip newlines, then re-insert in correct grid layout.
          */
         ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
         int use_crop = (width > 640 || height > 640);
-        int ggrid = 16;  /* 1024/16/4 */
         int lgrid = 10;  /* 640/16/4 */
         float *nl = ctx->vis_tokenizer.image_newline;
         float *vsep = ctx->vis_tokenizer.view_seperator;
 
-        /* ── Global view ── */
-        ds_image_t *gimg = ds_image_pad(&img, 1024, 127);
+        /* ── Global view ──
+         * Python: small image → pad(image_size=640), large image → pad(base_size=1024)
+         * Small image: 640×640 → SAM 100 tokens → CLIP 111 tokens (10 rows × 11 + 1 view_sep)
+         * Large image: 1024×1024 → SAM 256 tokens → CLIP 273 tokens (16 rows × 17 + 1 view_sep)
+         */
+        int global_size = use_crop ? 1024 : 640;
+        int ggrid = global_size / 16 / 4;  /* 1024→16, 640→10 */
+
+        ds_image_t *gimg = ds_image_pad(&img, global_size, 127);
         if (!gimg) return NULL;
         int n_sg; float *sg = ds_sam_forward_image(ctx, gimg, &n_sg, NULL);
         ds_image_free(gimg);
@@ -1727,57 +1734,51 @@ prompt_construction:
         /* V2 prompt format matching Python model.infer() with sft_format='plain':
          * Python prompt = '<image>\nFree OCR. '
          * With multi-crop: encoder_output already contains [local, global, view_sep]
-         * C equivalent: [BOS] + encoder_output(n_encoder_tokens) + '\nFree OCR. '(5 tokens)
+         * C equivalent: [BOS] + image_tokens + '\nFree OCR.'(4 tokens)
          * Note: PLAIN template has no role tokens — roles=("", ""), sep=""
+         *
+         * Python's masked_scatter layout:
+         *   images_seq_mask True positions = [global(257), local(W*H*100)]
+         *     where global = num_queries_base^2 + 1 = 16*16+1 = 257
+         *     and local = (num_queries*W) * (num_queries*H) = 10*W * 10*H per crop
+         *   source = cat([local_features(N*144), global_features(256), view_sep(1)])
+         *   masked_scatter fills True positions IN ORDER from source[0].
+         *   So: global_slots[0:257] ← source[0:257] = local[0:257]
+         *       local_slots[0:M]   ← source[257:257+M] = local[257:] + global[0:...]
          */
-        /* Compute image_size=640 token layout (must match Python model.infer() default) */
         int ds_image_size = 640;
         int ds_num_queries = (ds_image_size + 15) / 16 / 4;  /* ceil(640/16/4) = 10 */
+        int ds_num_queries_base = (1024 + 15) / 16 / 4;      /* ceil(1024/16/4) = 16 */
         int ds_local_tokens_per_crop = ds_num_queries * ds_num_queries;  /* 100 */
-        int n_crops_count = (n_encoder_tokens - 257) / 144;  /* works for 1 or 6 crops */
-        if (n_crops_count < 0) n_crops_count = 0;  /* safety */
-        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;
-        int n_global_slots = 256;
-        int n_sep_slots = 1;
-        int n_img_tokens = n_global_slots + n_sep_slots + n_local_slots;
-        int n_local_enc = n_encoder_tokens - 257;
+        int n_local_enc = n_encoder_tokens - 257;  /* local features count */
         if (n_local_enc < 0) n_local_enc = 0;
+        int n_crops_count = n_local_enc / 144;
+        int n_global_slots = ds_num_queries_base * ds_num_queries_base + 1; /* 257: 256 global + 1 sep */
+        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;
+        int n_img_tokens = n_global_slots + n_local_slots;  /* total True positions */
 
         int n_text_after = 0;
         int *text_after_ids = NULL;
         if (tokenizer) {
-            /* Encode text after image using BPE tokenizer.
-             * Python format_messages strips each message's content and the final prompt,
-             * so "<image>\nFree OCR. " (with trailing space) becomes "<image>\nFree OCR."
-             * after strip(). Text after image = "\nFree OCR." (no trailing space).
-             * Expected: [201, 21431, 126041, 16] (4 tokens) */
             text_after_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR.", &n_text_after);
             if (!text_after_ids || n_text_after <= 0) {
-                /* Fallback: use verified hardcoded IDs if tokenizer fails */
                 static const int fallback_ids[] = {201, 21431, 126041, 16};
                 n_text_after = 4;
                 text_after_ids = (int *)malloc(n_text_after * sizeof(int));
                 memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
             }
             if (ds_verbose >= 1) {
-                fprintf(stderr, "Prompt: BOS + img(%d) + after(%d) = %d tokens\n",
-                        n_img_tokens, n_text_after, 1 + n_img_tokens + n_text_after);
+                fprintf(stderr, "V2 Prompt: BOS + img(%d = global%d + local%d) + after(%d) = %d\n",
+                        n_img_tokens, n_global_slots, n_local_slots, n_text_after,
+                        1 + n_img_tokens + n_text_after);
             }
         }
 
-        /* prefix = BOS(1) + image_tokens(n_img_tokens) + text_after(n_text_after)
-         * Note: n_img_tokens may differ from n_encoder_tokens when image_size=640
-         * because some encoder tokens are dropped by Python's masked_scatter. */
-        /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
-
         if (ds_verbose >= 1) {
-            fprintf(stderr, "Image size config: image_size=%d, num_queries=%d, "
-                   "local_tokens/crop=%d, crops=%d\n",
-                   ds_image_size, ds_num_queries, ds_local_tokens_per_crop, n_crops_count);
-            fprintf(stderr, "Token layout: %d image tokens from local_enc[0:%d] "
-                   "(encoder has %d local, dropping %d + global/sep dropped)\n",
-                   n_img_tokens, n_img_tokens,
-                   n_local_enc, n_local_enc - n_img_tokens);
+            fprintf(stderr, "V2 Layout: image_size=%d, num_queries=%d, "
+                   "local_tokens/crop=%d, crops=%d, local_enc=%d, n_enc=%d\n",
+                   ds_image_size, ds_num_queries, ds_local_tokens_per_crop,
+                   n_crops_count, n_local_enc, n_encoder_tokens);
         }
 
         prefix_len = 1 + n_img_tokens + n_text_after;
@@ -1800,27 +1801,17 @@ prompt_construction:
         /* 1. BOS token (id=0) */
         EMBED_TOKEN(DS_TOKEN_BOS);
 
-        /* 2. Encoder output tokens — layout must match Python model.forward() behavior.
+        /* 2. Image tokens — must match Python's masked_scatter layout.
          *
-         * Python constructs: source = cat([local_features(864), global_features(256), view_sep(1)])
-         *   → 1121 elements total (after projector, dim=1280)
+         * Python: images_seq_mask True positions = [global(257), local(n_local_slots)]
+         * Source = encoder_output = [local(n_local_enc), global(256), view_sep(1)]
+         * masked_scatter fills True positions sequentially from source:
+         *   global_slots (257 positions) ← source[0:min(257, n_local_enc)]
+         *   local_slots  (n_local_slots) ← source[257:257+n_local_slots] (may wrap into global/sep)
          *
-         * Then masked_scatter_(images_seq_mask, source) fills 857 True positions
-         * with source[0:857] = local_features[0:857].
-         *
-         * With image_size=640: num_queries=10, local_tokens_per_crop=100
-         * Image positions = 857 (from image_size*image_size/14/14 = 640*640/196 ≈ 2088?
-         *   No — it's image_size/16/4=10, so local_slots = 6*100=600, plus global=256 + sep=1 = 857)
-         * 
-         * Key insight: ALL 857 image positions are filled with local_enc[0:857].
-         * The global features and sep in the source are AFTER local[864], so they
-         * land at source[864:1121] which is BEYOND the 857 True positions — they're dropped.
-         * Local_enc[857:864] (7 tokens, last ~1.17 per crop) are also dropped.
-         *
-         * So C simply copies local_enc[0:857] into positions 1-857. */
-        /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
-
-        /* Debug: dump encoder_output for Python decoder comparison */
+         * We simulate this by iterating through True positions in order and
+         * copying from source in order.
+         */
         if (getenv("DS_DUMP_ENCODER")) {
             FILE *df = fopen("dump/c_encoder_output.bin", "wb");
             if (df) { fwrite(encoder_output, sizeof(float), n_encoder_tokens * hidden, df); fclose(df); }
@@ -1828,34 +1819,17 @@ prompt_construction:
                     n_encoder_tokens, hidden);
         }
 
-        /* Apply Python model's masked_scatter layout:
-         *
-         * Python constructs: tokenized_image = [global(256), sep(1), local(N)]
-         * These become True positions in images_seq_mask.
-         * Source for masked_scatter = cat([local_features, global_features, view_sep])
-         * So source = [local(n_local_enc), global(n_global_enc), sep(1)].
-         *
-         * masked_scatter fills True positions IN ORDER with source elements:
-         *   pos 0..255 (global slots)  <- source[0:256]  = local[0:256]
-         *   pos 256   (sep slot)       <- source[256]    = local[256]
-         *   pos 257..(n_img_tokens-1)  <- source[257:n_img_tokens]
-         *     = if n_img_tokens <= n_local_enc: local[257:n_img_tokens]
-         *     = if n_img_tokens >  n_local_enc: local[257:n_local_enc] + global[0:n_img_tokens-n_local_enc]
-         *
-         * Since encoder_output layout = [local, global, sep], we can simply copy
-         * encoder_output[0:n_img_tokens] which matches source[0:n_img_tokens]. */
-        float *enc = encoder_output;
-        int img_pos = pos;  /* starts at 1 (after BOS) */
-
-        /* Copy source[0:n_img_tokens] = enc[0:n_img_tokens] into image positions */
+        /* Simulate masked_scatter: fill n_img_tokens True positions from source in order.
+         * Source = enc = [local(n_local_enc), global(256), view_sep(1)].
+         * We copy source[0..n_img_tokens-1] into image_positions (1..n_img_tokens).
+         * Since image_positions in input_embeds are contiguous after BOS,
+         * this is just a contiguous copy of the first n_img_tokens source elements.
+         * Any source elements beyond n_img_tokens are dropped (masked_scatter truncation). */
         int n_copy = n_img_tokens < n_encoder_tokens ? n_img_tokens : n_encoder_tokens;
-        memcpy(input_embeds + img_pos * hidden, enc, n_copy * hidden * sizeof(float));
-        img_pos += n_copy;
-        /* If n_img_tokens > n_encoder_tokens (shouldn't happen),
-         * remaining positions stay zero. */
-        pos = img_pos;
+        memcpy(input_embeds + pos * hidden, encoder_output, n_copy * hidden * sizeof(float));
+        pos += n_img_tokens;
 
-        /* 3. Text after image: "\nFree OCR. " (5 tokens) */
+        /* 3. Text after image: "\nFree OCR." (4 tokens) */
         for (int t = 0; t < n_text_after; t++) EMBED_TOKEN(text_after_ids[t]);
 
         #undef EMBED_TOKEN
@@ -1875,8 +1849,8 @@ prompt_construction:
          * Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
          *
          * Image token count = n_encoder_tokens (from CLIP+SAM+Projector):
-         *   - Small image (<=640): [global(273), view_sep(1)] = 274
-         *   - Large image (>640):  [local(N), global(273), view_sep(1)] = N+274
+         *   - Small image (≤640): [global(110), view_sep(1)] = 111
+         *   - Large image (>640):  [local(N), global(272), view_sep(1)] = N+273
          *     where N = (crop_h*10)*(crop_w*10+1)
          *
          * Python's masked_scatter places all encoder tokens into the
@@ -2339,16 +2313,22 @@ prompt_construction:
         out_len = ds_strip_det_tags(output, out_len);
         /* V3 hallucination prefix removal: when the model's first token
          * is forced past EOS, it may generate a short English hallucination
-         * before the actual OCR content. Common pattern:
-         * "The image contains no text... [No text detected]\n<actual OCR>"
+         * before the actual OCR content. Common patterns:
+         *   "The image contains no text... [No text detected]\n<actual OCR>"
+         *   "The image contains no text... Therefore... [No text detected]\n<actual OCR>"
          * Strip everything up to and including "[No text detected]" marker.
-         * Only strip if the marker appears early (within first 200 chars). */
+         * If no marker found, also check for English-only prefix before CJK text. */
         if (out_len > 20) {
+            /* Skip leading whitespace for pattern matching */
+            int start = 0;
+            while (start < out_len && (output[start] == ' ' || output[start] == '\n'))
+                start++;
             const char *marker = "[No text detected]";
             int mlen = 18;
-            /* Search for marker in first 400 chars */
-            int search_len = out_len < 400 ? out_len : 400;
-            for (int i = 0; i + mlen <= search_len; i++) {
+            /* Search for marker in first 400 chars from start */
+            int search_len = (out_len - start) < 400 ? (out_len - start) : 400;
+            int stripped = 0;
+            for (int i = start; i + mlen <= start + search_len; i++) {
                 if (memcmp(output + i, marker, mlen) == 0) {
                     int skip = i + mlen;
                     /* Skip whitespace/newlines after marker */
@@ -2358,7 +2338,53 @@ prompt_construction:
                         memmove(output, output + skip, out_len - skip + 1);
                         out_len -= skip;
                     }
+                    stripped = 1;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "V3: stripped hallucination prefix to: [%s]\n", output);
                     break;
+                }
+            }
+            /* If no [No text detected] marker, try stripping English-only prefix
+             * before first CJK/meaningful content. Pattern: the model generates
+             * a sentence starting with "The image..." before real OCR output.
+             * Look for double-newline boundary where actual content starts. */
+            if (!stripped && out_len > 50) {
+                /* Check if output starts with common hallucination phrases
+                 * (after leading whitespace) */
+                const char *halluc_starts[] = {
+                    "The image contains no text",
+                    "There is no text",
+                    "No text is present",
+                    "The OCR result",
+                    NULL
+                };
+                for (int h = 0; halluc_starts[h]; h++) {
+                    int hlen = (int)strlen(halluc_starts[h]);
+                    if (start + hlen <= out_len && memcmp(output + start, halluc_starts[h], hlen) == 0) {
+                        /* Find end of this English paragraph (double newline or first CJK char) */
+                        int skip = start + hlen;
+                        /* Skip to end of English sentence(s) — look for \n\n or first CJK */
+                        while (skip < out_len) {
+                            unsigned char c = (unsigned char)output[skip];
+                            /* CJK range: bytes 0xE0+ in UTF-8 */
+                            if (c >= 0xE0) break;
+                            /* Double newline */
+                            if (skip + 1 < out_len && output[skip] == '\n' && output[skip+1] == '\n') {
+                                skip += 2;
+                                break;
+                            }
+                            skip++;
+                        }
+                        /* Skip trailing whitespace/newlines */
+                        while (skip < out_len && (output[skip] == '\n' || output[skip] == ' '))
+                            skip++;
+                        if (skip < out_len && skip > start) {
+                            memmove(output, output + skip, out_len - skip + 1);
+                            out_len -= skip;
+                        }
+                        stripped = 1;
+                        break;
+                    }
                 }
             }
         }

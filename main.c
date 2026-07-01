@@ -145,8 +145,10 @@ int main(int argc, char **argv) {
         ctx->no_repeat_ngram_size = 35;
     }
 
-    /* Set up streaming callback */
-    if (verbosity > 0) {
+    /* Set up streaming callback.
+     * V3: disable streaming because hallucination prefix needs post-processing
+     * (stripping "[No text detected]" etc.) which can't be done per-token. */
+    if (verbosity > 0 && ctx->config.model_version != 3) {
         ds_set_token_callback(ctx, stream_token, NULL);
     }
 
@@ -154,7 +156,7 @@ int main(int argc, char **argv) {
     char *text = ds_recognize(ctx, input_image);
 
     if (text) {
-        if (verbosity == 0) {
+        if (verbosity == 0 || ctx->config.model_version == 3) {
             printf("%s\n", text);
         } else {
             printf("\n");
