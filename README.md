@@ -34,33 +34,38 @@ make blas
 | **Encoder** | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 + R-SWA |
 | **Decoder** | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA |
 | **Input** | 1024×1024 (stretch) | Dynamic multi-crop | 640×640 (pad) + multi-crop |
-| **Visual tokens** | 256 | 857 (6-crop) | 273 ~ 3323 (1~30 crops) |
+| **Visual tokens** | 256 | 857 (4-crop) | 111 ~ 3323 (1~30 crops) |
 | **Prompt** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
 | **Model size** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
-### Benchmark (Apple M4 Max, 1794×1578 test image, BLAS + Metal GPU)
+### Benchmark (Apple M2 Pro, 8 threads, BLAS)
+
+#### Large Image (1794×1578, multi-crop)
 
 | Metric | V1 | V2 ⭐ | V3 |
 |--------|----|----|-----|
-| **Total time** | 14.3s | 15.6s | 77.0s (30 crops) |
-| **Encoding** | 6.1s | 9.5s | 42.8s (30 crops × SAM+CLIP) |
-| **Prefill** | 3.0s (286 tok) | 3.3s (1162 tok) | 4.1s (3323 tok) |
-| **Decode** | 5.2s (238 tok) | 2.8s (112 tok) | 30.1s (499 tok) |
-| **Decode speed** | 45.9 tok/s | 40.3 tok/s | 16.6 tok/s |
-| **Output quality** | ✅ Complete | ✅ Correct | ✅ Detailed (det tags stripped) |
+| **Total time** | 12.2s | 14.8s | 79.7s (30 crops) |
+| **Encoding** | 6.1s | 8.8s | 43.0s (30 crops × SAM+CLIP) |
+| **Prefill** | 1.0s (280 tok) | 1.0s (662 tok) | 6.4s (3328 tok) |
+| **Decode** | 5.0s (238 tok) | 5.0s (224 tok) | 30.3s (499 tok) |
+| **Decode speed** | 47.3 tok/s | 44.4 tok/s | 16.5 tok/s |
+| **Crops** | 1 (1024×1024) | 4 (2×2 @768) | 30 (6×5 @640) |
+| **Output quality** | ✅ Complete | ✅ Complete | ✅ Content OK (minor typos) |
 
-### Small Image (≤640px, 1-crop)
+#### Small Image (400×100, ≤640px, 1-crop)
 
 | Metric | V1 | V2 | V3 |
 |--------|----|----|-----|
-| **Total time** | 6.9s | 8.6s | 9.6s |
-| **Decode speed** | 43.7 tok/s | 45.4 tok/s | 47.4 tok/s |
+| **Total time** | 8.9s | 10.9s | 2.5s |
+| **Decode speed** | 38.8 tok/s | 36.9 tok/s | 48.0 tok/s |
+| **Visual tokens** | 256 | 257 | 111 |
 
 > **Recommendation**: V2 is the best all-round choice — multi-crop handles any image size,
 > DeepEncoder V2 produces the most accurate encoder output.
 > V1 is faster but stretches images to 1024×1024 (aspect distortion) and has minor precision typos.
-> V3 supports language detection and detailed document parsing but is significantly slower for large
-> images due to sequential 30-crop encoding and MHA attention (vs V2's MLA).
+> V3 excels on small images (2.5s vs 8-11s for V1/V2) and supports language detection,
+> but is significantly slower for large images due to sequential 30-crop encoding + MHA attention.
+> V3 hallucination prefix ("The image contains no text...") is automatically stripped in post-processing.
 
 ## Performance
 
@@ -205,13 +210,15 @@ Inference: 15025 ms, 226 text tokens (44.4 tok/s decode)
 <summary>V2 Multi-Crop Preprocessing</summary>
 
 1. `find_closest_aspect_ratio()` selects optimal crop ratio (min aspect diff, area tie-breaker)
-2. Large image (e.g. 1938×1210) → ratio (3,2) → 6 local crops of 768×768
+2. `dynamic_preprocess(min_num=2, max_num=6)`: e.g. 1794×1578 → ratio (2,2) → 4 local crops of 768×768
 3. Small image (both dims ≤768) → ratio (1,1) → 1 local crop of 768×768
 4. Global view: `ImageOps.pad()` → 1024×1024 (always present)
 5. SAM: N local + 1 global → [896,12,12] / [896,16,16]
-6. Token layout (image_size=640): num_queries=10 → 857 image slots
-7. masked_scatter: 1121→857 (truncate overflow)
-8. Prefix: BOS(1) + 857 image + 4 text ("\nFree OCR.") = 862 tokens
+6. DeepEncoder V2: 144 visual + 144 causal flow → 144 out per crop, 256 out for global
+7. Token layout (image_size=640): num_queries=10 → 100 slots/crop, 257 global slots
+8. masked_scatter: source=[local,global,sep] → fill [global(257),local(400)] positions
+   4 crops: 833 source → 657 positions (176 dropped = masked_scatter truncation)
+9. Prefix: BOS(1) + 657 image + 4 text ("\nFree OCR.") = 662 tokens
 
 </details>
 
@@ -402,6 +409,7 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 
 ## Version History
 
+- **v1.1** — V2 multi-crop fix (dynamic_preprocess min_num=2→4 crops, was 9→truncated), V3 small image fix (640×640 pad→111 tokens, was 1024→273), CLIP position embedding bilinear interpolation, V3 hallucination prefix auto-strip, V3 streaming disabled for post-processing
 - **v1.0** — BPE tokenizer merge loading fix (3 bugs: JSON skip, nested array format, strdup key copy), V2 output quality fix, Metal GPU MoE batching, INT8 quantization (`--int4`)
 - **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), V3 multi-crop, tokenizer.json fallback, download_model.sh v1/v2/v3
 - **v0.8** — Batched MoE prefill + parallel encoding: 16s end-to-end (6× v0.5)
@@ -412,9 +420,10 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 ### Known Issues
 
 1. **V1 precision**: V1 output has minor BF16 precision-induced typos (e.g. "raletimit" vs "ratelimit") — within normal precision range for F32 accumulation through 36 encoder layers.
-2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing.
-3. **V2 EOS timing**: V2 may stop earlier than V1 for some images (fewer output tokens). This is an encoder-level difference, not a decoding issue.
-4. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
+2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing. Hallucination prefix (e.g. "The image contains no text...[No text detected]") is also auto-stripped.
+3. **V3 large image typos**: V3 on large images (30+ crops) may have minor OCR typos (e.g. "CC"→"CF") due to local crop context loss. This is a model limitation, not a code bug.
+4. **V3 small image Non-Text**: V3 on very small images (≤640px) may output `[Non-Text]` markers — the model was trained predominantly on larger document images.
+5. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
 
 ## Differences from Python Implementation
 
