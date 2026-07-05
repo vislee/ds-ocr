@@ -1,6 +1,30 @@
 /*
  * ds_image.c - Image loading for DeepSeek-OCR
+ * ds_image.c — DeepSeek-OCR 图像加载实现
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【模块角色】推理流水线的"入口"
+ * ─────────────────────────────────────────────────────────────────────
+ * 将磁盘上的图像文件解码为RGB像素数组，提供多种预处理方式。
+ *
+ * 【关键函数】
+ *   ds_image_load()          — 图像解码（PNG/JPEG/WebP等 → RGB uint8）
+ *   ds_image_resize()        — 双线性插值缩放（拉伸模式）
+ *   ds_image_pad()           — 保持宽高比填充（V2/V3预处理方式）
+ *   ds_image_crop_box()      — 矩形裁剪
+ *   ds_dynamic_preprocess()  — V2/V3动态多裁剪（大图分割策略）
+ *   ds_image_to_float_chw()  — uint8→float32 + NCHW转换（SAM输入格式）
+ *
+ * 【预处理策略对比】
+ *   V1: resize(1024×1024) — 拉伸，不保持宽高比
+ *   V2: pad(1024×1024) + dynamic_preprocess(768×768) — 保持比例+多裁剪
+ *   V3: pad(1024×1024 或 640×640) + dynamic_preprocess(640×640) — 保持比例+多裁剪
+ *
+ * 【stb_image.h】
+ * 单头文件图像解码库，只需 #define STB_IMAGE_IMPLEMENTATION 后 #include
+ * 支持所有常见格式，零外部依赖，完美符合ds-ocr的设计哲学
  * Uses stb_image.h for decoding (single-header library).
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 #define STB_IMAGE_IMPLEMENTATION

@@ -1,5 +1,61 @@
 /*
  * ds_moe_decoder.c - DeepSeek-V2 MoE Decoder for DeepSeek-OCR
+ * ds_moe_decoder.c — DeepSeek-V2 MoE 解码器实现
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【解码器单层前向传播详解】(详见 01-Transformer基础篇.md + 02-MoE混合专家篇.md)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * Dense层 (Layer 0):
+ *   ┌──────────────────────────────────────────────────────┐
+ *   │ x_norm = RMSNorm(x, input_norm)                      │  ← Pre-Norm
+ *   │ q,k,v = Wq*x, Wk*x, Wv*x  (BF16→F32 on-the-fly)    │  ← QKV投影
+ *   │ q = rms_norm_per_head(q, q_norm)  [V1/V2 only]      │  ← Per-head Q norm
+ *   │ k = rms_norm_per_head(k, k_norm)  [V1/V2 only]      │  ← Per-head K norm
+ *   │ apply_rope(q, k, pos)                                │  ← RoPE旋转位置编码
+ *   │ cache_k[pos] = k, cache_v[pos] = v                   │  ← KV缓存写入
+ *   │ attn_out = causal_attention(q, cache_k, cache_v)      │  ← 因果注意力
+ *   │ proj_out = Wo @ attn_out                              │  ← 输出投影
+ *   │ x = x + proj_out                                     │  ← 残差连接
+ *   │ x_norm = RMSNorm(x, post_attn_norm)                  │
+ *   │ gate = W_gate @ x_norm, up = W_up @ x_norm           │  ← Dense SwiGLU
+ *   │ ffn_out = W_down @ (SiLU(gate) ⊙ up)                 │
+ *   │ x = x + ffn_out                                      │  ← 残差连接
+ *   └──────────────────────────────────────────────────────┘
+ *
+ * MoE层 (Layer 1~11):
+ *   ┌──────────────────────────────────────────────────────┐
+ *   │ (注意力部分同上，省略)                                │
+ *   │ x_norm = RMSNorm(x, post_attn_norm)                  │
+ *   │ ── MoE 前向 ──                                       │
+ *   │ scores = gate_weight @ x_norm → softmax → top-6      │  ← 路由器
+ *   │ ── 路由专家 (top-6) ──                               │
+ *   │ for k=0..5:                                          │
+ *   │   expert_id = top_indices[k]                         │
+ *   │   gate_up = gate_up_fused[expert_id] @ x_norm        │  ← 融合gate+up
+ *   │   gate, up = split(gate_up)                          │
+ *   │   hidden = SiLU(gate) ⊙ up                           │  ← SwiGLU激活
+ *   │   expert_out = down_weight[expert_id] @ hidden       │  ← Down投影
+ *   │   output += top_weights[k] * expert_out              │  ← 加权组合
+ *   │ ── 共享专家 (永远激活) ──                            │
+ *   │ s_gate_up = shared_gate_up_fused @ x_norm            │  ← 2个共享专家一起算
+ *   │ s_gate, s_up = split(s_gate_up)                      │
+ *   │ s_hidden = SiLU(s_gate) ⊙ s_up                       │
+ *   │ shared_out = shared_down @ s_hidden                   │
+ *   │ output += shared_out                                 │  ← 共享专家贡献
+ *   │ x = x + output                                       │  ← 残差连接
+ *   └──────────────────────────────────────────────────────┘
+ *
+ * 【Decode vs Prefill 的实现差异】
+ *   Decode (单token): matvec(BF16×F32) + 串行6个expert
+ *   Prefill (多token): sgemm(F32×F32) + Gather-Compute-Scatter批量expert
+ *
+ * 【v0.5→v0.9 优化历程】
+ *   - Argmax LM Head: 流式argmax，不分配129280个logits → 8×加速
+ *   - 连续expert块: 所有expert在同一块内存 → 2.4× MoE加速
+ *   - Fused gate+up: 1次matvec代替2次 → 减少x的内存读取
+ *   - madvise预取: 异步预读下一个expert权重 → 减少page fault
+ *   - Selective Repetition Penalty: 只重算历史中出现过的token → 减少惩罚开销
  *
  * Architecture:
  * - 12 transformer layers
