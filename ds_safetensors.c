@@ -54,10 +54,22 @@
  * Minimal JSON parser for safetensors header
  * ======================================================================== */
 
+/* 跳过JSON空白字符（空格、换行、回车、制表符）
+ * 工具函数：将指针前进到第一个非空白字符位置 */
 static void skip_whitespace(const char **p) {
     while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++;
 }
 
+/* parse_string — 解析JSON字符串值
+ *
+ * 从指针p当前位置解析一个带双引号的JSON字符串。
+ * 支持标准JSON转义序列（\n, \t, \\, \", \/ 等）。
+ *
+ * @param p        [输入/输出] 指向当前解析位置的指针，解析后前进到结束引号之后
+ * @param out      [输出] 解析出的字符串缓冲区
+ * @param max_len  缓冲区最大长度（含NUL终止符）
+ * @return         成功返回0，失败返回-1
+ */
 static int parse_string(const char **p, char *out, size_t max_len) {
     skip_whitespace(p);
     if (**p != '"') return -1;
@@ -82,6 +94,14 @@ static int parse_string(const char **p, char *out, size_t max_len) {
     return 0;
 }
 
+/* parse_int — 解析JSON整数（含负数）
+ *
+ * 从指针p当前位置解析一个可选的负号后跟一串数字。
+ * 注意：此函数不处理小数或科学计数法——safetensors的shape和offset都是纯整数。
+ *
+ * @param p  [输入/输出] 指向当前解析位置的指针，解析后前进到数字末尾
+ * @return   解析出的整数（int64_t可覆盖BF16 offset等大数值）
+ */
 static int64_t parse_int(const char **p) {
     skip_whitespace(p);
     int64_t val = 0;
@@ -94,6 +114,14 @@ static int64_t parse_int(const char **p) {
     return neg ? -val : val;
 }
 
+/* parse_dtype — 将JSON中的dtype字符串转换为枚举值
+ *
+ * safetensors规范支持的dtype: F32, F16, BF16, I32, I64, BOOL
+ * 遇到不支持的类型返回DTYPE_UNKNOWN，由调用方自行处理。
+ *
+ * @param s  dtype字符串（如 "BF16"）
+ * @return   对应的枚举值，未知返回DTYPE_UNKNOWN
+ */
 static safetensor_dtype_t parse_dtype(const char *s) {
     if (strcmp(s, "F32") == 0) return DTYPE_F32;
     if (strcmp(s, "F16") == 0) return DTYPE_F16;
@@ -104,6 +132,15 @@ static safetensor_dtype_t parse_dtype(const char *s) {
     return DTYPE_UNKNOWN;
 }
 
+/* parse_tensor_entry — 解析单个张量的JSON元数据
+ *
+ * 解析JSON对象：{"dtype":"BF16","shape":[4096,4096],"data_offsets":[0,33554432]}
+ * 将解析结果填入safetensor_t结构体。
+ *
+ * @param p  [输入/输出] 指向JSON对象起始位置（'{'之后），解析后前进到'}'之后
+ * @param t  [输出] 解析结果写入此张量结构体
+ * @return   成功返回0，失败返回-1
+ */
 static int parse_tensor_entry(const char **p, safetensor_t *t) {
     skip_whitespace(p);
     if (**p != '{') return -1;
@@ -184,6 +221,23 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
     return 0;
 }
 
+/* parse_header — 解析完整的JSON header
+ *
+ * JSON header格式：
+ *   {
+ *     "tensor_name_1": { "dtype":"BF16","shape":[1280,896],"data_offsets":[0,2293760] },
+ *     "tensor_name_2": { ... },
+ *     "__metadata__": { ... }   ← 元数据对象，跳过不处理
+ *   }
+ *
+ * 遍历JSON对象的每个键值对：
+ *   - 键(key) = 张量名称（如 "vision_encoder.patch_embed.weight"）
+ *   - 值(value) = 张量元数据对象（dtype, shape, data_offsets）
+ *   - "__metadata__" 特殊键跳过（包含格式版本等元信息）
+ *
+ * @param sf  [输出] 解析结果写入sf->tensors[]数组，sf->num_tensors为解析数量
+ * @return   成功返回0，失败返回-1
+ */
 static int parse_header(safetensors_file_t *sf) {
     const char *p = sf->header_json;
     skip_whitespace(&p);
@@ -228,24 +282,42 @@ static int parse_header(safetensors_file_t *sf) {
  * Single file operations
  * ======================================================================== */
 
+/* safetensors_open — 打开单个safetensors文件（mmap映射 + JSON解析）
+ *
+ * 处理流程：
+ *   1. open() 打开文件 → 获取文件描述符 fd
+ *   2. fstat() 获取文件大小 file_size
+ *   3. mmap() 将整个文件映射到内存 → 返回基地址 data
+ *   4. 读取前8字节 → 得到 header_size（little-endian uint64）
+ *   5. 从 data+8 提取 header_size 字节的JSON字符串
+ *   6. parse_header() 解析JSON → 填充 tensors[] 数组
+ *
+ * @param path  safetensors文件路径
+ * @return      成功返回safetensors_file_t指针（调用者需safetensors_close释放），失败返回NULL
+ */
 safetensors_file_t *safetensors_open(const char *path) {
+    /* 第1步: 以只读方式打开文件，获取文件描述符 */
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
 
+    /* 第2步: 获取文件大小，验证文件至少能容纳8字节的header长度 */
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return NULL; }
 
     size_t file_size = (size_t)st.st_size;
     if (file_size < 8) { close(fd); return NULL; }
 
+    /* 第3步: mmap将整个文件映射到虚拟地址空间（零拷贝关键） */
     void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
+    close(fd);  /* 映射完成后可立即关闭fd */
     if (data == MAP_FAILED) return NULL;
 
+    /* 第4步: 读取前8字节（little-endian uint64），这是JSON header的长度 */
     uint64_t header_size = 0;
     memcpy(&header_size, data, 8);
     if (header_size > file_size - 8) { munmap(data, file_size); return NULL; }
 
+    /* 第5步: 分配safetensors_file_t结构体，存储文件元信息 */
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) { munmap(data, file_size); return NULL; }
 
@@ -254,6 +326,7 @@ safetensors_file_t *safetensors_open(const char *path) {
     sf->file_size = file_size;
     sf->header_size = (size_t)header_size;
 
+    /* 第6步: 复制JSON header字符串（从mmap区域复制到堆内存），并解析 */
     sf->header_json = malloc(header_size + 1);
     if (!sf->header_json) { safetensors_close(sf); return NULL; }
     memcpy(sf->header_json, (char *)data + 8, header_size);

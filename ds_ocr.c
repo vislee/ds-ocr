@@ -1,6 +1,7 @@
 /*
  * ds_ocr.c - DeepSeek-OCR Pure C Inference Engine
  * ds_ocr.c — DeepSeek-OCR 纯C推理引擎主协调器
+ * ds_ocr.c — DeepSeek-OCR 纯C推理引擎主协调器
  *
  * ═══════════════════════════════════════════════════════════════════════
  * 【模块角色】整个推理流水线的"总指挥"
@@ -42,24 +43,24 @@
  * Main coordinator: image → visual tokenizer → encoder → MoE decoder → text
  */
 
-#include "ds_ocr.h"
-#include "ds_kernels.h"
-#include "ds_safetensors.h"
-#include "ds_image.h"
-#include "ds_visual_tokenizer.h"
-#include "ds_deep_encoder.h"
-#include "ds_moe_decoder.h"
-#include "ds_tokenizer.h"
-#include "ds_quantize.h"
+#include "ds_ocr.h"                /* 公共头文件：常量、结构体、API声明 */
+#include "ds_kernels.h"            /* 数学内核：矩阵运算、线程池、RoPE */
+#include "ds_safetensors.h"       /* Safetensors权重读取器（mmap零拷贝） */
+#include "ds_image.h"             /* 图像加载与预处理（stb_image封装） */
+#include "ds_visual_tokenizer.h"  /* SAM视觉分词器：patch嵌入+Transformer编码 */
+#include "ds_deep_encoder.h"      /* DeepEncoder V2 (Qwen2-0.5B) / CLIP编码器 */
+#include "ds_moe_decoder.h"       /* MoE解码器：64路由专家+2共享专家 */
+#include "ds_tokenizer.h"         /* BPE分词器：token ID ←→ 文本 */
+#include "ds_quantize.h"          /* INT4/INT8量化工具 */
 
-#include "ds_dump.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <pthread.h>
-#include <sys/time.h>
-#include <sys/stat.h>
+#include "ds_dump.h"              /* 调试用tensor dump工具 */
+#include <stdio.h>   /* printf, fprintf, snprintf */
+#include <stdlib.h>  /* malloc, free, calloc, realloc, posix_memalign */
+#include <string.h>  /* memset, memcpy, memcmp, strstr */
+#include <math.h>    /* powf, fabsf, sqrtf */
+#include <pthread.h> /* 多线程并行裁剪编码 */
+#include <sys/time.h>/* gettimeofday — 毫秒级计时 */
+#include <sys/stat.h>/* stat — 文件状态检查 */
 
 /* ds_verbose — 全局日志详细度
  * 0 = 静默（仅输出识别结果）
@@ -91,9 +92,12 @@ int ds_bf16_simulate_python = 1;
 int g_dump_crop_id = -1;
 
 /* ========================================================================
- * Timing Helper
+ * Timing Helper — 毫秒级计时器
  * ======================================================================== */
 
+/* now_ms: 获取当前时间的毫秒数（基于gettimeofday）
+ * 用于测量推理各阶段耗时：编码、prefill、decode
+ */
 static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -123,36 +127,44 @@ static double now_ms(void) {
  *      '<' 之前的文本安全输出，'<..' 之后继续缓冲
  * ======================================================================== */
 
-/* Check if the buffer contains a complete <|det|>...<|/det|> or
- * <|ref|>...<|/ref|><|det|>...<|/det|> pattern, and if so, strip it.
- * Returns: number of characters consumed from buf (0 = nothing to strip yet).
- * If a complete pattern is found, buf is modified in-place with the stripped
- * version and *out_new_len is set to the new length. */
+/* ds_try_strip_det_tag: 尝试从缓冲区中移除完整的det/ref标签
+ *
+ * 检测两种标签模式:
+ *   1. 独立 <|det|>...<|/det|> — 检测框标签（含标签名和坐标）
+ *   2. <|ref|>...<|/ref|><|det|>...<|/det|> — 引用+检测对
+ *
+ * 返回值: 消耗的字符数（0=未找到完整标签）
+ * 找到完整标签时，buf原地修改，*out_new_len设为新长度
+ */
 static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
-    /* Try standalone <|det|>...<|/det|> */
+    /* 尝试匹配独立 <|det|>...<|/det|> 模式 */
+    /* 从位置7开始搜索<|/det|>结束标签 */
     if (buf_len >= 7 && memcmp(buf, "<|det|>", 7) == 0) {
         for (int i = 7; i + 8 <= buf_len; i++) {
             if (memcmp(buf + i, "<|/det|>", 8) == 0) {
-                /* Found complete det tag: skip entire buf[0..i+8) */
+                /* 找到完整的det标签：跳过整个 buf[0..i+8) */
                 int consumed = i + 8;
                 *out_new_len = 0;
                 return consumed;
             }
         }
     }
-    /* Try <|ref|>...<|/ref|><|det|>...<|/det|> pair */
+    /* 尝试匹配 <|ref|>...<|/ref|><|det|>...<|/det|> 对 */
+    /* <|ref|>是7字符，<|/ref|>是8字符，<|det|>是7字符，<|/det|>是8字符 */
     if (buf_len >= 7 && memcmp(buf, "<|ref|>", 7) == 0) {
         int ref_end = -1;
+        /* 先找<|/ref|>结束位置 */
         for (int i = 7; i + 8 <= buf_len; i++) {
             if (memcmp(buf + i, "<|/ref|>", 8) == 0) {
                 ref_end = i + 8;
                 break;
             }
         }
+        /* ref结束后紧接着<|det|>，再找<|/det|> */
         if (ref_end > 0 && ref_end + 7 <= buf_len && memcmp(buf + ref_end, "<|det|>", 7) == 0) {
             for (int i = ref_end + 7; i + 8 <= buf_len; i++) {
                 if (memcmp(buf + i, "<|/det|>", 8) == 0) {
-                    /* Found complete ref+det pair: skip entire buf */
+                    /* 找到完整的ref+det对：跳过整个缓冲区内容 */
                     int consumed = i + 8;
                     *out_new_len = 0;
                     return consumed;
@@ -160,16 +172,22 @@ static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
             }
         }
     }
-    return 0;  /* No complete pattern found yet */
+    return 0;  /* 缓冲区中尚未出现完整标签模式 */
 }
 
-/* Stream a decoded token piece through the det tag filter.
- * Accumulates potential tag starts in ctx->_det_buf, and flushes
- * regular text through the token callback. */
+/* ds_stream_filter_det: 流式token经过det标签过滤器
+ *
+ * 逐个将解码后的token送入缓冲区累积，当判断缓冲区内容为完整标签时丢弃；
+ * 否则将非标签的安全前缀（'<'之前的内容）通过回调输出。
+ *
+ * 为什么不能逐token判断?
+ *   BPE分词可能将一个标签切分成多个token，如 "<|de" + "t|>"
+ *   缓冲后才能正确识别完整的标签边界
+ */
 static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
     if (!ctx || !piece || !ctx->token_cb) return;
     if (ctx->config.model_version != 3) {
-        /* Non-V3: pass through directly */
+        /* 非V3模型：直接透传，无需缓冲过滤det标签 */
         ctx->token_cb(piece, ctx->token_cb_userdata);
         return;
     }
