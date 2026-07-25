@@ -78,7 +78,48 @@
 #include <math.h>
 #include <sys/mman.h>
 
-/* Forward declaration */
+/* ========================================================================
+ * Forward Declaration
+ * ======================================================================== */
+/* moe_forward — MoE层的前向传播（单token decode路径）
+ * 处理64个路由专家(top-6) + 2个共享专家的完整计算流程。
+ * 所有buffer由调用者提供（复用ctx中的预分配内存），避免反复malloc/free。*/
+/* moe_forward — MoE 前向传播（单 token decode 路径）
+ *
+ * 处理顺序:
+ *   1. Router: x_norm @ W_gate → softmax → top-6 选择
+ *   2. Routed experts: 对 top-6 专家逐专家做 gate+up+SwiGLU+down
+ *   3. Combine: 按路由权重加权求和 top-6 个 expert 输出
+ *   4. Shared experts: 2个永久激活的专家，gate+up+SwiGLU+down
+ *   5. Final: routed_output + shared_output
+ *
+ * ┌────────────────────────────────────────────────────────────────┐
+ * │ 输入: x [hidden]                                               │
+ * │  Router ─→ softmax over 64 ─→ top-6 indices + weights          │
+ * │    │                                                            │
+ * │    ├→ Expert[k=0]: gate_up_fused @ x → SiGLU → down → w0 * out │
+ * │    ├→ Expert[k=1]: ...                                         │
+ * │    ├→ ...                                                      │
+ * │    ├→ Expert[k=5]: ...                                         │
+ * │    └→ Shared: gate_up_fused @ x → SiLU → down                  │
+ * │    ┌─ 加权求和 ─────────────────────────────────────┐           │
+ * │    │ routed_output = Σ(w_k * expert_out_k) + shared_out │       │
+ * │    └───────────────────────────────────────────────────┘         │
+ * │ 输出: routed_output + shared_output  [hidden]                    │
+ * └────────────────────────────────────────────────────────────────┘
+ *
+ * 【CPU 与 GPU 双路径】
+ * CPU: 串行逐 expert matvec，madvise 预取下一 expert 权重
+ * GPU (Metal): 批量将 top-6 expert 提交 GPU 并行计算
+ *
+ * 【权重布局优化】
+ * 所有 64 个 expert 的 gate_up_fused 权重放在一块连续内存
+ * (expert_block_bf16)，共享 expert 放在尾部。这样一次 madvise
+ * 预取整个块，减少 page fault 导致的随机读延迟。*/
+
+/* moe_forward — MoE层的前向传播（单token decode路径）
+ * 处理64个路由专家(top-6) + 2个共享专家的完整计算流程。
+ * 所有buffer由调用者提供（复用ctx中的预分配内存），避免反复malloc/free。*/
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
                          float *expert_gate_buf, float *expert_up_buf,
@@ -89,15 +130,42 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          float *expert_outputs_buf);
 
 /* ========================================================================
- * BF16 ↔ F32 Conversion Helpers
+ * BF16 → F32 Conversion Helpers
  * ======================================================================== */
+/* 注意: 所有权重以 BF16 格式存储（通过 mmap 零拷贝加载），
+ * 在 matmul/matvec 运算时逐元素转换为 F32（on-the-fly 转换）。
+ * 这避免了预转换全部权重的 F32 内存开销（~1.6GB 额外）。
+ * 解码器中的 F32 运算精度高于 Python 的 BF16 累积精度。
+ * 当 ds_bf16_simulate_python=1 时，中间结果会被截断回 BF16 精度
+ * 以匹配 Python 的 autocast("cuda", dtype=bfloat16) 行为。*/
+
+/* ========================================================================
+ * KV Cache Access Helpers — F32 direct storage
+ * ======================================================================== */
+/* KV 缓存结构: 一个紧凑的三维数组
+ *   维度: [num_layers][kv_cache_max][kv_row_stride] (F32)
+ *   kv_row_stride ≥ kv_dim，对齐到 64 字节边界以优化 SIMD 读取
+ *   
+ * 【设计选择: F32 缓存 → 无需解压缩】
+ * 与 qwen-asr 不同（缓存 BF16，读取时批量 F32→BF16→F32 转换），
+ * ds-ocr 将 K/V 直接以 F32 存储在缓存中。代价是缓存容量减半，
+ * 但好处是每次解码步骤不需要逐位置转换 BF16→F32 —— 注意力计算
+ * 时 KV 可直接以 F32 读取，省掉 O(seq_len) 的格式转换开销。
+ * 对于解码器~300个KV位置，每步节省约2-3μs。
+ *
+ * 【V3 R-SWA 缓存策略】
+ * V3 (Unlimited-OCR) 使用 R-SWA 注意力，KV 缓存包含两类:
+ *   1. Reference tokens: [0..prefill_token_count-1] — 视觉token，永久保留
+ *   2. Sliding window tokens: 最近 W=128 个文本 token
+ * 缓存大小理论上限 = prefill_token_count + W，但当前实现仍用
+ * append-only 模式（文本token持续追加），尚未实现环形缓冲区。*/
 
 /* ========================================================================
  * KV Cache Access Helpers — F32 direct storage (no BF16 conversion)
  * ======================================================================== */
 
 /* Get pointer to K cache row for a given layer and position.
- * Cache layout: [layers][max_seq][kv_row_stride], kv_row_stride >= kv_dim. */
+ * 布局: cache[layers][max_seq][kv_row_stride], kv_row_stride >= kv_dim. */
 static inline float *ds_kv_k_row(ds_ctx_t *ctx, int layer, int pos) {
     int stride = ctx->_kv_row_stride;
     return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
@@ -125,8 +193,22 @@ static inline void ds_kv_store_f32(float *dst, const float *src, int n) {
 }
 
 /* ========================================================================
- * Dense FFN Forward Pass (SwiGLU, used for layer 0)
+ * Dense FFN Forward: SwiGLU (Layer 0 only)
  * ======================================================================== */
+/* 稠密 FFN (SwiGLU) 的前向传播，仅用于 Layer 0。
+ * 架构: gate = x @ W_gate, up = x @ W_up
+ *       SwiGLU = SiLU(gate) ⊙ up
+ *       output = SwiGLU @ W_down
+ * 中间维度 intermediate=6848，隐藏维度 hidden=1280。
+ *
+ * 实现要点:
+ *   1. gate 和 up 分别做 BF16 matvec（非融合版本，因为 dense 只有一层）
+ *   2. SwiGLU 使用 ds_swiglu_direct 直接计算（不经过 gate_up 交错排列）
+ *   3. buffer 由调用者提供或内部临时分配（用于 prefill 批量模式）
+ *   
+ * 为什么 Layer 0 用 Dense 而不是 MoE？
+ * 第一个 transformer 层处理"原始"输入特征，需要全参数来提取通用特征。
+ * 后续层(MoE)在通用特征基础上做专业化分工（路由到不同专家）。*/
 
 static void dense_ffn_forward(float *output, const float *x,
                                ds_dec_layer_t *layer, ds_config_t *cfg,
@@ -160,6 +242,14 @@ static void dense_ffn_forward(float *output, const float *x,
     if (own_swiglu) free(swiglu_buf);
 }
 
+/* mlp_forward — MLP 分派层（dense FFN 或 MoE）
+ *
+ * 根据 layer_idx 与 dec_first_k_dense 的比较，分派到两种路径:
+ *   layer_idx < dec_first_k_dense → dense_ffn_forward (Layer 0)
+ *   layer_idx >= dec_first_k_dense → moe_forward (Layer 1~11)
+ *
+ * 所有 buffer 由调用者传入（decode 时复用 ctx 中的预分配内存），
+ * 避免每步 malloc/free 的开销。*/
 static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          ds_config_t *cfg, ds_metal_ctx_t *metal_ctx, int layer_idx,
                          float *dense_gate_buf, float *dense_up_buf, float *dense_swiglu_buf,
@@ -261,12 +351,17 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
         goto shared_experts;
     }
 
-    /* ── CPU path ── */
-    /* Prefetch the entire range of selected experts' gate_up_fused weights
-     * experts. We also prefetch the down weight (still in mmap'd region). */
-    /* Prefetch the entire range of selected experts' gate_up_fused weights
-     * within the contiguous block. This covers all top-k experts' gate_up
-     * in one system call, letting the kernel async-read-ahead. */
+    /* ── CPU path: 逐expert matvec ──
+     * 【为什么不用 sgemm 批量计算？】
+     * Decode 路径每次只有1个token，matvec (BF16×F32) 是最优选择。
+     * sgemm (F32×F32) 虽然计算吞吐更高，但需要预转换 BF16→F32 权重，
+     * 内存开销 ~265MB (64 experts × 896×1280×2×4bytes)，不值得。
+     *
+     * 【madvise 预取策略】
+     * mmap 加载的 BF16 权重在第一次访问时触发 page fault（~60μs/page）。
+     * 通过提前 madvise(WILLNEED) 触发内核异步预读，减少 stall 时间。
+     * 策略: 一次预取所有 top-6 专家的 gate_up_fused 范围（在连续块内），
+     *       然后在循环中提前预取下一个专家的 down 权重。*/
     if (layer->expert_block_bf16 && top_k > 1) {
         /* Find min/max offset of selected experts within the block */
         size_t fused_per_expert = (size_t)2 * moe_inter * hidden * sizeof(uint16_t);
@@ -315,13 +410,27 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
         }
     }
 
-    /* Step 4: Combine routed expert outputs (CPU path) */
+    /* Step 4: 加权合并路由专家的输出
+     * ds_expert_combine 对每个 expert 的输出乘以路由权重并累加:
+     *   output[h] = Σ_{k=0..5} top_weights[k] * expert_outputs[k*hidden + h]
+     * 这是 CPU 路径的合并（GPU 路径在 Metal 内核中直接合并）。*/
     ds_expert_combine(output, expert_outputs, top_indices, top_weights, top_k, hidden);
     if (!expert_outputs_buf) free(expert_outputs);
     else memset(expert_outputs_buf, 0, top_k * hidden * sizeof(float));
 
 shared_experts:
-    /* Step 5: Add shared expert outputs (always active) */
+    /* Step 5: 共享专家前向传播
+     * 共享专家永远激活（不受路由选择影响），处理通用知识。
+     * DeepSeek-V2 每层有 2 个共享专家（共享 gate + 共享 up/down），
+     * 隐含维度 = 2 * moe_inter = 2 * 896 = 1792。
+     *
+     * 有 4 种实现路径，按优先级排列:
+     *   INT4 → Metal GPU → Fused BF16 (gate+up 合并) → 分离 BF16 (gate, up 分开)
+     *
+     * 【为什么共享专家不需要路由？】
+     * 路由专家的设计意图是"专业化分工"——每个专家处理不同类型的输入。
+     * 共享专家的设计意图是"通用知识"——所有输入都需要的基础能力（如语法、格式）。
+     * 实验表明，共享专家显著提高了训练效率和模型质量。*/
     if (layer->int4_enabled && layer->shared_gate_up_int4.qweight) {
         /* ── INT4 path for shared experts ── */
         int shared_inter = n_shared * moe_inter;
@@ -409,7 +518,11 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     double t_layer_start = 0, t0 = 0;
     if (ctx->profile_enabled) t_layer_start = ds_time_sec();
 
-    /* Input RMSNorm */
+    /* 输入 RMSNorm: Pre-Norm 模式
+     * Transformer 的前置归一化（Pre-LayerNorm），在注意力/FFN 之前做归一化。
+     * Pre-Norm 相比 Post-Norm 更稳定，训练时可以使用更大的学习率。
+     * 公式: x_norm = x / sqrt(mean(x²) + eps) * weight
+     * 这里 weight 是 RMSNorm 的缩放参数（一个可学习的向量）。*/
     float *x_norm = ctx->dec_x_norm;
     ds_rms_norm(x_norm, x, layer->input_norm, 1, hidden, cfg->dec_rms_norm_eps);
 
@@ -431,7 +544,14 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     if (layer->k_norm_weight)
         ds_rms_norm_per_head(k, layer->k_norm_weight, 1, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
 
-    /* RoPE (applied to both Q and K) */
+    /* RoPE: 对 Q 和 K 应用旋转位置编码
+     * 使用 Neox 格式（DeepSeek-V2 用的就是这个变体，与 Qwen 不同）。
+     * RoPE 使得不同位置的 token 具有不同的注意力偏好，
+     * 是 transformer 位置编码的核心机制。
+     *
+     * 预计算的 cos/sin 值存储在 ctx->rope_cache_cos/sin 中，
+     * 预先计算好所有位置（直到 max_seq_len）的三角函数值，
+     * 避免每步重复计算 sin/cos。*/
     float *cos_vals = ctx->rope_cache_cos + pos * head_dim;
     float *sin_vals = ctx->rope_cache_sin + pos * head_dim;
     ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);
@@ -556,10 +676,20 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     for (int l = 0; l < cfg->dec_layers; l++) {
         ds_dec_layer_t *layer = &dec->layers[l];
 
-        /* Input RMSNorm */
+        /* 输入 RMSNorm (prefill 批量模式)
+         * 与 decode 路径不同, prefill 一次性处理 seq_len 个 token,
+         * 所以 ds_rms_norm 的第二个参数 seq_len > 1, 走 sgemm 批量化路径。*/
         ds_rms_norm(x_norm, x, layer->input_norm, seq_len, hidden, cfg->dec_rms_norm_eps);
 
-        /* QKV */
+        /* QKV 投影: 批量矩阵乘法
+         * Prefill 路径用 sgemm (F32×F32) 而不是 matvec (BF16×F32)。
+         * BF16 权重在 ds_linear_nobias_bf16 内部转换: BF16 → F32 on-the-fly,
+         * 然后用 cblas_sgemm 做批量矩阵乘。
+         *
+         * 【为什么 prefill 用 sgemm 更快？】
+         * matvec 适合单 token（内存带宽瓶颈），
+         * sgemm 适合多 token（计算吞吐瓶颈）。
+         * Prefill 的 seq_len ≈ 270-330 tokens → sgemm 远快于 matvec。*/
         ds_linear_nobias_bf16(Q, x_norm, layer->wq_weight_bf16, seq_len, hidden, q_dim);
         ds_linear_nobias_bf16(K, x_norm, layer->wk_weight_bf16, seq_len, hidden, kv_dim);
         ds_linear_nobias_bf16(V, x_norm, layer->wv_weight_bf16, seq_len, hidden, kv_dim);
@@ -1080,12 +1210,27 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     const uint16_t *lm_w = dec->lm_head_bf16 ? dec->lm_head_bf16 : dec->tok_embeddings_bf16;
     float rp = ctx->repeat_penalty;  /* Repetition penalty (used in both fast and full paths) */
 
-    /* ──── Fast argmax path (no temperature sampling) ────
-     * Instead of computing all 129280 logits via sgemm (631MB BF16→F32),
-     * use ds_argmax_matvec_bf16 which computes dot products on-the-fly
-     * and only tracks the best value. For repetition penalty, we
-     * selectively recompute only the ~hundred history tokens' logits
-     * instead of all 129280. This saves ~55ms/step on LM head. */
+    /* ──── Fast argmax 路径（无 temperature 采样） ────
+     * 【为什么 argmax 比全量 logits 快 8 倍？】
+     * 标准做法: x [1280] @ lm_head [vocab=129280, 1280] → logits [129280] → argmax
+     *   需要读取 631MB BF16 权重、计算 331M 次点积、分配 0.5MB logits 数组。
+     *   每步 ~55ms，纯内存带宽瓶颈（M2 Pro 200GB/s，理论 ~3.2ms，实际 ~55ms 因效率低）。
+     *
+     * ds_argmax_matvec_bf16 的做法:
+     *   直接流式读取 lm_head 的每一行 BF16 权重，和 x 做点积，
+     *   只跟踪当前最佳值，不存储全量 logits。
+     *   这既节省了分配 logits 数组的 F32 内存（~0.5MB），
+     *   又避免了 F32 转换后的回写开销。
+     *
+     * 【Selective Repetition Penalty】
+     * 传统做法: 计算全量 logits → 对所有历史 token 除以 penalty → argmax
+     *   代价: 每一项都要做一次遍历史 token 的查找 (O(vocab * history_len))
+     * ds-ocr 的做法: 
+     *   1. 先 argmax 找到最佳 token
+     *   2. 如果最佳 token 在历史中，对其施加 penalty
+     *   3. 对历史中的其他 token，逐个计算其 logit 并施加 penalty
+     *   只需要重新计算 ~O(history_len) 个而非 ~O(vocab) 个 logits
+     *   历史通常 < 300 tokens → 从 129280 降到 ~300 次计算，近 430× 加速 */
     if (ctx->temperature <= 0.0f && lm_w) {
         double t_lm = ctx->profile_enabled ? ds_time_sec() : 0;
 
@@ -1254,10 +1399,23 @@ full_logits_path:
         }
     }
 
-    /* N-gram blocking: prevent repeating any n-gram of given size.
-     * If the last (n-1) tokens match a previously seen n-gram prefix,
-     * ban the token that would complete it.
-     * This matches HuggingFace no_repeat_ngram_size behavior. */
+    /* N-gram 重复惩罚 (no_repeat_ngram_size)
+     * 防止模型生成重复的 n-gram 序列（HuggingFace 标准实现）。
+     *
+     * 原理:
+     *   检查历史中最后 (n-1) 个 token 是否曾在更早位置出现过相同的序列。
+     *   如果找到匹配，就禁止（设为 -inf）后来跟随的那个 token。
+     *
+     * 举例 (ngram_n=3):
+     *   历史: [...A, B, C, D, E, B, C, ?]
+     *   最后 2 个 = [B, C]
+     *   之前的 [B, C] 出现在位置 1-2, 其后续 token = D
+     *   所以禁止 D，防止出现 B,C,D 的重复
+     *
+     * 为什么不用 full logits 路径也能做 ngram blocking？
+     * 在 argmax 路径（fast path）中，如果 argmax 选择的 token 被禁止，
+     * 就跳转到 full_logits_path 重新选下一个最佳 token。
+     * 由于 ngram 通常只禁止 0-1 个 token，大部分步骤走 fast path。*/
     int ngram_n = ctx->no_repeat_ngram_size;
     if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
         int prefix_len = ngram_n - 1;
@@ -1326,6 +1484,24 @@ full_logits_path:
  * shared KV cache reads across all N tokens per layer.
  * ======================================================================== */
 
+/* ds_decoder_forward_batch — 批量解码（v0.8 新增）
+ *
+ * 一次性处理 N 个 token 通过全部 12 层解码器。
+ * 与 decode 路径（逐 token 串行 matvec）不同，batch 路径使用 sgemm
+ * 批量矩阵乘法，对 QKV、RoPE、注意力、FFN 等所有操作批量处理。
+ *
+ * 【适用场景】
+ * Lookahead decoding / 推测解码 (speculative decoding)：
+ * 用一个小 draft 模型预测后续 N 个 token，然后用大模型验证。
+ * 批量解码比逐 token 解码快约 3-5×，因为 sgemm 的计算利用率更高。
+ *
+ * 【注意事项】
+ * 每个 token 可以 attend 到之前的所有 token（包括本批次中更早的 token），
+ * 所以本批次中的 token 之间有因果依赖——即 token[i] 可以看到 token[0..i-1]
+ * 但看不到 token[i+1..]。
+ *
+ * 当前 MoE 专家的前向仍然是逐 token 的（折衷：MLP 占比 ~30%，
+ * 批量化的注意力、QKV、RMSNorm 占比 ~70%，整体仍有收益）。*/
 void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
                                 int n_tokens, int *tokens_out) {
     ds_moe_decoder_t *dec = &ctx->decoder;
