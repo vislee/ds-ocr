@@ -224,7 +224,20 @@ void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weig
 
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
                   int n_experts, int top_k) {
-    /* Find top-K experts using simple selection */
+    /* 选择 top-K 路由专家（n_experts=64, top_k=6）
+     *
+     * K=6 ≈ n_experts 的 10%，top-6 覆盖了绝大多数的路由概率质量。
+     * 仅计算选中的 6 个专家，跳过 58 个不活跃的专家，显著节省计算。
+     *
+     * 【当前实现：O(k·n_experts) 简单选择】
+     * 优点：代码简单，无额外内存开销。
+     * 缺点：对 64 个专家做 6 次扫描（6×64=384 次比较），不是最优的。
+     * 优化方向：可以用 partial sort (nth_element) 将复杂度降到 O(n_experts)。
+     * 当前 K=6, n_experts=64 规模下，384 次比较开销微不足道（< 1μs），不需要优化。
+     *
+     * 【路由权重处理】
+     * top-6 的原始 softmax 分数经过 max-subtract 归一化后，
+     * 再做 softmax 得到最终权重。这样权重之和 = 1，且只有 top-6 非零。*/
     int selected[DS_MAX_EXPERTS];
     float selected_scores[DS_MAX_EXPERTS];
     int n_selected = 0;
@@ -280,7 +293,19 @@ void ds_expert_forward(float *out, const float *x,
                        int hidden, int intermediate,
                        float *gate_buf, float *up_buf,
                        float *gate_up_buf, float *hidden_buf) {
-    /* gate = gate_bf16 @ x, up = up_bf16 @ x */
+    /* 分离 gate 和 up 的专家前向传播
+     *
+     * 架构: output = W_down @ (SiLU(W_gate @ x) ⊙ (W_up @ x))
+     * gate 和 up 分别做 BF16 matvec 得到 gate_buf 和 up_buf，
+     * 然后 SwiGLU(gate_buf, up_buf) → hidden_buf，再做 down matvec。
+     *
+     * 【为什么有分离版本？】
+     * 1. 直接读取 gate_bf16 和 up_bf16 两块分离的权重
+     * 2. gate 和 up 的中间维度不同时也需要分离版本
+     * 3. 对使用 INT4 量化时，gate/up 有各自的 scale/offset
+     *
+     * 此函数是 CPU 路径的专家前向，每路由专家调用一次。
+     * 性能方面，gate 和 up 的 BF16 matvec 各占 ~50% 的计算时间。*/
     ds_linear_nobias_bf16(gate_buf, x, gate_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, up_bf16, 1, hidden, intermediate);
 
