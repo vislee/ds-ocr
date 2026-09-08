@@ -1,5 +1,60 @@
 /*
  * ds_deep_encoder.c - Encoders for DeepSeek-OCR
+ * ds_deep_encoder.c — DeepSeek-OCR 编码器实现
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【两种编码器的完整实现】
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * V1/V3 — CLIP ViT-L/14 编码器:
+ *   ┌─────────────────────────────────────────────────────┐
+ *   │ 输入: SAM视觉特征 [256, 1024]                        │
+ *   │ (V3模式: CLIP绕过patch_embed，直接接收SAM特征)       │
+ *   │   ↓ + CLS token → [257, 1024]                       │
+ *   │   ↓ + 位置编码 (可能需要双三次插值)                  │
+ *   │   ↓ Pre-LayerNorm                                   │
+ *   │   ↓ 24层标准ViT:                                     │
+ *   │     LayerNorm → MHA(16头, 64维) → 残差               │
+ *   │     LayerNorm → GELU FFN(4096) → 残差               │
+ *   │   ↓ 移除CLS token → [256, 1024]                     │
+ *   │   ↓ Concat(SAM特征, CLIP特征) → [256, 2048]         │
+ *   │   ↓ Projector(2048→1280) → [256, 1280]              │
+ *   │   ↓ + image_newline(每16个token后插入) + view_sep    │
+ *   │ 输出: 273 tokens [273, 1280]                         │
+ *   │   (16行×(16+1) + 1 = 273)                            │
+ *   └─────────────────────────────────────────────────────┘
+ *
+ * V2 — DeepEncoder V2 (Qwen2-0.5B 架构):
+ *   ┌─────────────────────────────────────────────────────┐
+ *   │ 输入: [visual_tokens, causal_queries]               │
+ *   │   = [256, 896] + [256, 896] → [512, 896]           │
+ *   │   ↓ 24层 Transformer (混合注意力):                   │
+ *   │     RMSNorm → GQA(14Q头/2KV头, RoPE) → 残差         │
+ *   │     RMSNorm → SwiGLU FFN(4864) → 残差              │
+ *   │     视觉token: 双向注意力(可互相看到)                │
+ *   │     因果查询: 因果注意力(只看自己和之前)             │
+ *   │   ↓ 最终 RMSNorm                                    │
+ *   │   ↓ 取因果查询的输出 → [256, 896]                   │
+ *   │   ↓ Projector(896→1280) → [256, 1280]              │
+ *   │   ↓ + view_seperator                               │
+ *   │ 输出: 257 tokens [257, 1280]                         │
+ *   └─────────────────────────────────────────────────────┘
+ *
+ * 【CLIP位置编码插值】
+ * CLIP预训练位置编码为257个(1 CLS + 16×16=256 patches)
+ * 当输入正好256个patch时完美匹配，无需插值
+ * 否则需要双三次插值: [16×16] → [tgt_h × tgt_w]
+ *
+ * 【image_newline 的2D网格布局】(V1/V3)
+ * 256个视觉token按16×16网格排列，每行末尾插入1个newline token:
+ *   Row 0: [patch_0..15, newline]   ← 17 tokens
+ *   Row 1: [patch_16..31, newline]  ← 17 tokens
+ *   ...
+ *   Row 15: [patch_240..255, newline] ← 17 tokens
+ *   Last: [view_seperator]           ← 1 token
+ *   Total: 16×17 + 1 = 273 tokens
+ * newline告诉解码器图像空间结构的行边界
+ * ═══════════════════════════════════════════════════════════════════════
  *
  * V1: CLIP ViT-L/14 → takes SAM patch_embeds → CLIP output + SAM concat → projector
  * V2: Qwen2-0.5B based encoder with causal flow queries
@@ -150,31 +205,30 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
          *
          * Python's get_abs_pos: bicubic interpolation of spatial part to target size.
          * C implementation: for V3 with total_len=257, position_embedding[257][1024] matches exactly.
-         * For other sizes, we need to interpolate. */
-        if (total_len <= 257) {
-            /* Direct copy — positions 0..total_len-1 fit within stored embedding */
+         * For other sizes, we need to interpolate (both smaller and larger). */
+        int src_size = (int)sqrtf(256.0f);  /* 16x16 for original CLIP position embedding */
+        int tgt_size = (int)sqrtf((float)clip_n_patches);
+        if (tgt_size == src_size && total_len <= 257) {
+            /* Direct copy — no interpolation needed */
             for (int i = 0; i < total_len; i++) {
                 for (int d = 0; d < clip_dim; d++) {
                     x[i * clip_dim + d] += clip->position_embedding[i * clip_dim + d];
                 }
             }
         } else {
-            /* Need bicubic interpolation for larger sizes.
+            /* Need bicubic interpolation (tgt_size != src_size).
              * This follows Python's get_abs_pos:
              * 1. Split CLS and spatial part
              * 2. Reshape spatial to [1, dim, src_h, src_w]
              * 3. Bicubic interpolate to [1, dim, tgt_h, tgt_w]
              * 4. Reshape back and concatenate with CLS */
-            int src_size = (int)sqrtf(256.0f);  /* 16x16 for original CLIP */
-            int tgt_size = (int)sqrtf((float)clip_n_patches);
 
             /* Interpolate spatial part: position_embedding[1:257] = [256, 1024] */
             float *spatial_pos = (float *)malloc(256 * clip_dim * sizeof(float));
             memcpy(spatial_pos, clip->position_embedding + clip_dim, 256 * clip_dim * sizeof(float));
 
-            /* Reshape [256, 1024] → [1024, 16, 16] (CHW), bicubic resize → [1024, tgt_h, tgt_w] */
+            /* Bilinear interpolation from [src_size, src_size] to [tgt_size, tgt_size] */
             float *resized_pos = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
-            /* Simple bilinear interpolation (approximate — for non-standard sizes only) */
             for (int d = 0; d < clip_dim; d++) {
                 for (int th = 0; th < tgt_size; th++) {
                     for (int tw = 0; tw < tgt_size; tw++) {

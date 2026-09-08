@@ -1,40 +1,103 @@
 /*
  * ds_ocr.c - DeepSeek-OCR Pure C Inference Engine
+ * ds_ocr.c — DeepSeek-OCR 纯C推理引擎主协调器
+ * ds_ocr.c — DeepSeek-OCR 纯C推理引擎主协调器
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【模块角色】整个推理流水线的"总指挥"
+ * ─────────────────────────────────────────────────────────────────────
+ * 协调各个子模块（图像加载、SAM编码器、CLIP/DeepEncoder、MoE解码器、分词器），
+ * 完成从图像到OCR文本的端到端推理。
+ *
+ * 【完整推理流程】(详见 04-完整推理流程篇.md)
+ *
+ *   ┌──────────────────────────────────────────────────────────────┐
+ *   │ 1. 图像加载: ds_image_load() → RGB像素 [H, W, 3]           │
+ *   │ 2. 图像预处理: pad/resize/crop → 模型所需尺寸               │
+ *   │ 3. SAM编码: ds_sam_forward() → 视觉特征 [256, 1024/896]     │
+ *   │ 4. 编码器:                                                    │
+ *   │    V1/V3: CLIP(sam_features) → Concat(SAM,CLIP) → [256,2048]│
+ *   │    V2:   DeepEncoder(sam_features) → [256, 896]              │
+ *   │ 5. 投影: Projector(2048/896→1280) → 与解码器维度对齐         │
+ *   │ 6. 构造Prompt: [BOS] + image_tokens + prompt_text            │
+ *   │ 7. Prefill: 批量处理Prompt → 填充KV缓存                     │
+ *   │ 8. Decode循环: 逐token生成 → argmax → 下一个token → 文本     │
+ *   │ 9. 后处理: V3去除det/ref标签, 截断空格                       │
+ *   └──────────────────────────────────────────────────────────────┘
+ *
+ * 【三版本差异】(详见 ds_ocr.h 中的 ds_config_t)
+ *   V1: 单图1024×1024 + CLIP双编码器 + 标准因果注意力
+ *   V2: 多裁剪768×768 + DeepEncoder V2 + 标准因果注意力
+ *   V3: 单图1024×1024 + CLIP双编码器 + R-SWA滑动窗口注意力
+ *
+ * 【性能优化历程】(详见 05-性能优化实战篇.md)
+ *   v0.5(97s) → v0.7(28s) → v0.8(17s) → v0.9(15s) = 6.5×加速
+ *   关键优化: 并行N+1编码 / 批量sgemm Prefill / Argmax LM Head / 连续expert块
+ *
+ * 【与 qwen-asr 的对应】
+ *   qwen-asr: audio → Mel → Conv+Encoder → Proj → Dense Decoder → 文字
+ *   ds-ocr:   image → SAM → CLIP/DeepEncoder → Proj → MoE Decoder → 文字
+ *   结构相同，输入不同（音频 vs 图像），解码器不同（Dense vs MoE）
+ * ═══════════════════════════════════════════════════════════════════════
  *
  * Main coordinator: image → visual tokenizer → encoder → MoE decoder → text
  */
 
-#include "ds_ocr.h"
-#include "ds_kernels.h"
-#include "ds_safetensors.h"
-#include "ds_image.h"
-#include "ds_visual_tokenizer.h"
-#include "ds_deep_encoder.h"
-#include "ds_moe_decoder.h"
-#include "ds_tokenizer.h"
-#include "ds_quantize.h"
+#include "ds_ocr.h"                /* 公共头文件：常量、结构体、API声明 */
+#include "ds_kernels.h"            /* 数学内核：矩阵运算、线程池、RoPE */
+#include "ds_safetensors.h"       /* Safetensors权重读取器（mmap零拷贝） */
+#include "ds_image.h"             /* 图像加载与预处理（stb_image封装） */
+#include "ds_visual_tokenizer.h"  /* SAM视觉分词器：patch嵌入+Transformer编码 */
+#include "ds_deep_encoder.h"      /* DeepEncoder V2 (Qwen2-0.5B) / CLIP编码器 */
+#include "ds_moe_decoder.h"       /* MoE解码器：64路由专家+2共享专家 */
+#include "ds_tokenizer.h"         /* BPE分词器：token ID ←→ 文本 */
+#include "ds_quantize.h"          /* INT4/INT8量化工具 */
 
-#include "ds_dump.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <pthread.h>
-#include <sys/time.h>
-#include <sys/stat.h>
+#include "ds_dump.h"              /* 调试用tensor dump工具 */
+#include <stdio.h>   /* printf, fprintf, snprintf */
+#include <stdlib.h>  /* malloc, free, calloc, realloc, posix_memalign */
+#include <string.h>  /* memset, memcpy, memcmp, strstr */
+#include <math.h>    /* powf, fabsf, sqrtf */
+#include <pthread.h> /* 多线程并行裁剪编码 */
+#include <sys/time.h>/* gettimeofday — 毫秒级计时 */
+#include <sys/stat.h>/* stat — 文件状态检查 */
 
+/* ds_verbose — 全局日志详细度
+ * 0 = 静默（仅输出识别结果）
+ * 1 = 正常（显示加载进度、性能统计）
+ * 2 = 调试（显示每步token、权重加载详情）
+ * 3 = 详细（显示前几步的top-k logits）
+ */
 int ds_verbose = 1;
-int ds_bf16_simulate_python = 1;  /* BF16 intermediate truncation ON by default.
-                                     Matches Python BF16 computation path.
-                                     Without this, F32 precision diverges from Python
-                                     after 12 MoE layers, reducing EOS logit and causing
-                                     hallucinated output after OCR text is complete. */
-int g_dump_crop_id = -1;  /* Crop ID for per-crop dumps */
+
+/* ds_bf16_simulate_python — BF16中间截断开关
+ *
+ * 默认开启(1): 模拟Python PyTorch的BF16计算路径
+ * 在每层MoE的gate+up+down计算后，将F32结果截断为BF16精度再转回F32
+ * 这样C引擎的中间计算精度与Python一致
+ *
+ * 为什么必须开启?
+ *   Python PyTorch训练/推理使用BF16自动混合精度(AMP)
+ *   如果C引擎用F32全精度，12层MoE后累积误差使EOS logit偏低
+ *   导致OCR文本完成后不输出EOS，继续产生幻觉内容
+ *   开启后截断使C与Python精度一致，EOS在正确位置触发
+ *
+ * 关闭方式: 设置环境变量 DS_BF16_SIMULATE_PYTHON=0
+ */
+int ds_bf16_simulate_python = 1;
+
+/* g_dump_crop_id — 当前裁剪ID（用于调试dump，-1表示未设置）
+ * V2多裁剪模式下，每个裁剪编码时设置此值，便于ds_dump按crop ID保存中间结果
+ */
+int g_dump_crop_id = -1;
 
 /* ========================================================================
- * Timing Helper
+ * Timing Helper — 毫秒级计时器
  * ======================================================================== */
 
+/* now_ms: 获取当前时间的毫秒数（基于gettimeofday）
+ * 用于测量推理各阶段耗时：编码、prefill、decode
+ */
 static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -45,45 +108,63 @@ static double now_ms(void) {
 
 /* ========================================================================
  * V3 Streaming Det Tag Filter
+ * V3 流式 Det 标签过滤器
  *
- * Unlimited-OCR outputs <|det|>label [bbox]<|/det|> tags that contain
- * bounding box coordinates. During streaming (token-by-token output),
- * we buffer tokens that might be part of det/ref tags. When a complete
- * tag is detected, we suppress it (don't emit). Regular text is flushed
- * through as-is. This matches Python's re_match() behavior where
- * det/ref blocks are stripped from the output.
+ * 【背景】Unlimited-OCR (V3) 输出格式中包含检测标签:
+ *   <|det|>label [x1, y1, x2, y2]<|/det|>  ← 检测框坐标
+ *   <|ref|>...<|/ref|><|det|>...<|/det|>    ← 引用+检测对
+ * 这些标签对用户无用（只需要文本），需要实时过滤掉。
+ *
+ * 【挑战】标签可能跨多个token:
+ *   token1: "<|de"  token2: "t|>label"  token3: "[0,"  token4: "0]<|/det|>"
+ * 不能逐token判断——必须缓冲可能构成标签的token，确认后再决定输出或丢弃
+ *
+ * 【算法】状态机式缓冲:
+ *   1. 将每个token追加到缓冲区
+ *   2. 尝试匹配完整的 det/ref 标签模式
+ *   3. 匹配成功 → 丢弃整个标签，继续处理
+ *   4. 无法匹配 → 找到最后一个 '<'（可能是标签开始）
+ *      '<' 之前的文本安全输出，'<..' 之后继续缓冲
  * ======================================================================== */
 
-/* Check if the buffer contains a complete <|det|>...<|/det|> or
- * <|ref|>...<|/ref|><|det|>...<|/det|> pattern, and if so, strip it.
- * Returns: number of characters consumed from buf (0 = nothing to strip yet).
- * If a complete pattern is found, buf is modified in-place with the stripped
- * version and *out_new_len is set to the new length. */
+/* ds_try_strip_det_tag: 尝试从缓冲区中移除完整的det/ref标签
+ *
+ * 检测两种标签模式:
+ *   1. 独立 <|det|>...<|/det|> — 检测框标签（含标签名和坐标）
+ *   2. <|ref|>...<|/ref|><|det|>...<|/det|> — 引用+检测对
+ *
+ * 返回值: 消耗的字符数（0=未找到完整标签）
+ * 找到完整标签时，buf原地修改，*out_new_len设为新长度
+ */
 static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
-    /* Try standalone <|det|>...<|/det|> */
+    /* 尝试匹配独立 <|det|>...<|/det|> 模式 */
+    /* 从位置7开始搜索<|/det|>结束标签 */
     if (buf_len >= 7 && memcmp(buf, "<|det|>", 7) == 0) {
         for (int i = 7; i + 8 <= buf_len; i++) {
             if (memcmp(buf + i, "<|/det|>", 8) == 0) {
-                /* Found complete det tag: skip entire buf[0..i+8) */
+                /* 找到完整的det标签：跳过整个 buf[0..i+8) */
                 int consumed = i + 8;
                 *out_new_len = 0;
                 return consumed;
             }
         }
     }
-    /* Try <|ref|>...<|/ref|><|det|>...<|/det|> pair */
+    /* 尝试匹配 <|ref|>...<|/ref|><|det|>...<|/det|> 对 */
+    /* <|ref|>是7字符，<|/ref|>是8字符，<|det|>是7字符，<|/det|>是8字符 */
     if (buf_len >= 7 && memcmp(buf, "<|ref|>", 7) == 0) {
         int ref_end = -1;
+        /* 先找<|/ref|>结束位置 */
         for (int i = 7; i + 8 <= buf_len; i++) {
             if (memcmp(buf + i, "<|/ref|>", 8) == 0) {
                 ref_end = i + 8;
                 break;
             }
         }
+        /* ref结束后紧接着<|det|>，再找<|/det|> */
         if (ref_end > 0 && ref_end + 7 <= buf_len && memcmp(buf + ref_end, "<|det|>", 7) == 0) {
             for (int i = ref_end + 7; i + 8 <= buf_len; i++) {
                 if (memcmp(buf + i, "<|/det|>", 8) == 0) {
-                    /* Found complete ref+det pair: skip entire buf */
+                    /* 找到完整的ref+det对：跳过整个缓冲区内容 */
                     int consumed = i + 8;
                     *out_new_len = 0;
                     return consumed;
@@ -91,16 +172,22 @@ static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
             }
         }
     }
-    return 0;  /* No complete pattern found yet */
+    return 0;  /* 缓冲区中尚未出现完整标签模式 */
 }
 
-/* Stream a decoded token piece through the det tag filter.
- * Accumulates potential tag starts in ctx->_det_buf, and flushes
- * regular text through the token callback. */
+/* ds_stream_filter_det: 流式token经过det标签过滤器
+ *
+ * 逐个将解码后的token送入缓冲区累积，当判断缓冲区内容为完整标签时丢弃；
+ * 否则将非标签的安全前缀（'<'之前的内容）通过回调输出。
+ *
+ * 为什么不能逐token判断?
+ *   BPE分词可能将一个标签切分成多个token，如 "<|de" + "t|>"
+ *   缓冲后才能正确识别完整的标签边界
+ */
 static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
     if (!ctx || !piece || !ctx->token_cb) return;
     if (ctx->config.model_version != 3) {
-        /* Non-V3: pass through directly */
+        /* 非V3模型：直接透传，无需缓冲过滤det标签 */
         ctx->token_cb(piece, ctx->token_cb_userdata);
         return;
     }
@@ -267,6 +354,20 @@ static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
 
 /* ========================================================================
  * Parallel crop encoding (for multi-crop SAM + encoder)
+ * V2 并行多裁剪编码
+ *
+ * 【设计原理】
+ * V2 模型处理大图像时，将图像分割为多个768×768的局部裁剪 + 1个1024×1024全局图。
+ * 每个裁剪的编码完全独立（SAM + DeepEncoder 无数据依赖），天然可并行。
+ *
+ * 【性能对比】
+ *   串行 (v0.5): global(12s) + local1(9.5s) + ... + local4(9.5s) = ~50s
+ *   并行 (v0.9): max(global(12s), local(9.5s)) = ~9s → 实测5.5×加速
+ *
+ * 【线程模型】
+ *   N+1 个 worker 线程同时启动（N个local + 1个global）
+ *   M2 Pro: 6个性能核 + 4个能效核，5个worker自然分到不同核心
+ *   性能核处理全局图（1024²，计算量大），能效核处理局部裁剪（768²，计算量小）
  * ======================================================================== */
 
 typedef struct {
@@ -342,7 +443,16 @@ static void *crop_worker_global(void *arg) {
 }
 
 /* ========================================================================
- * Configuration Detection
+ * Configuration Detection — 模型版本自动检测
+ *
+ * 读取 config.json，通过关键字检测模型版本:
+ *   V3 (Unlimited-OCR): 包含 "sliding_window_size" 或 "unlimited-ocr"
+ *   V2 (DeepEncoder V2): 包含 "DeepEncoderV2" 或 "causal_flow" 或 enc_type=2
+ *   V1 (DeepSeek-OCR): 以上都不匹配 → 默认V1
+ *
+ * 【为什么需要自动检测?】
+ * 三个版本共享大部分代码，差异仅在编码器类型和注意力机制。
+ * 自动检测让用户无需指定版本，一个二进制兼容所有模型。
  * ======================================================================== */
 
 static int detect_model_version(const char *model_dir) {
@@ -515,7 +625,24 @@ static void init_config(ds_config_t *cfg, int version) {
 }
 
 /* ========================================================================
- * Weight Loading
+ * Weight Loading — 权重加载
+ *
+ * 【加载策略】
+ * 编码器权重 (SAM/CLIP/DeepEncoder): 以 F32 格式加载（预转换，适合批量计算）
+ * 解码器权重 (MoE Decoder): 以 BF16 格式零拷贝加载（mmap直接指针，适合逐token解码）
+ * 路由器权重 (Gate): 同时保留 BF16 和 F32 两个版本（BF16保精度，F32备用）
+ * 归一化权重 (RMSNorm/LayerNorm): 以 F32 格式加载（维度小，精度敏感）
+ *
+ * 【融合权重构建】
+ * 加载完成后，为每个MoE层构建:
+ *   1. gate_up_fused: gate和up权重拼接为 [2*moe_inter, hidden]，
+ *      推理时只需1次matvec代替2次，更好的缓存复用
+ *   2. 连续expert_block: 所有64个expert + shared的gate_up_fused
+ *      在一块连续内存中，减少page fault（v0.9优化，2.4× MoE加速）
+ *
+ * 【加载宏】
+ *   LOAD_F32(name, target) — 查找tensor → 转F32 → 存入target
+ *   LOAD_BF16(name, target) — 查找tensor → 取BF16直接指针 → 存入target（零拷贝）
  * ======================================================================== */
 
 static int load_all_weights(ds_ctx_t *ctx) {
@@ -910,7 +1037,27 @@ int ds_quantize_moe_int4(ds_ctx_t *ctx) {
 }
 
 /* ========================================================================
- * Context Allocation
+ * Context Allocation — 上下文缓冲区分配
+ *
+ * 【KV缓存】
+ * 布局: [layers, max_seq, kv_dim]，F32格式，cache-line 64字节对齐
+ * 为什么用F32而非BF16存储?
+ *   之前用BF16存储，但每步decode都要将整个KV缓存BF16→F32转换
+ *   对于长序列(1000+ tokens)，每层每步转换1000+元素，12层×2(K和V) = 24000+次转换
+ *   这完全占据了注意力计算时间！
+ *   改为F32存储后: 内存翻倍(240MB→480MB)，但消除所有转换开销
+ *
+ * 【行对齐】
+ * kv_row_stride = (kv_dim + 15) & ~15 — 将每行长度向上取整到16个float(64字节)
+ * 这样每行起始地址对齐到cache line，注意力计算时内存访问更高效
+ *
+ * 【预分配复用缓冲区】
+ * 所有decode步骤共享同一组缓冲区（gate_buf, up_buf等），避免反复malloc/free
+ * 这是安全的，因为MoE专家串行处理，不同专家可复用同一块内存
+ *
+ * 【RoPE预计算】
+ * 一次性计算所有位置的cos/sin值（4096个位置），decode时直接查表
+ * 比每步重新计算快得多，且结果完全精确
  * ======================================================================== */
 
 static int alloc_decoder_buffers(ds_ctx_t *ctx) {
@@ -1030,7 +1177,12 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
 }
 
 /* ========================================================================
- * Public API
+ * Public API — 公共API函数
+ *
+ * ds_load()     — 加载模型（检测版本→打开权重→加载→分配缓冲区→初始化Metal）
+ * ds_free()     — 释放所有资源（Metal→safetensors→KV缓存→解码缓冲区→expert块→ctx）
+ * ds_recognize()  — 从图像文件路径识别文字
+ * ds_recognize_image() — 从RGB像素识别文字（核心实现）
  * ======================================================================== */
 
 ds_ctx_t *ds_load(const char *model_dir) {
@@ -1294,7 +1446,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         }
 
         if (use_crop && !pil_pixels) {
-            crops = ds_dynamic_preprocess(&img, 768, 1, 12, 0, &n_crops);
+            crops = ds_dynamic_preprocess(&img, 768, 2, 6, 0, &n_crops);
             if (!crops || n_crops < 1) {
                 fprintf(stderr, "dynamic_preprocess failed\n");
                 return NULL;
@@ -1573,26 +1725,33 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     } else if (cfg->model_version == 3 && cfg->enc_type == 1) {
         /* ── V3 (Unlimited-OCR) multi-crop path ──
          *
-         * Python logic:
-         *   1. Global: pad(1024) → SAM → CLIP → Projector → [256, 1280]
-         *      → view(16,16,dim), cat(newline per row) → [16,17,dim] → [272, 1280]
-         *   2. Local: dynamic_preprocess(640) → N crops, each → [100, 1280]
-         *      → view(crop_h, crop_w, 10, 10, dim).permute→reshape(h*10, w*10, dim)
-         *      → cat(newline per row) → [h*10, w*10+1, dim]
-         *   3. Concat: [local, global, view_seperator]
+         * Python logic (infer() default: base_size=1024, image_size=640):
+         *   Small image (≤640): pad(image_size=640) → SAM(100) → CLIP(100) → Proj(111)
+         *     tokenized_image = ([128815]*10+[128815])*10+[128815] = 111 tokens
+         *   Large image (>640):
+         *     Global: pad(base_size=1024) → SAM(256) → CLIP(256) → Proj(273)
+         *     Local: dynamic_preprocess(640) → N crops, each → SAM(100)→CLIP(100)→Proj(111)
+         *       strip newlines, reassemble grid, re-insert newlines
+         *     Concat: [local, global(272), view_seperator]
          *
-         * CLIP encoder returns tokens WITH newlines (273/111).
+         * CLIP encoder returns tokens WITH newlines (273 for 1024², 111 for 640²).
          * We strip newlines, then re-insert in correct grid layout.
          */
         ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
         int use_crop = (width > 640 || height > 640);
-        int ggrid = 16;  /* 1024/16/4 */
         int lgrid = 10;  /* 640/16/4 */
         float *nl = ctx->vis_tokenizer.image_newline;
         float *vsep = ctx->vis_tokenizer.view_seperator;
 
-        /* ── Global view ── */
-        ds_image_t *gimg = ds_image_pad(&img, 1024, 127);
+        /* ── Global view ──
+         * Python: small image → pad(image_size=640), large image → pad(base_size=1024)
+         * Small image: 640×640 → SAM 100 tokens → CLIP 111 tokens (10 rows × 11 + 1 view_sep)
+         * Large image: 1024×1024 → SAM 256 tokens → CLIP 273 tokens (16 rows × 17 + 1 view_sep)
+         */
+        int global_size = use_crop ? 1024 : 640;
+        int ggrid = global_size / 16 / 4;  /* 1024→16, 640→10 */
+
+        ds_image_t *gimg = ds_image_pad(&img, global_size, 127);
         if (!gimg) return NULL;
         double t_v3sam = ds_time_sec();
         int n_sg; float *sg = ds_sam_forward_image(ctx, gimg, &n_sg, NULL);
@@ -1787,7 +1946,17 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 
     double encode_end = now_ms();
 
-    /* Step 3: Build decoder input sequence */
+    /* ── Step 3: 构造解码器输入序列 ──
+     * 将编码器输出(视觉token) + prompt文本(token IDs) 拼接为解码器输入
+     * 不同版本有不同的prompt格式和token布局:
+     *
+     * V1: [BOS][img_start][encoder_output(273)][img_end][\nFree OCR.]
+     * V2: [BOS][encoder_output(n_img_tokens)][\nFree OCR.]
+     * V3: [BOS][image_placeholder(128815)×n][\ndocument parsing.]
+     *
+     * 每个token通过 tok_embeddings 查表得到嵌入向量 [hidden=1280]
+     * 图像token位置用编码器输出覆盖嵌入值
+     */
 
 prompt_construction:
     /* Optional: skip SAM+encoder entirely by loading Python's encoder output.
@@ -1843,57 +2012,51 @@ prompt_construction:
         /* V2 prompt format matching Python model.infer() with sft_format='plain':
          * Python prompt = '<image>\nFree OCR. '
          * With multi-crop: encoder_output already contains [local, global, view_sep]
-         * C equivalent: [BOS] + encoder_output(n_encoder_tokens) + '\nFree OCR. '(5 tokens)
+         * C equivalent: [BOS] + image_tokens + '\nFree OCR.'(4 tokens)
          * Note: PLAIN template has no role tokens — roles=("", ""), sep=""
+         *
+         * Python's masked_scatter layout:
+         *   images_seq_mask True positions = [global(257), local(W*H*100)]
+         *     where global = num_queries_base^2 + 1 = 16*16+1 = 257
+         *     and local = (num_queries*W) * (num_queries*H) = 10*W * 10*H per crop
+         *   source = cat([local_features(N*144), global_features(256), view_sep(1)])
+         *   masked_scatter fills True positions IN ORDER from source[0].
+         *   So: global_slots[0:257] ← source[0:257] = local[0:257]
+         *       local_slots[0:M]   ← source[257:257+M] = local[257:] + global[0:...]
          */
-        /* Compute image_size=640 token layout (must match Python model.infer() default) */
         int ds_image_size = 640;
         int ds_num_queries = (ds_image_size + 15) / 16 / 4;  /* ceil(640/16/4) = 10 */
+        int ds_num_queries_base = (1024 + 15) / 16 / 4;      /* ceil(1024/16/4) = 16 */
         int ds_local_tokens_per_crop = ds_num_queries * ds_num_queries;  /* 100 */
-        int n_crops_count = (n_encoder_tokens - 257) / 144;  /* works for 1 or 6 crops */
-        if (n_crops_count < 0) n_crops_count = 0;  /* safety */
-        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;
-        int n_global_slots = 256;
-        int n_sep_slots = 1;
-        int n_img_tokens = n_global_slots + n_sep_slots + n_local_slots;
-        int n_local_enc = n_encoder_tokens - 257;
+        int n_local_enc = n_encoder_tokens - 257;  /* local features count */
         if (n_local_enc < 0) n_local_enc = 0;
+        int n_crops_count = n_local_enc / 144;
+        int n_global_slots = ds_num_queries_base * ds_num_queries_base + 1; /* 257: 256 global + 1 sep */
+        int n_local_slots = n_crops_count * ds_local_tokens_per_crop;
+        int n_img_tokens = n_global_slots + n_local_slots;  /* total True positions */
 
         int n_text_after = 0;
         int *text_after_ids = NULL;
         if (tokenizer) {
-            /* Encode text after image using BPE tokenizer.
-             * Python format_messages strips each message's content and the final prompt,
-             * so "<image>\nFree OCR. " (with trailing space) becomes "<image>\nFree OCR."
-             * after strip(). Text after image = "\nFree OCR." (no trailing space).
-             * Expected: [201, 21431, 126041, 16] (4 tokens) */
             text_after_ids = ds_tokenizer_encode(tokenizer, "\nFree OCR.", &n_text_after);
             if (!text_after_ids || n_text_after <= 0) {
-                /* Fallback: use verified hardcoded IDs if tokenizer fails */
                 static const int fallback_ids[] = {201, 21431, 126041, 16};
                 n_text_after = 4;
                 text_after_ids = (int *)malloc(n_text_after * sizeof(int));
                 memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
             }
             if (ds_verbose >= 1) {
-                fprintf(stderr, "Prompt: BOS + img(%d) + after(%d) = %d tokens\n",
-                        n_img_tokens, n_text_after, 1 + n_img_tokens + n_text_after);
+                fprintf(stderr, "V2 Prompt: BOS + img(%d = global%d + local%d) + after(%d) = %d\n",
+                        n_img_tokens, n_global_slots, n_local_slots, n_text_after,
+                        1 + n_img_tokens + n_text_after);
             }
         }
 
-        /* prefix = BOS(1) + image_tokens(n_img_tokens) + text_after(n_text_after)
-         * Note: n_img_tokens may differ from n_encoder_tokens when image_size=640
-         * because some encoder tokens are dropped by Python's masked_scatter. */
-        /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
-
         if (ds_verbose >= 1) {
-            fprintf(stderr, "Image size config: image_size=%d, num_queries=%d, "
-                   "local_tokens/crop=%d, crops=%d\n",
-                   ds_image_size, ds_num_queries, ds_local_tokens_per_crop, n_crops_count);
-            fprintf(stderr, "Token layout: %d image tokens from local_enc[0:%d] "
-                   "(encoder has %d local, dropping %d + global/sep dropped)\n",
-                   n_img_tokens, n_img_tokens,
-                   n_local_enc, n_local_enc - n_img_tokens);
+            fprintf(stderr, "V2 Layout: image_size=%d, num_queries=%d, "
+                   "local_tokens/crop=%d, crops=%d, local_enc=%d, n_enc=%d\n",
+                   ds_image_size, ds_num_queries, ds_local_tokens_per_crop,
+                   n_crops_count, n_local_enc, n_encoder_tokens);
         }
 
         prefix_len = 1 + n_img_tokens + n_text_after;
@@ -1916,27 +2079,17 @@ prompt_construction:
         /* 1. BOS token (id=0) */
         EMBED_TOKEN(DS_TOKEN_BOS);
 
-        /* 2. Encoder output tokens — layout must match Python model.forward() behavior.
+        /* 2. Image tokens — must match Python's masked_scatter layout.
          *
-         * Python constructs: source = cat([local_features(864), global_features(256), view_sep(1)])
-         *   → 1121 elements total (after projector, dim=1280)
+         * Python: images_seq_mask True positions = [global(257), local(n_local_slots)]
+         * Source = encoder_output = [local(n_local_enc), global(256), view_sep(1)]
+         * masked_scatter fills True positions sequentially from source:
+         *   global_slots (257 positions) ← source[0:min(257, n_local_enc)]
+         *   local_slots  (n_local_slots) ← source[257:257+n_local_slots] (may wrap into global/sep)
          *
-         * Then masked_scatter_(images_seq_mask, source) fills 857 True positions
-         * with source[0:857] = local_features[0:857].
-         *
-         * With image_size=640: num_queries=10, local_tokens_per_crop=100
-         * Image positions = 857 (from image_size*image_size/14/14 = 640*640/196 ≈ 2088?
-         *   No — it's image_size/16/4=10, so local_slots = 6*100=600, plus global=256 + sep=1 = 857)
-         * 
-         * Key insight: ALL 857 image positions are filled with local_enc[0:857].
-         * The global features and sep in the source are AFTER local[864], so they
-         * land at source[864:1121] which is BEYOND the 857 True positions — they're dropped.
-         * Local_enc[857:864] (7 tokens, last ~1.17 per crop) are also dropped.
-         *
-         * So C simply copies local_enc[0:857] into positions 1-857. */
-        /* (Variables already computed above: n_img_tokens, n_local_slots, n_local_enc, etc.) */
-
-        /* Debug: dump encoder_output for Python decoder comparison */
+         * We simulate this by iterating through True positions in order and
+         * copying from source in order.
+         */
         if (getenv("DS_DUMP_ENCODER")) {
             FILE *df = fopen("dump/c_encoder_output.bin", "wb");
             if (df) { fwrite(encoder_output, sizeof(float), n_encoder_tokens * hidden, df); fclose(df); }
@@ -1944,34 +2097,17 @@ prompt_construction:
                     n_encoder_tokens, hidden);
         }
 
-        /* Apply Python model's masked_scatter layout:
-         *
-         * Python constructs: tokenized_image = [global(256), sep(1), local(N)]
-         * These become True positions in images_seq_mask.
-         * Source for masked_scatter = cat([local_features, global_features, view_sep])
-         * So source = [local(n_local_enc), global(n_global_enc), sep(1)].
-         *
-         * masked_scatter fills True positions IN ORDER with source elements:
-         *   pos 0..255 (global slots)  <- source[0:256]  = local[0:256]
-         *   pos 256   (sep slot)       <- source[256]    = local[256]
-         *   pos 257..(n_img_tokens-1)  <- source[257:n_img_tokens]
-         *     = if n_img_tokens <= n_local_enc: local[257:n_img_tokens]
-         *     = if n_img_tokens >  n_local_enc: local[257:n_local_enc] + global[0:n_img_tokens-n_local_enc]
-         *
-         * Since encoder_output layout = [local, global, sep], we can simply copy
-         * encoder_output[0:n_img_tokens] which matches source[0:n_img_tokens]. */
-        float *enc = encoder_output;
-        int img_pos = pos;  /* starts at 1 (after BOS) */
-
-        /* Copy source[0:n_img_tokens] = enc[0:n_img_tokens] into image positions */
+        /* Simulate masked_scatter: fill n_img_tokens True positions from source in order.
+         * Source = enc = [local(n_local_enc), global(256), view_sep(1)].
+         * We copy source[0..n_img_tokens-1] into image_positions (1..n_img_tokens).
+         * Since image_positions in input_embeds are contiguous after BOS,
+         * this is just a contiguous copy of the first n_img_tokens source elements.
+         * Any source elements beyond n_img_tokens are dropped (masked_scatter truncation). */
         int n_copy = n_img_tokens < n_encoder_tokens ? n_img_tokens : n_encoder_tokens;
-        memcpy(input_embeds + img_pos * hidden, enc, n_copy * hidden * sizeof(float));
-        img_pos += n_copy;
-        /* If n_img_tokens > n_encoder_tokens (shouldn't happen),
-         * remaining positions stay zero. */
-        pos = img_pos;
+        memcpy(input_embeds + pos * hidden, encoder_output, n_copy * hidden * sizeof(float));
+        pos += n_img_tokens;
 
-        /* 3. Text after image: "\nFree OCR. " (5 tokens) */
+        /* 3. Text after image: "\nFree OCR." (4 tokens) */
         for (int t = 0; t < n_text_after; t++) EMBED_TOKEN(text_after_ids[t]);
 
         #undef EMBED_TOKEN
@@ -1991,8 +2127,8 @@ prompt_construction:
          * Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
          *
          * Image token count = n_encoder_tokens (from CLIP+SAM+Projector):
-         *   - Small image (<=640): [global(273), view_sep(1)] = 274
-         *   - Large image (>640):  [local(N), global(273), view_sep(1)] = N+274
+         *   - Small image (≤640): [global(110), view_sep(1)] = 111
+         *   - Large image (>640):  [local(N), global(272), view_sep(1)] = N+273
          *     where N = (crop_h*10)*(crop_w*10+1)
          *
          * Python's masked_scatter places all encoder tokens into the
@@ -2153,8 +2289,18 @@ prompt_construction:
         }
     }
 
-    /* Step 4: Reset KV cache and prefill (all but last token),
-     * then use decoder_forward with last token to get first predicted token */
+    /* ── Step 4: 重置KV缓存 + Prefill ──
+     *
+     * Prefill: 将所有prefix token(视觉+prompt)一次性送入解码器
+     * 使用批量矩阵乘法(sgemm)高效处理整个序列
+     * 结果: KV缓存被填满，第一个生成token的logits可用
+     *
+     * 为什么prefill而非逐token?
+     *   逐token: 280 tokens × 12层 × ~23ms/step = ~77s（太慢！）
+     *   批量prefill: 一次sgemm处理所有token = ~0.7s（100×加速）
+     *
+     * Python对应: model.generate() 先prefill整个prompt，再自回归decode
+     */
     ctx->kv_cache_len = 0;
 
     float *dec_input = (float *)malloc(hidden * sizeof(float));
@@ -2285,7 +2431,23 @@ prompt_construction:
         ds_set_threads(n_total);
     }
 
-    /* Step 5: Autoregressive decoding */
+    /* ── Step 5: 自回归解码循环 ──
+     *
+     * 核心循环: 每步生成1个token，直到EOS或达到max_new_tokens
+     *
+     * 每步流程:
+     *   1. ds_decoder_forward(ctx, dec_input) → token_id
+     *      内部: 12层decoder前向 → argmax(lm_head @ x) → next_token_id
+     *   2. 检查EOS → 如果提前到达EOS且<min_new_tokens，抑制并选次优token
+     *   3. 记录token到历史（用于重复惩罚）
+     *   4. ds_tokenizer_decode(token_id) → 文本片段 → 追加到输出
+     *   5. tok_embeddings[token_id] → 下一步的输入嵌入
+     *
+     * 【V3 特殊处理】
+     * - EOS抑制: V3模型F32精度下EOS logit偏高，前32步需禁用EOS+Ġ
+     * - R-SWA: 解码器注意力只看reference(视觉)+window(最近128个文本token)
+     * - det标签过滤: 流式输出时实时过滤<|det|>...<|/det|>检测标签
+     */
 
     /* Build output string */
     int capacity = 4096;
@@ -2455,16 +2617,22 @@ prompt_construction:
         out_len = ds_strip_det_tags(output, out_len);
         /* V3 hallucination prefix removal: when the model's first token
          * is forced past EOS, it may generate a short English hallucination
-         * before the actual OCR content. Common pattern:
-         * "The image contains no text... [No text detected]\n<actual OCR>"
+         * before the actual OCR content. Common patterns:
+         *   "The image contains no text... [No text detected]\n<actual OCR>"
+         *   "The image contains no text... Therefore... [No text detected]\n<actual OCR>"
          * Strip everything up to and including "[No text detected]" marker.
-         * Only strip if the marker appears early (within first 200 chars). */
+         * If no marker found, also check for English-only prefix before CJK text. */
         if (out_len > 20) {
+            /* Skip leading whitespace for pattern matching */
+            int start = 0;
+            while (start < out_len && (output[start] == ' ' || output[start] == '\n'))
+                start++;
             const char *marker = "[No text detected]";
             int mlen = 18;
-            /* Search for marker in first 400 chars */
-            int search_len = out_len < 400 ? out_len : 400;
-            for (int i = 0; i + mlen <= search_len; i++) {
+            /* Search for marker in first 400 chars from start */
+            int search_len = (out_len - start) < 400 ? (out_len - start) : 400;
+            int stripped = 0;
+            for (int i = start; i + mlen <= start + search_len; i++) {
                 if (memcmp(output + i, marker, mlen) == 0) {
                     int skip = i + mlen;
                     /* Skip whitespace/newlines after marker */
@@ -2474,7 +2642,53 @@ prompt_construction:
                         memmove(output, output + skip, out_len - skip + 1);
                         out_len -= skip;
                     }
+                    stripped = 1;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "V3: stripped hallucination prefix to: [%s]\n", output);
                     break;
+                }
+            }
+            /* If no [No text detected] marker, try stripping English-only prefix
+             * before first CJK/meaningful content. Pattern: the model generates
+             * a sentence starting with "The image..." before real OCR output.
+             * Look for double-newline boundary where actual content starts. */
+            if (!stripped && out_len > 50) {
+                /* Check if output starts with common hallucination phrases
+                 * (after leading whitespace) */
+                const char *halluc_starts[] = {
+                    "The image contains no text",
+                    "There is no text",
+                    "No text is present",
+                    "The OCR result",
+                    NULL
+                };
+                for (int h = 0; halluc_starts[h]; h++) {
+                    int hlen = (int)strlen(halluc_starts[h]);
+                    if (start + hlen <= out_len && memcmp(output + start, halluc_starts[h], hlen) == 0) {
+                        /* Find end of this English paragraph (double newline or first CJK char) */
+                        int skip = start + hlen;
+                        /* Skip to end of English sentence(s) — look for \n\n or first CJK */
+                        while (skip < out_len) {
+                            unsigned char c = (unsigned char)output[skip];
+                            /* CJK range: bytes 0xE0+ in UTF-8 */
+                            if (c >= 0xE0) break;
+                            /* Double newline */
+                            if (skip + 1 < out_len && output[skip] == '\n' && output[skip+1] == '\n') {
+                                skip += 2;
+                                break;
+                            }
+                            skip++;
+                        }
+                        /* Skip trailing whitespace/newlines */
+                        while (skip < out_len && (output[skip] == '\n' || output[skip] == ' '))
+                            skip++;
+                        if (skip < out_len && skip > start) {
+                            memmove(output, output + skip, out_len - skip + 1);
+                            out_len -= skip;
+                        }
+                        stripped = 1;
+                        break;
+                    }
                 }
             }
         }
@@ -2515,10 +2729,22 @@ prompt_construction:
     return output;
 }
 
-/* Strip V3 detection/ref tags from output text.
- * Removes: <|det|>label [x1, y1, x2, y2]<|/det|> and <|ref|>...<|/ref|><|det|>...<|/det|>
- * Keeps: the text content between detection blocks.
- * Returns new string length. */
+/* ds_strip_det_tags — V3后处理：去除检测坐标标签
+ *
+ * V3 (Unlimited-OCR) 输出格式:
+ *   "实际文字<|det|>text [bbox]<|/det|>更多文字<|ref|>...<|/ref|><|det|>...<|/det|>..."
+ * 用户只需要文字，不需要检测框坐标，所以需要去除 det/ref 标签。
+ *
+ * 算法: 读写双指针法
+ *   read指针扫描原文，write指针写入过滤后结果
+ *   遇到<|det|>...<|/det|> → 跳过整个块
+ *   遇到<|ref|>...<|/ref|><|det|>...<|/det|> → 跳过整个ref+det对
+ *   其他文本 → 直接复制
+ *
+ * 后处理: 合并连续多个换行为最多2个
+ *
+ * Python对应: outputs.replace(a_match_other, '')
+ */
 int ds_strip_det_tags(char *text, int len) {
     if (!text || len <= 0) return len;
 

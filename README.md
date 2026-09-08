@@ -32,13 +32,29 @@ make blas
 | **HuggingFace ID** | `deepseek-ai/DeepSeek-OCR` | `deepseek-ai/DeepSeek-OCR-2` | `baidu/Unlimited-OCR` |
 | **Encoder** | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 + R-SWA |
 | **Decoder** | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA |
-| **Input** | 1024×1024 (stretch) | Dynamic multi-crop | 640×640 (pad) |
-| **Visual tokens** | 256 | 857 (6-crop) | 273 |
+| **Input** | 1024×1024 (stretch) | Dynamic multi-crop (768, 2–6 crops) | 640×640 (pad) + multi-crop |
+| **Visual tokens** | 256 | 857 (6-crop) | 111 ~ 3323 (1~30 crops) |
 | **Prompt** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
 | **C support** | ✅ Full | ✅ Full | ✅ Full + EOS fix |
 | **Model size** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
 
 ### Benchmark
+
+#### M4 Max (14-core, 36 GB, CPU BLAS), 1600×2264 document (Unlimited-OCR cover, 6 crops) — current build
+
+| Metric | V1 | V2 (6-crop) | V3 (Unlimited-OCR, 6 crops) |
+|--------|----|----|-----------------------------|
+| **Total time** | 6.9s | 10.9s | 12.6s *(was 20.6s)* |
+| **Encoding** | 5.6s (SAM 5.1 + CLIP 0.5) | 8.7s | 7.5s *(was 13.8s)* |
+| **Prefill** | 0.6s (280 tokens) | 1.8s (862 tokens) | 1.8s (908 tokens) *(was 3.5s)* |
+| **Decode** | 0.7s (33 tokens) | 0.4s (16 tokens) | 3.2s (136 tokens) |
+| **Decode speed** | 47.9 tok/s | 39.7 tok/s | 42.3 tok/s |
+| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags + orphan closing-tag prefix stripped) |
+
+> V3 speedups vs the previous release: parallel crop encoding (SAM+CLIP run
+> concurrently across crops, like V2), parallel BF16→F32 weight conversion in
+> prefill, and float32 attention softmax in SAM. V2 prefill gains from the same
+> parallel conversion; V1 from the SAM softmax change.
 
 #### M2 Pro (10-core, 16 GB, BLAS + Metal GPU), 6-crop V2 image (595×841)
 
@@ -55,32 +71,21 @@ make blas
 > benefits memory-constrained devices and x86; on M2 Pro with Metal, decode speed is
 > similar to BF16 due to GPU overhead.
 
-#### M4 Max (14-core, 36 GB, CPU BLAS), 1600×2264 document (Unlimited-OCR cover, 6 crops)
+#### M2 Pro (8 threads, CPU BLAS), 1794×1578 large image + 400×100 small image (historical)
 
-| Metric | V1 | V2 (6-crop) | V3 (Unlimited-OCR, 6 crops) |
-|--------|----|----|-----------------------------|
-| **Total time** | 6.9s | 10.9s | 12.6s *(was 20.6s)* |
-| **Encoding** | 5.6s (SAM 5.1 + CLIP 0.5) | 8.7s | 7.5s *(was 13.8s)* |
-| **Prefill** | 0.6s (280 tokens) | 1.8s (862 tokens) | 1.8s (908 tokens) *(was 3.5s)* |
-| **Decode** | 0.7s (33 tokens) | 0.4s (16 tokens) | 3.2s (136 tokens) |
-| **Decode speed** | 47.9 tok/s | 39.7 tok/s | 42.3 tok/s |
-| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags + orphan closing-tag prefix stripped) |
+| Metric | V1 | V2 ⭐ | V3 |
+|--------|----|----|-----|
+| **Total time (large)** | 12.2s | 14.8s | 79.7s (30 crops) |
+| **Encoding** | 6.1s | 8.8s | 43.0s (30 crops × SAM+CLIP) |
+| **Prefill** | 1.0s (280 tok) | 1.0s (662 tok) | 6.4s (3328 tok) |
+| **Decode** | 5.0s (238 tok) | 5.0s (224 tok) | 30.3s (499 tok) |
+| **Decode speed** | 47.3 tok/s | 44.4 tok/s | 16.5 tok/s |
+| **Total time (small)** | 8.9s | 10.9s | 2.5s |
+| **Decode speed (small)** | 38.8 tok/s | 36.9 tok/s | 48.0 tok/s |
+| **Visual tokens (small)** | 256 | 257 | 111 |
 
-> V3 speedups vs the previous release: parallel crop encoding (SAM+CLIP run
-> concurrently across crops, like V2), parallel BF16→F32 weight conversion in
-> prefill, and float32 attention softmax in SAM. V2 prefill gains from the same
-> parallel conversion; V1 from the SAM softmax change.
-
-#### M2 Pro vs M4 Max Comparison (CPU BLAS, V2 6-crop)
-
-| Stage | M2 Pro | M4 Max (est.) | Ratio |
-|-------|--------|---------------|-------|
-| SAM+Encoder | 9.0s | ~5.8s | 1.55× |
-| Prefill (~660 tok) | 0.93s | ~0.6s | 1.55× |
-| Decode (226 tok) | 5.1s | ~3.3s | 1.55× |
-| **Total** | **15.0s** | **~9.7s** | **1.55×** |
-
-> M4 Max scaling: CPU single-thread ~1.35×, multi-thread ~1.55×, memory BW ~1.37×.
+> Measured before V3 parallel crop encoding landed; on the current build the
+> 30-crop encoding phase runs ~6× faster (see v1.1 optimizations below).
 
 #### Model Quality Comparison
 
@@ -90,9 +95,11 @@ make blas
 | **V1** | Fastest single-crop, simplest pipeline | 1024×1024 stretch, BF16 precision typos | Quick scans, small images |
 | **V3** | Detailed output, sliding window attention | More crops for large images (parallel-encoded), occasional structural-tag artifacts (auto-stripped) | Small images ≤640px, structured docs |
 
-> V3's decode speed is ~3× slower than V1/V2 due to LlamaAttention (10 heads × 128 dim)
-> vs DeepSeek-V2 MLA compression. For small images (≤640px, 1 crop), V3 matches V1
-> decode speed at ~47 tok/s.
+> **Recommendation**: V2 is the best all-round choice — multi-crop handles any image size,
+> DeepEncoder V2 produces the most accurate encoder output.
+> V1 is faster but stretches images to 1024×1024 (aspect distortion) and has minor precision typos.
+> V3 excels on small images (2.5s vs 8-11s for V1/V2) and supports language detection.
+> On small images (≤640px, 1 crop), V3 matches V1 decode speed at ~47 tok/s.
 
 ## Performance
 
@@ -276,13 +283,15 @@ Inference: 71116 ms, 362 text tokens (10.2 tok/s decode)
 <summary>V2 Multi-Crop Preprocessing</summary>
 
 1. `find_closest_aspect_ratio()` selects optimal crop ratio (min aspect diff, area tie-breaker)
-2. Large image (e.g. 1938×1210) → ratio (3,2) → 6 local crops of 768×768
+2. `dynamic_preprocess(min_num=2, max_num=6)`: e.g. 1794×1578 → ratio (2,2) → 4 local crops of 768×768
 3. Small image (both dims ≤768) → ratio (1,1) → 1 local crop of 768×768
 4. Global view: `ImageOps.pad()` → 1024×1024 (always present)
 5. SAM: N local + 1 global → [896,12,12] / [896,16,16]
-6. Token layout (image_size=640): num_queries=10 → 857 image slots
-7. masked_scatter: 1121→857 (truncate overflow)
-8. Prefix: BOS(1) + 857 image + 4 text ("\nFree OCR.") = 862 tokens
+6. DeepEncoder V2: 144 visual + 144 causal flow → 144 out per crop, 256 out for global
+7. Token layout (image_size=640): num_queries=10 → 100 slots/crop, 257 global slots
+8. masked_scatter: source=[local,global,sep] → fill [global(257),local(400)] positions
+   4 crops: 833 source → 657 positions (176 dropped = masked_scatter truncation)
+9. Prefix: BOS(1) + 657 image + 4 text ("\nFree OCR.") = 662 tokens
 
 </details>
 
@@ -484,8 +493,10 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 
 ### Version History
 
+- **v1.1** — OCR quality + speed: V3 parallel crop encoding, parallel BF16→F32 prefill conversion, n-gram exclusion argmax, SAM float32 softmax, V3 orphan closing-tag prefix strip; V2 multi-crop fix (dynamic_preprocess min_num=2), V3 small image fix (640×640 pad→111 tokens), CLIP position embedding bilinear interpolation
+- **v1.0** — BPE tokenizer merge loading fix (3 bugs: JSON skip, nested array format, strdup key copy), V2 output quality fix, Metal GPU MoE batching, INT8 quantization (`--int4`)
 - **v0.10** — INT8 per-row MoE expert quantization (`--int4`, RMS<0.01), platform auto-detect (M1/M2+/x86)
-- **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), tokenizer.json fallback, download_model.sh v1/v2/v3
+- **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), V3 multi-crop, tokenizer.json fallback, download_model.sh v1/v2/v3
 - **v0.8** — Batched MoE prefill + parallel encoding: 16s end-to-end (6× v0.5)
 - **v0.7** — F32 KV cache + fused residual+norm + direct SwiGLU + batched decode
 - **v0.6** — sgemm LM head + BF16 KV cache + fused decode attention + fast exp
@@ -497,6 +508,7 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing. The 830 added_tokens (including `<|det|>`, `<|ref|>`, `<|grounding|>`, `<td>`, `<tr>`, etc.) are now correctly loaded from `tokenizer.json` with vocab expansion beyond 128K.
 3. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
 4. **Independent lm_head weights**: `lm_head.weight` ≠ `embed_tokens.weight`; C correctly loads the independent weights.
+
 
 ## Differences from Python Implementation
 

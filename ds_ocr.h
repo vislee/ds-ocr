@@ -1,8 +1,29 @@
 /*
  * ds_ocr.h - DeepSeek-OCR Pure C Inference Engine
+ * ds_ocr.h — DeepSeek-OCR 纯C推理引擎 公共头文件
  *
  * Supports DeepSeek-OCR (v1), DeepSeek-OCR-2 (v2), and Unlimited-OCR (v3) models.
+ * 支持 DeepSeek-OCR (v1)、DeepSeek-OCR-2 (v2) 和 Unlimited-OCR (v3) 三种模型版本。
+ *
  * Architecture: SAM Vision Tokenizer + DeepEncoder/DeepEncoderV2 + MoE Decoder
+ * 架构: SAM视觉分词器 + 深层编码器(V1:CLIP / V2:Qwen2-0.5B) + MoE解码器
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【整体推理流水线】
+ *   图像像素 → SAM ViT-B (视觉分词器) → 视觉token序列
+ *                                       ↓
+ *                        编码器(CLiP ViT-L/14 或 DeepEncoder V2) → 编码特征
+ *                                       ↓
+ *                        投影层 (2048→1280 或 896→1280) → 与解码器维度对齐
+ *                                       ↓
+ *                        MoE解码器 (DeepSeek3B-MoE-A570M) → 自回归生成OCR文本
+ *
+ * 【关键设计决策】
+ *   - 纯C实现: 零外部依赖，可移植到嵌入式/边缘设备
+ *   - BF16存储: 权重以BF16格式mmap加载，计算时转F32，节省50%内存
+ *   - 在线softmax/fused matvec: 避免大矩阵中间结果的内存分配
+ *   - 线程池: 多线程并行处理矩阵运算
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 #ifndef DS_OCR_H
@@ -15,80 +36,98 @@
 #include "ds_quantize.h"
 
 /* ========================================================================
- * Constants
+ * Constants — 常量定义
+ * 每个常量对应模型架构中的一个具体维度或超参数
  * ======================================================================== */
 
-/* Vision tokenizer (SAM ViT-B) */
-#define DS_IMAGE_SIZE           1024
-#define DS_SAM_PATCH_SIZE       16      /* SAM patch embedding kernel/stride */
-#define DS_SAM_EMBED_DIM        768     /* SAM ViT-B embedding dimension */
-#define DS_SAM_HEADS            12      /* SAM ViT-B attention heads */
-#define DS_SAM_HEAD_DIM         64      /* SAM ViT-B head dimension */
-#define DS_SAM_MLP_DIM          3072    /* SAM ViT-B FFN intermediate dim */
-#define DS_SAM_WINDOW_SIZE      14      /* SAM window attention window size */
-#define DS_SAM_NECK_DIM         256     /* SAM neck output channels */
-#define DS_SAM_DS1_DIM          512     /* SAM net_2 downsample channels */
-#define DS_SAM_DS2_DIM          1024    /* SAM net_3 downsample channels (V1) */
-#define DS_SAM_DS2_DIM_V2       896     /* SAM net_3 downsample channels (V2) */
-#define DS_VISUAL_TOKENS_BASE   256     /* Base visual tokens for 1024x1024 */
-#define DS_LOCAL_CROP_TOKENS    144     /* Tokens per local crop (768x768) */
-#define DS_MAX_LOCAL_CROPS      6       /* Maximum local crop regions */
+/* Vision tokenizer (SAM ViT-B)
+ * SAM ViT-B 视觉编码器 — 整个OCR流水线的"眼睛"
+ * SAM (Segment Anything Model) 将输入图像切分为patch并编码为视觉token序列。
+ * 采用 window attention (局部窗口注意力, window_size=14) + global attention (全局注意力, 层2/5/8/11) 的混合策略。
+ */
+#define DS_IMAGE_SIZE           1024    /* 输入图像尺寸 1024x1024 */
+#define DS_SAM_PATCH_SIZE       16      /* SAM patch切分大小：16x16像素/patch，即卷积核和步幅 */
+#define DS_SAM_EMBED_DIM        768     /* SAM ViT-B的嵌入维度(隐藏层维度)，ViT-B标准配置 */
+#define DS_SAM_HEADS            12      /* SAM注意力头数 */
+#define DS_SAM_HEAD_DIM         64      /* 每个头的维度 = 768/12 */
+#define DS_SAM_MLP_DIM          3072    /* SAM FFN中间维度 = 768*4 */
+#define DS_SAM_WINDOW_SIZE      14      /* SAM窗口注意力的窗口大小(14x14) */
+#define DS_SAM_NECK_DIM         256     /* SAM neck输出通道数(768→256通道压缩) */
+#define DS_SAM_DS1_DIM          512     /* SAM net_2下采样输出通道(256→512, 2×下采样) */
+#define DS_SAM_DS2_DIM          1024    /* SAM net_3下采样输出通道(512→1024, V1/V3最终维度) */
+#define DS_SAM_DS2_DIM_V2       896     /* SAM net_3下采样输出通道(512→896, V2最终维度) */
+#define DS_VISUAL_TOKENS_BASE   256     /* 1024×1024输入的基础token数 = 64/4 × 64/4 = 16×16 */
+#define DS_LOCAL_CROP_TOKENS    144     /* 768×768裁剪的token数 = 48/4 × 48/4 = 12×12 */
+#define DS_MAX_LOCAL_CROPS      6       /* 最大局部裁剪数(V2: 动态多裁剪上限) */
 
-/* CLIP ViT-L/14 (V1 encoder) */
-#define DS_CLIP_LAYERS          24
-#define DS_CLIP_HIDDEN          1024
-#define DS_CLIP_HEADS           16
-#define DS_CLIP_HEAD_DIM        64
-#define DS_CLIP_MLP_DIM         4096
-#define DS_CLIP_PATCH_SIZE      14
+/* CLIP ViT-L/14 (V1/V3 encoder)
+ * CLIP ViT-L/14 — V1/V3的第二编码器(24层标准ViT)
+ * V1/V3中CLIP绕过自身patch_embed，直接接收SAM特征做"二次精炼"
+ */
+#define DS_CLIP_LAYERS          24      /* CLIP Transformer层数 */
+#define DS_CLIP_HIDDEN          1024    /* CLIP隐藏维度 */
+#define DS_CLIP_HEADS           16      /* CLIP注意力头数 */
+#define DS_CLIP_HEAD_DIM        64      /* 每个头的维度 = 1024/16 */
+#define DS_CLIP_MLP_DIM         4096    /* CLIP FFN中间维度 = 1024*4 */
+#define DS_CLIP_PATCH_SIZE      14      /* CLIP原始patch大小(V1/V3中不使用，SAM已完成patch化) */
 
-/* DeepEncoder V2 (Qwen2-0.5B based) */
-#define DS_ENC_V2_LAYERS        24
-#define DS_ENC_V2_HIDDEN        896
-#define DS_ENC_V2_HEADS         14
-#define DS_ENC_V2_KV_HEADS      2       /* GQA: 2 KV heads for 14 Q heads */
-#define DS_ENC_V2_HEAD_DIM      64
-#define DS_ENC_V2_INTERMEDIATE  4864
+/* DeepEncoder V2 (Qwen2-0.5B based)
+ * DeepEncoder V2 — V2的编码器(Qwen2-0.5B架构，混合注意力)
+ * 视觉token双向注意力 + 因果流查询因果注意力
+ */
+#define DS_ENC_V2_LAYERS        24      /* DeepEncoder V2 Transformer层数 */
+#define DS_ENC_V2_HIDDEN        896     /* DeepEncoder V2隐藏维度 */
+#define DS_ENC_V2_HEADS         14      /* DeepEncoder V2 Q头数 */
+#define DS_ENC_V2_KV_HEADS      2       /* GQA: 2个KV头(14个Q头共享2组KV，7:1分组比) */
+#define DS_ENC_V2_HEAD_DIM      64      /* 每个头的维度 = 896/14 */
+#define DS_ENC_V2_INTERMEDIATE  4864    /* DeepEncoder V2 SwiGLU FFN中间维度 */
 
-/* Projector (V1: 2048→1280, V2: 896→1280) */
-#define DS_PROJECTOR_V1_INPUT   2048    /* CLIP(1024) + SAM(1024) concatenated */
-#define DS_PROJECTOR_V2_INPUT   896     /* DeepEncoder V2 output dim */
+/* Projector (投影层: 编码器维度→解码器维度)
+ * V1/V3: 2048→1280 (CLIP 1024 + SAM 1024 拼接后投影)
+ * V2: 896→1280 (DeepEncoder V2输出直接投影)
+ */
+#define DS_PROJECTOR_V1_INPUT   2048    /* V1/V3投影输入: CLIP(1024) + SAM(1024)拼接 */
+#define DS_PROJECTOR_V2_INPUT   896     /* V2投影输入: DeepEncoder V2输出维度 */
 
-/* MoE Decoder (DeepSeek3B-MoE-A570M) */
-#define DS_DEC_HIDDEN           1280
-#define DS_DEC_LAYERS           12
-#define DS_DEC_HEADS            10
-#define DS_DEC_KV_HEADS         10      /* Standard MHA, NOT GQA (kv_heads = q_heads) */
-#define DS_DEC_HEAD_DIM         128
-#define DS_DEC_INTERMEDIATE     6848    /* Dense FFN intermediate (layer 0) */
-#define DS_DEC_MOE_INTER        896     /* MoE expert intermediate size */
-#define DS_DEC_NUM_EXPERTS      64      /* Routed experts per layer */
-#define DS_DEC_SHARED_EXPERTS   2       /* Shared experts per layer */
-#define DS_DEC_TOP_K            6       /* Experts activated per token */
-#define DS_DEC_FIRST_K_DENSE    1       /* First K layers use dense FFN instead of MoE */
-#define DS_DEC_VOCAB_SIZE       129280
+/* MoE Decoder (DeepSeek3B-MoE-A570M)
+ * MoE解码器 — 整个推理流程的"嘴巴和大脑"
+ * 总参数~3B，但每次只激活~570M(3B知识，570M计算)，这就是MoE的威力
+ */
+#define DS_DEC_HIDDEN           1280    /* 解码器隐藏维度 */
+#define DS_DEC_LAYERS           12      /* 解码器Transformer层数 */
+#define DS_DEC_HEADS            10      /* Q注意力头数 */
+#define DS_DEC_KV_HEADS         10      /* KV头数(标准MHA，不是GQA；10=10) */
+#define DS_DEC_HEAD_DIM         128     /* 每个头的维度 = 1280/10 */
+#define DS_DEC_INTERMEDIATE     6848    /* Dense FFN中间维度(仅Layer 0) */
+#define DS_DEC_MOE_INTER        896     /* MoE每个专家的中间维度 */
+#define DS_DEC_NUM_EXPERTS      64      /* 每层路由专家数(64个专家中每次只激活top-6) */
+#define DS_DEC_SHARED_EXPERTS   2       /* 每层共享专家数(始终激活，提供通用知识) */
+#define DS_DEC_TOP_K            6       /* 每个token激活的top-K路由专家数 */
+#define DS_DEC_FIRST_K_DENSE    1       /* 前K层使用Dense FFN(浅层语义不足，路由效果差) */
+#define DS_DEC_VOCAB_SIZE       129280  /* 词表大小(129280个token) */
 
-/* Special token IDs (from config.json) */
-#define DS_TOKEN_BOS            0       /* BOS token ID */
-#define DS_TOKEN_EOS            1       /* EOS token ID */
-#define DS_TOKEN_PAD            2       /* PAD token ID */
-#define DS_TOKEN_IMAGE_START    151655
-#define DS_TOKEN_IMAGE_END      151656
-#define DS_TOKEN_NEWLINE        151657
-#define DS_TOKEN_IMAGE_PLACEHOLDER 128815  /* Unlimited-OCR: single image token ID */
+/* Special token IDs (from config.json) — 特殊token ID */
+#define DS_TOKEN_BOS            0       /* BOS token ID — 序列开始标记 */
+#define DS_TOKEN_EOS            1       /* EOS token ID — 序列结束标记(解码器遇到此token停止) */
+#define DS_TOKEN_PAD            2       /* PAD token ID — 填充标记 */
+#define DS_TOKEN_IMAGE_START    151655  /* V1/V2图像开始标记 */
+#define DS_TOKEN_IMAGE_END      151656  /* V1/V2图像结束标记 */
+#define DS_TOKEN_NEWLINE        151657  /* V1/V3图像行分隔符(每16个token后插入) */
+#define DS_TOKEN_IMAGE_PLACEHOLDER 128815  /* Unlimited-OCR: 单个图像占位符token ID */
 
-/* Model version identifiers */
-#define DS_MODEL_VERSION_V1     1       /* DeepSeek-OCR (original, SAM+CLIP) */
-#define DS_MODEL_VERSION_V2     2       /* DeepSeek-OCR-2 (DeepEncoder V2) */
-#define DS_MODEL_VERSION_UNLIMITED 3    /* Unlimited-OCR (SAM+CLIP+2D grid+sliding window) */
+/* Model version identifiers — 模型版本标识 */
+#define DS_MODEL_VERSION_V1     1       /* DeepSeek-OCR (原始版, SAM+CLIP双编码器) */
+#define DS_MODEL_VERSION_V2     2       /* DeepSeek-OCR-2 (DeepEncoder V2, 因果流查询) */
+#define DS_MODEL_VERSION_UNLIMITED 3    /* Unlimited-OCR (SAM+CLIP+2D网格+R-SWA滑动窗口) */
 
-/* Maximum layer counts (for static array sizing) */
+/* Maximum layer counts (for static array sizing) — 静态数组尺寸上限 */
 #define DS_MAX_ENC_LAYERS       24
 #define DS_MAX_DEC_LAYERS       12
 #define DS_MAX_EXPERTS          64
 
 /* ========================================================================
- * Model Configuration
+ * Model Configuration — 模型配置结构体
+ * 记录三版本(V1/V2/V3)的所有架构超参数
  * ======================================================================== */
 
 typedef struct {
@@ -148,7 +187,8 @@ typedef struct {
 } ds_config_t;
 
 /* ========================================================================
- * SAM Vision Tokenizer
+ * SAM Vision Tokenizer — SAM视觉分词器权重
+ * 所有SAM权重以F32格式加载(预转换，适合批量计算)
  * ======================================================================== */
 
 typedef struct {
@@ -204,7 +244,7 @@ typedef struct {
 } ds_visual_tokenizer_t;
 
 /* ========================================================================
- * CLIP ViT-L/14 (V1 encoder)
+ * CLIP ViT-L/14 (V1/V3 encoder) — CLIP编码器权重(F32格式)
  * ======================================================================== */
 
 typedef struct {
@@ -239,7 +279,8 @@ typedef struct {
 } ds_clip_encoder_t;
 
 /* ========================================================================
- * Projector (V1: 2048→1280, V2: 896→1280)
+ * Projector (V1: 2048→1280, V2: 896→1280) — 投影层权重(F32)
+ * 将编码器输出维度投影到解码器隐藏维度
  * ======================================================================== */
 
 typedef struct {
@@ -248,7 +289,7 @@ typedef struct {
 } ds_projector_t;
 
 /* ========================================================================
- * DeepEncoder V2 (Qwen2-0.5B based)
+ * DeepEncoder V2 (Qwen2-0.5B based) — V2编码器权重(F32格式)
  * ======================================================================== */
 
 typedef struct {

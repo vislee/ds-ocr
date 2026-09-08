@@ -1,5 +1,43 @@
 /*
  * ds_visual_tokenizer.c - SAM Vision Tokenizer for DeepSeek-OCR
+ * ds_visual_tokenizer.c — SAM 视觉分词器实现
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【SAM ViT-B 前向传播详解】
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * Step 1: Patch Embed — 将图像切分为patch并线性投影
+ *   输入: RGB [3, H, W] (float32, [0,1])
+ *   操作: Conv2d(3→768, kernel=16, stride=16) — 等价于将16×16像素块投影为768维向量
+ *   输出: [768, H/16, W/16] — 1024²输入时为 [768, 64, 64] = 4096个patch
+ *
+ * Step 2: 位置编码 — 为每个patch注入位置信息
+ *   + sam_pos_embed [577, 768] — 1个CLS + 576个patch(24×24)
+ *   如果输入尺寸不同(如768²→48×48=2304 patches)，需双三次插值
+ *
+ * Step 3: 12层 Transformer — 交替使用窗口/全局注意力
+ *   层 [0,1,3,4,6,7,9,10]: 窗口注意力 (window_size=14) — 局部感受野
+ *     - 相对位置编码 (rel_pos_h, rel_pos_w): 窗口内位置偏移
+ *     - 计算量: O(W²×n_patches) — W=14, 线性复杂度
+ *   层 [2,5,8,11]: 全局注意力 — 所有patch互相可见
+ *     - 标准自注意力: O(n_patches²) — 二次复杂度，但只在4层使用
+ *   每层: LayerNorm → (Window/Global) Attention → 残差 → LayerNorm → FFN → 残差
+ *
+ * Step 4: SAM Neck — 通道压缩
+ *   Conv2d(768→256, k=1) + LayerNorm2d + Conv2d(256→256, k=1) + LayerNorm2d
+ *   768维→256维，为下游降采样做准备
+ *
+ * Step 5: SAM Downsample — 4×空间压缩
+ *   net_2: Conv2d(256→512, k=3, s=2, p=1) — 空间2×下采样
+ *   net_3: Conv2d(512→1024/896, k=3, s=2, p=1) — 空间2×下采样
+ *   最终: 空间4×下采样 → 64/4×64/4 = 16×16 = 256 tokens (1024²输入)
+ *         或 48/4×48/4 = 12×12 = 144 tokens (768²输入)
+ *
+ * 【输出维度】
+ *   V1/V3: sam_ds2_dim = 1024 → SAM特征 [256, 1024]
+ *   V2:    sam_ds2_dim = 896  → SAM特征 [256, 896]
+ *   区别在于 net_3 的输出通道数不同
+ * ═══════════════════════════════════════════════════════════════════════
  *
  * Architecture: SAM ViT-B encoder → neck → downsample → spatial features
  * - SAM ViT-B: 12 layers, 768 dim, 12 heads, patch_size=16

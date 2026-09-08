@@ -1,8 +1,33 @@
 /*
  * ds_kernels.h - Math kernels for DeepSeek-OCR inference
+ * ds_kernels.h — DeepSeek-OCR 推理引擎数学内核头文件
  *
  * Low-level math operations. All operate on float32 tensors in row-major order.
+ * 底层数学运算。所有操作均基于行主序(float32)张量。
+ *
  * Adapted from antirez/qwen-asr project.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【三级内核架构】generic → NEON/AVX → BLAS
+ *   第一级 (generic): 纯C99可移植实现，任何平台均可运行
+ *   第二级 (NEON/AVX): SIMD加速，ARM NEON(Apple Silicon)或x86 AVX2+FMA
+ *   第三级 (BLAS): cblas_sgemm加速大规模矩阵运算(macOS Accelerate/Linux OpenBLAS)
+ *
+ * 【BF16→F32 on-the-fly 转换】
+ *   权重以BF16格式mmap加载(零拷贝)，matvec计算时即时转F32，节省50%存储
+ *
+ * 【关键函数对照表】(对应文档理论概念)
+ *   ds_linear_nobias_bf16()     — BF16权重线性变换(解码器核心操作)
+ *   ds_causal_attention()       — 因果注意力(解码器，带GQA支持)
+ *   ds_rswa_attention_aligned() — R-SWA注意力(V3，reference+window两段)
+ *   ds_rms_norm()               — RMSNorm(解码器归一化)
+ *   ds_rms_norm_per_head()      — Per-head RMSNorm(DeepSeek特色Q/K归一化)
+ *   ds_swiglu_multiply()        — SwiGLU激活(SiLU(gate)*up)
+ *   ds_moe_router_bf16()        — MoE路由器(gate+softmax+topK)
+ *   ds_argmax_matvec_bf16()     — 流式argmax(不分配129280个logits)
+ *   ds_compute_rope_neox()      — RoPE位置编码预计算
+ *   ds_apply_rope_neox()        — 应用RoPE旋转位置编码
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 #ifndef DS_KERNELS_H

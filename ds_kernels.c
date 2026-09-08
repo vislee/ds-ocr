@@ -1,6 +1,38 @@
 /*
- * ds_kernels.c - Math kernels for Qwen3-ASR inference
- * Adapted from voxtral-realtime project.
+ * ds_kernels.c - Math kernels for DeepSeek-OCR inference
+ * ds_kernels.c — DeepSeek-OCR 推理引擎数学内核实现
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【模块角色】所有数学运算的底层实现
+ * ─────────────────────────────────────────────────────────────────────
+ * 提供矩阵乘法、注意力计算、归一化、激活函数、MoE路由等核心运算。
+ * 是整个推理引擎中调用最频繁的模块——12层解码器每层都调用数十次。
+ *
+ * 【三级内核架构】(详见 ds_kernels_impl.h)
+ *   本文件(ds_kernels.c) = 公共逻辑 + 平台无关的参考实现
+ *   ds_kernels_generic.c  = 纯C99可移植实现
+ *   ds_kernels_neon.c     = ARM NEON SIMD优化（Apple Silicon）
+ *   ds_kernels_avx.c      = x86 AVX2+FMA优化（Intel/AMD）
+ *
+ * 编译时通过宏自动选择最优实现:
+ *   #ifdef __ARM_NEON → 使用 NEON 版本
+ *   #elif __AVX2__    → 使用 AVX2 版本
+ *   #else             → 使用 generic 版本
+ *
+ * 【关键函数对照表】
+ *   ds_linear_nobias_bf16()  — BF16权重矩阵×F32向量（解码器核心操作）
+ *   ds_causal_attention()    — 因果注意力（解码器，带GQA支持）
+ *   ds_rswa_attention_aligned() — R-SWA注意力（V3，reference+window两段）
+ *   ds_rms_norm()            — RMSNorm（解码器归一化）
+ *   ds_rms_norm_per_head()   — Per-head RMSNorm（DeepSeek特色Q/K归一化）
+ *   ds_swiglu_multiply()     — SwiGLU激活（SiLU(gate)*up）
+ *   ds_moe_router_bf16()     — MoE路由器（gate + softmax + topK）
+ *   ds_argmax_matvec_bf16()  — 流式argmax（不分配129280个logits）
+ *   ds_compute_rope_neox()   — RoPE位置编码预计算
+ *   ds_apply_rope_neox()     — 应用RoPE旋转
+ *
+ * Adapted from antirez/qwen-asr project.
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 #include "ds_kernels.h"
@@ -192,7 +224,20 @@ void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weig
 
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
                   int n_experts, int top_k) {
-    /* Find top-K experts using simple selection */
+    /* 选择 top-K 路由专家（n_experts=64, top_k=6）
+     *
+     * K=6 ≈ n_experts 的 10%，top-6 覆盖了绝大多数的路由概率质量。
+     * 仅计算选中的 6 个专家，跳过 58 个不活跃的专家，显著节省计算。
+     *
+     * 【当前实现：O(k·n_experts) 简单选择】
+     * 优点：代码简单，无额外内存开销。
+     * 缺点：对 64 个专家做 6 次扫描（6×64=384 次比较），不是最优的。
+     * 优化方向：可以用 partial sort (nth_element) 将复杂度降到 O(n_experts)。
+     * 当前 K=6, n_experts=64 规模下，384 次比较开销微不足道（< 1μs），不需要优化。
+     *
+     * 【路由权重处理】
+     * top-6 的原始 softmax 分数经过 max-subtract 归一化后，
+     * 再做 softmax 得到最终权重。这样权重之和 = 1，且只有 top-6 非零。*/
     int selected[DS_MAX_EXPERTS];
     float selected_scores[DS_MAX_EXPERTS];
     int n_selected = 0;
@@ -248,7 +293,19 @@ void ds_expert_forward(float *out, const float *x,
                        int hidden, int intermediate,
                        float *gate_buf, float *up_buf,
                        float *gate_up_buf, float *hidden_buf) {
-    /* gate = gate_bf16 @ x, up = up_bf16 @ x */
+    /* 分离 gate 和 up 的专家前向传播
+     *
+     * 架构: output = W_down @ (SiLU(W_gate @ x) ⊙ (W_up @ x))
+     * gate 和 up 分别做 BF16 matvec 得到 gate_buf 和 up_buf，
+     * 然后 SwiGLU(gate_buf, up_buf) → hidden_buf，再做 down matvec。
+     *
+     * 【为什么有分离版本？】
+     * 1. 直接读取 gate_bf16 和 up_bf16 两块分离的权重
+     * 2. gate 和 up 的中间维度不同时也需要分离版本
+     * 3. 对使用 INT4 量化时，gate/up 有各自的 scale/offset
+     *
+     * 此函数是 CPU 路径的专家前向，每路由专家调用一次。
+     * 性能方面，gate 和 up 的 BF16 matvec 各占 ~50% 的计算时间。*/
     ds_linear_nobias_bf16(gate_buf, x, gate_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, up_bf16, 1, hidden, intermediate);
 

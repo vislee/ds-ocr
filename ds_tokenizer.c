@@ -1,5 +1,48 @@
 /*
  * ds_tokenizer.c - Qwen2/Qwen3 BPE tokenizer (GPT-2 byte-level)
+ * ds_tokenizer.c — Qwen2/Qwen3 BPE 分词器实现
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【BPE (Byte-Pair Encoding) 编码算法详解】
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * 【Encode 流程】(text → token IDs)
+ *   1. 将输入文本转为UTF-8字节序列
+ *   2. 每个字节查基础词表得到初始token ID序列
+ *   3. 迭代合并: 按合并规则优先级从高到低
+ *      扫描相邻token对 (tokens[i], tokens[i+1])
+ *      如果该对在merges中有记录且优先级最高 → 合并为新token
+ *      重复直到无法合并
+ *   4. 返回最终token ID序列
+ *
+ *   示例: "Hello world"
+ *     UTF-8: [72, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100]
+ *     初始tokens: [72, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100]
+ *     合并1: (108,108) → 256  → [72, 101, 256, 111, 32, 119, 111, 114, 108, 100]
+ *     合并2: (256,111) → 257  → [72, 101, 257, 32, 119, 111, 114, 108, 100]
+ *     ...最终: [15496, 993]  ("Hello"=15496, " world"=993)
+ *
+ * 【Decode 流程】(token ID → text)
+ *   简单查表: id_to_text[token_id] → 文本字符串
+ *   多个token的文本拼接即得最终结果
+ *
+ * 【GPT-2字节级BPE的特殊编码】
+ *   空格前缀: 在GPT-2 BPE中，词首空格编码为 Ġ (U+0120)
+ *   例如: " Hello" → "ĠHello" → token 15496
+ *   换行符: Ċ (U+010A)
+ *   这些特殊字符在vocab.json中出现，decode时自动转换为实际字符
+ *
+ * 【DeepSeek-OCR词表结构】(vocab_size = 129280)
+ *   0:      BOS (Beginning of Sequence)
+ *   1:      EOS (End of Sequence)
+ *   2:      PAD (Padding)
+ *   3-255:  字节token (原始UTF-8字节)
+ *   256+:   BPE合并token
+ *   151655: IMAGE_START (V1/V2图像开始标记)
+ *   151656: IMAGE_END (V1/V2图像结束标记)
+ *   151657: IMAGE_NEWLINE (V1/V3图像行分隔符)
+ *   128815: IMAGE_PLACEHOLDER (V3图像占位符)
+ * ═══════════════════════════════════════════════════════════════════════
  *
  * Supports:
  *   - decode token IDs to UTF-8 text (for ASR output assembly)

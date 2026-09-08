@@ -30,8 +30,8 @@ make blas
 | **HuggingFace** | `deepseek-ai/DeepSeek-OCR` | `deepseek-ai/DeepSeek-OCR-2` | `baidu/Unlimited-OCR` |
 | **编码器** | CLIP ViT-L/14 | DeepEncoder V2 (Qwen2-0.5B) | CLIP ViT-L/14 + R-SWA |
 | **解码器** | DeepSeek3B-MoE | DeepSeek3B-MoE | DeepSeek3B-MoE + R-SWA |
-| **输入** | 1024×1024 (拉伸) | 动态多裁剪 | 640×640 (填充) |
-| **视觉 token** | 256 | 857 (6-裁剪) | 273 |
+| **输入** | 1024×1024 (拉伸) | 动态多裁剪 (768, 2–6 crops) | 640×640 (填充) + 多裁剪 |
+| **视觉 token** | 256 | 857 (6-裁剪) | 111 ~ 3323 (1~30 裁剪) |
 | **提示词** | `\nFree OCR.` | `\nFree OCR.` | `\ndocument parsing.` |
 | **C 支持** | ⚠️ 部分 | ✅ 完整 | ✅ 完整 |
 | **模型大小** | ~6.3 GB | ~6.7 GB | ~6.2 GB |
@@ -76,14 +76,21 @@ make blas
 > prefill 阶段并行 BF16→F32 权重转换、SAM float32 注意力 softmax。
 > V2 的 prefill 提速来自并行转换；V1 来自 SAM softmax 修改。
 
-#### M2 Pro vs M4 Max 对比 (CPU BLAS, V2 6-crop)
+#### M2 Pro (8 线程, CPU BLAS), 大图 1794×1578 + 小图 400×100（历史数据）
 
-| 阶段 | M2 Pro | M4 Max (估算) | 倍率 |
-|------|--------|---------------|------|
-| SAM+Encoder | 9.0s | ~5.8s | 1.55× |
-| Prefill (~660 tok) | 0.93s | ~0.6s | 1.55× |
-| Decode (226 tok) | 5.1s | ~3.3s | 1.55× |
-| **总计** | **15.0s** | **~9.7s** | **1.55×** |
+| 指标 | V1 | V2 ⭐ | V3 |
+|------|----|----|-----|
+| **总耗时（大图）** | 12.2s | 14.8s | 79.7s (30 裁剪) |
+| **编码** | 6.1s | 8.8s | 43.0s (30 裁剪 × SAM+CLIP) |
+| **Prefill** | 1.0s (280 tok) | 1.0s (662 tok) | 6.4s (3328 tok) |
+| **解码** | 5.0s (238 tok) | 5.0s (224 tok) | 30.3s (499 tok) |
+| **解码速度** | 47.3 tok/s | 44.4 tok/s | 16.5 tok/s |
+| **总耗时（小图）** | 8.9s | 10.9s | 2.5s |
+| **解码速度（小图）** | 38.8 tok/s | 36.9 tok/s | 48.0 tok/s |
+| **视觉 token（小图）** | 256 | 257 | 111 |
+
+> 测于 V3 并行 crop 编码合入之前；当前版本 30-crop 编码阶段约快 6×
+> （见下文 v1.1 优化）。
 
 #### 模型质量对比
 
@@ -92,6 +99,12 @@ make blas
 | **V2** | 动态多裁剪、精度最佳、输入尺寸灵活 | 编码较慢（6+ crops） | **通用（推荐）** |
 | **V1** | 最快的单裁剪、管线最简 | 1024×1024 拉伸、BF16 精度偏差 | 快速扫描、小图 |
 | **V3** | 输出详细、滑动窗口注意力 | 大图 crop 较多（已并行编码）、偶发结构标签残留（已自动清理） | 小图 ≤640px、结构化文档 |
+
+> **推荐**：V2 是最佳全能选择 — 多裁剪适配任意尺寸图片，DeepEncoder V2 编码精度最高。
+> V1 更快但会把图片拉伸到 1024×1024（宽高比失真），且有小概率精度拼写偏差。
+> V3 小图表现优异（2.5s vs V1/V2 的 8-11s），支持语种检测和详细文档解析。
+> 小图（≤640px，单裁剪）场景下 V3 解码速度与 V1 相当（~47 tok/s）。
+> V3 幻觉前缀（如 "The image contains no text..." 与孤立闭合标签）会自动清除。
 
 ## 性能
 
@@ -459,7 +472,9 @@ make test_debug        # AddressSanitizer 模式
 
 ### 版本历史
 
-- **v0.9** — Unlimited-OCR V3 支持（CLIP+R-SWA），tokenizer.json 回退，download_model.sh v1/v2/v3
+- **v1.1** — 识别效果与速度优化：V3 并行 crop 编码、prefill 并行 BF16→F32 转换、n-gram 排除 argmax、SAM float32 softmax、V3 孤立闭合标签前缀清理；V2 多裁剪修复（dynamic_preprocess min_num=2），V3 小图修复（640×640→111 tokens），CLIP 位置编码双线性插值
+- **v1.0** — BPE tokenizer merge 加载修复（3个 bug），V2 输出质量修复，Metal GPU MoE 批处理，INT8 量化
+- **v0.9** — Unlimited-OCR V3 支持（CLIP+R-SWA），V3 多裁剪，tokenizer.json 回退，download_model.sh v1/v2/v3
 - **v0.8** — 批量 MoE prefill + 并行 encoding：16s 端到端（6× v0.5）
 - **v0.7** — F32 KV cache + 融合 residual+norm + 直接 SwiGLU + 批量 decode
 - **v0.6** — sgemm LM head + BF16 KV cache + 融合 decode attention + fast exp
@@ -468,21 +483,11 @@ make test_debug        # AddressSanitizer 模式
 ### 已知问题
 
 1. **V1 CLIP 编码器**：V1 和 V3 使用相同的 CLIP 架构，CLIP bypass Conv2d 直接接收 SAM features。V1 输出存在少量 BF16 精度引起的拼写偏差（如 "raletimit" vs "ratelimit"），属于正常精度范围。
-2. **V3 输出标签**：Unlimited-OCR 产生 `<|det|>` 和 `<|ref|>` 检测标签，后处理中已去除。部分格式（子项缩进）可能不同于 Python 输出。
-3. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。不影响 OCR 质量。
-4. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
-
-## 与 Python 实现的差异
-
-| 特性 | Python (PyTorch) | 本实现 (C) |
-|------|-------------------|-----------|
-| 权重格式 | 完整 FP32/BF16 张量 | mmap BF16（零拷贝） |
-| Attention | FlashAttention / SDPA | Online softmax（O(1) 内存） |
-| MoE routing | GPU scatter/gather | 批量 sgemm: grouped expert + shared 一步完成 |
-| 位置编码 | 动态计算 | 预计算 RoPE 表 |
-| 图片 resize | PIL BICUBIC (antialias) | Antialias bicubic |
-| Tokenizer | HuggingFace tokenizers | 自定义 BPE (GPT-2 byte-level) + added_tokens |
-| 依赖 | PyTorch, transformers... | 仅 BLAS + stb_image |
+2. **V3 输出标签**：`<|det|>` 和 `<|ref|>` 检测标签已在后处理中自动去除；幻觉前缀（如 "The image contains no text...[No text detected]"）与孤立 HTML 闭合标签前缀（如 `</td></tr></table>`）也会自动清除。
+3. **V3 大图拼写偏差**：V3 对大图（30+ 裁剪）可能出现轻微 OCR 拼写偏差（如 "CC"→"CF"），因局部裁剪丢失上下文，属模型限制。
+4. **V3 小图 Non-Text**：V3 对极小图片（≤640px）可能输出 `[Non-Text]` 标记，模型主要在大文档图上训练。
+5. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。不影响 OCR 质量。
+6. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
 
 ## 致谢
 
