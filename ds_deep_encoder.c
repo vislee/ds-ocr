@@ -151,6 +151,69 @@ static void clip_layer_forward(float *out, const float *x,
  *
  * sam_features: SAM's downsampled output [n_sam_tokens, 1024] (for feature fusion with CLIP output)
  */
+/* PyTorch bicubic convolution kernel (Catmull-Rom family, A = -0.75) —
+ * matches F.interpolate(mode='bicubic') and PIL bicubic. */
+static float ds_cubic_kernel(float x) {
+    const float A = -0.75f;
+    x = fabsf(x);
+    if (x <= 1.0f)
+        return ((A + 2.0f) * x - (A + 3.0f)) * x * x + 1.0f;
+    if (x < 2.0f)
+        return (((x - 5.0f) * x + 8.0f) * x - 4.0f) * A;
+    return 0.0f;
+}
+
+/* Resample one dimension: input element (j, o) lives at
+ * src + j*in_stride + o*o_stride; output (i, o) at dst + i*out_stride + o*o_stride.
+ * Matches F.interpolate(mode='bicubic', antialias=True, align_corners=False):
+ *   - center of dest i in source coords: (i + 0.5) * src/dst - 0.5
+ *   - downscale (src > dst): antialias — cubic kernel evaluated at
+ *     (j - center) / scale over a 2*scale source window, normalized
+ *   - upscale / same: plain 4-point bicubic at center
+ * Border handling: replicate (PyTorch upsample_get_value_bounded). */
+static void ds_bicubic_resample_dim(const float *src, float *dst,
+                                     int src_n, int dst_n,
+                                     long in_stride, long out_stride,
+                                     long in_o_stride, long out_o_stride,
+                                     int other, int dim) {
+    float scale = (float)src_n / (float)dst_n;
+    int antialias = src_n > dst_n;
+    float support = antialias ? 2.0f * scale : 2.0f;
+
+    float *w = (float *)malloc((src_n + 2) * sizeof(float));
+    for (int i = 0; i < dst_n; i++) {
+        float center = (i + 0.5f) * scale - 0.5f;
+        int j0 = (int)ceilf(center - support);
+        int j1 = (int)floorf(center + support);
+        if (j0 < 0) j0 = 0;
+        if (j1 > src_n - 1) j1 = src_n - 1;
+
+        float wsum = 0.0f;
+        for (int j = j0; j <= j1; j++) {
+            float arg = antialias ? (j - center) / scale : (j - center);
+            w[j - j0] = ds_cubic_kernel(arg);
+            wsum += w[j - j0];
+        }
+        if (wsum > 0.0f) {
+            float inv = 1.0f / wsum;
+            for (int j = j0; j <= j1; j++) w[j - j0] *= inv;
+        }
+
+        for (int o = 0; o < other; o++) {
+            float *dst_row = dst + (long)i * out_stride + (long)o * out_o_stride;
+            const float *src_base = src + (long)o * in_o_stride;
+            for (int d = 0; d < dim; d++) dst_row[d] = 0.0f;
+            for (int j = j0; j <= j1; j++) {
+                float wj = w[j - j0];
+                if (wj == 0.0f) continue;
+                const float *srow = src_base + (long)j * in_stride;
+                for (int d = 0; d < dim; d++) dst_row[d] += wj * srow[d];
+            }
+        }
+    }
+    free(w);
+}
+
 float *ds_clip_encoder_forward(ds_ctx_t *ctx,
                                 const unsigned char *rgb_pixels, int width, int height, int channels,
                                 const float *sam_features, int n_sam_tokens,
@@ -227,24 +290,23 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
             float *spatial_pos = (float *)malloc(256 * clip_dim * sizeof(float));
             memcpy(spatial_pos, clip->position_embedding + clip_dim, 256 * clip_dim * sizeof(float));
 
-            /* Bilinear interpolation from [src_size, src_size] to [tgt_size, tgt_size] */
+            /* Bicubic + antialias interpolation [src,src,dim] → [tgt,tgt,dim],
+             * separable H pass then W pass (matches PyTorch F.interpolate).
+             * Layout: (row, col, d) at row*colspan*dim + col*dim + d. */
+            float *tmp_pos = (float *)malloc(tgt_size * src_size * clip_dim * sizeof(float));
+            /* H pass: (sh,sw,d) → (th,sw,d) */
+            ds_bicubic_resample_dim(spatial_pos, tmp_pos,
+                                     src_size, tgt_size,
+                                     (long)src_size * clip_dim, (long)src_size * clip_dim,
+                                     clip_dim, clip_dim, src_size, clip_dim);
             float *resized_pos = (float *)malloc(clip_n_patches * clip_dim * sizeof(float));
-            for (int d = 0; d < clip_dim; d++) {
-                for (int th = 0; th < tgt_size; th++) {
-                    for (int tw = 0; tw < tgt_size; tw++) {
-                        float src_h = (float)th * (float)src_size / (float)tgt_size;
-                        float src_w = (float)tw * (float)src_size / (float)tgt_size;
-                        int sh = (int)src_h; if (sh >= src_size - 1) sh = src_size - 1;
-                        int sw = (int)src_w; if (sw >= src_size - 1) sw = src_size - 1;
-                        float fh = src_h - sh, fw = src_w - sw;
-                        float v = spatial_pos[(sh * src_size + sw) * clip_dim + d] * (1-fh) * (1-fw)
-                                + spatial_pos[(sh * src_size + (sw+1)) * clip_dim + d] * (1-fh) * fw
-                                + spatial_pos[((sh+1) * src_size + sw) * clip_dim + d] * fh * (1-fw)
-                                + spatial_pos[((sh+1) * src_size + (sw+1)) * clip_dim + d] * fh * fw;
-                        resized_pos[(th * tgt_size + tw) * clip_dim + d] = v;
-                    }
-                }
-            }
+            /* W pass: (th,sw,d) → (th,tw,d) */
+            ds_bicubic_resample_dim(tmp_pos, resized_pos,
+                                     src_size, tgt_size,
+                                     clip_dim, clip_dim,
+                                     (long)src_size * clip_dim, (long)tgt_size * clip_dim,
+                                     tgt_size, clip_dim);
+            free(tmp_pos);
             free(spatial_pos);
 
             /* Apply: CLS + interpolated spatial */

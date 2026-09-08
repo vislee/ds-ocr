@@ -1277,7 +1277,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
          * one exclusion-argmax pass (~8ms) replaces the old fallback that
          * computed full 129280-way logits via sgemm (60ms+ plus a one-time
          * 631MB BF16→F32 LM head conversion). */
-        int banned[8];
+        int banned[32];
         int n_banned = 0;
         int ngram_n = ctx->no_repeat_ngram_size;
         if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
@@ -1298,7 +1298,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
                         if (banned[b] == banned_tok) { dup = 1; break; }
                     }
                     if (!dup) {
-                        if (n_banned >= 8) goto full_logits_path;  /* pathological */
+                        if (n_banned >= 32) goto full_logits_path;  /* pathological */
                         banned[n_banned++] = banned_tok;
                     }
                 }

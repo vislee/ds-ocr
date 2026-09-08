@@ -40,21 +40,21 @@ make blas
 
 ### Benchmark
 
-#### M4 Max (14-core, 36 GB, CPU BLAS), 1600×2264 document (Unlimited-OCR cover, 6 crops) — current build
+#### M4 Max (14-core, 36 GB, CPU BLAS), 1600×2264 document (Unlimited-OCR cover, 6 crops)
 
 | Metric | V1 | V2 (6-crop) | V3 (Unlimited-OCR, 6 crops) |
 |--------|----|----|-----------------------------|
-| **Total time** | 6.9s | 10.9s | 12.6s *(was 20.6s)* |
-| **Encoding** | 5.6s (SAM 5.1 + CLIP 0.5) | 8.7s | 7.5s *(was 13.8s)* |
-| **Prefill** | 0.6s (280 tokens) | 1.8s (862 tokens) | 1.8s (908 tokens) *(was 3.5s)* |
-| **Decode** | 0.7s (33 tokens) | 0.4s (16 tokens) | 3.2s (136 tokens) |
-| **Decode speed** | 47.9 tok/s | 39.7 tok/s | 42.3 tok/s |
-| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags + orphan closing-tag prefix stripped) |
+| **Total time** | 7.5s | 11.4s | 10.1s *(was 20.6s)* |
+| **Encoding** | 5.2s (SAM 4.7 + CLIP 0.5) | 8.9s | 7.0s *(was 13.8s)* |
+| **Prefill** | 0.7–1.5s (280 tokens) | 1.9s (862 tokens) | 1.9s (908 tokens) *(was 3.5s)* |
+| **Decode** | 0.8s (33 tokens) | 0.7s (16 tokens) | 1.3s (52 tokens) |
+| **Decode speed** | 42–47 tok/s | 21–40 tok/s | 40 tok/s |
+| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Text correct (det/grounding tags + artifacts auto-stripped) |
 
 > V3 speedups vs the previous release: parallel crop encoding (SAM+CLIP run
 > concurrently across crops, like V2), parallel BF16→F32 weight conversion in
 > prefill, and float32 attention softmax in SAM. V2 prefill gains from the same
-> parallel conversion; V1 from the SAM softmax change.
+> parallel conversion; V1 from the SAM softmax + window-threading changes.
 
 #### M2 Pro (10-core, 16 GB, BLAS + Metal GPU), 6-crop V2 image (595×841)
 
@@ -143,9 +143,21 @@ Key optimizations in v1.1:
   conversion) on banned steps.
 - **SAM float32 softmax**: attention softmax switched from double to float32,
   matching Python's FP32 softmax. SAM@1024 on V1: 6.3s → 5.1s.
+- **SAM window-attention threading**: when a single SAM forward runs alone
+  (V1, small images, V3 global view), the 25 per-layer windows run across
+  raw pthreads (`DS_SAM_WIN_THREADS` tunable; auto-disabled during
+  multi-crop encoding to avoid oversubscription).
+- **V3 crop position embedding fix**: crops (100 tokens) now resample the
+  16×16 CLIP position grid with antialiased bicubic interpolation, matching
+  Python's `get_abs_pos` (`F.interpolate(mode='bicubic', antialias=True)`),
+  instead of copying its first 100 rows — that copy was the root cause of
+  V3's hallucinated `</td></tr></table>` prefix on multi-crop images.
 - **V3 output cleanup**: orphaned leading HTML closing-tag runs
-  (`</td></tr></table>`) — a model artifact on diagram/table-like content —
-  are suppressed in both streaming output and final text.
+  (`</td></tr></table>`) and broken leading `<|/det|>` fragments are
+  suppressed in both streaming output and final text.
+- **N-gram ban capacity**: greedy decode collects up to 32 banned tokens per
+  step (det-tag-heavy output can ban many) before falling back to full
+  logits.
 - **Encoding stage breakdown**: the timing summary now reports
   `SAM X ms + Encoder Y ms` separately.
 
@@ -366,6 +378,26 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | V3 | 1.01 | 35 | ngram required to prevent repetition |
 | V1 | 1.03 | 0 | Minor precision-induced typos |
 
+### V3 Output Post-Processing
+
+Unlimited-OCR (V3) is trained to emit layout/grounding markup, so raw model
+output can contain non-content artifacts. The engine strips them
+automatically — both from the streamed display and from the text returned by
+`ds_recognize()`:
+
+| Artifact | Example | Handling |
+|----------|---------|----------|
+| Detection tags | `<\|det\|>title [x1,y1,x2,y2]<\|/det\|>` | removed (`ds_strip_det_tags`) |
+| Reference+det pairs | `<\|ref\|>…<\|/ref\|><\|det\|>…<\|/det\|>` | removed, text kept |
+| "No text" hallucination prefix | `The image contains no text…[No text detected]` | prefix removed |
+| Orphaned HTML closing-tag prefix | `</td></tr></table>` | prefix removed (streaming + final text) |
+| Broken leading det fragment | `text [x1,y1,x2,y2]<\|/det\|>` (missing opener) | fragment removed |
+| Trailing/leading whitespace | — | trimmed (matches Python `.strip()`) |
+
+Root cause of the closing-tag artifact: with position-embedding interpolation
+now matching Python's `get_abs_pos`, the model emits these far less often; the
+filter remains as a safety net for diagram/table-heavy pages.
+
 ### C API
 
 ```c
@@ -493,7 +525,7 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 
 ### Version History
 
-- **v1.1** — OCR quality + speed: V3 parallel crop encoding, parallel BF16→F32 prefill conversion, n-gram exclusion argmax, SAM float32 softmax, V3 orphan closing-tag prefix strip; V2 multi-crop fix (dynamic_preprocess min_num=2), V3 small image fix (640×640 pad→111 tokens), CLIP position embedding bilinear interpolation
+- **v1.1** — OCR quality + speed: V3 parallel crop encoding, parallel BF16→F32 prefill conversion, n-gram exclusion argmax, SAM float32 softmax, SAM window-attention threading, V3 crop position-embedding interpolation fix (root cause of hallucinated table tags), V3 orphan closing-tag prefix strip; V2 multi-crop fix (dynamic_preprocess min_num=2), V3 small image fix (640×640 pad→111 tokens)
 - **v1.0** — BPE tokenizer merge loading fix (3 bugs: JSON skip, nested array format, strdup key copy), V2 output quality fix, Metal GPU MoE batching, INT8 quantization (`--int4`)
 - **v0.10** — INT8 per-row MoE expert quantization (`--int4`, RMS<0.01), platform auto-detect (M1/M2+/x86)
 - **v0.9** — Unlimited-OCR V3 support (CLIP+R-SWA), V3 multi-crop, tokenizer.json fallback, download_model.sh v1/v2/v3
@@ -505,9 +537,12 @@ Tokenizer loaded from `vocab.json` (V3) or `tokenizer.json` (V1/V2) with automat
 ### Known Issues
 
 1. **V1 CLIP encoder**: V1 and V3 share the same CLIP architecture (bypass Conv2d, receive SAM features directly). V1 output has minor BF16 precision-induced typos (e.g. "raletimit" vs "ratelimit") — within normal precision range.
-2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing. The 830 added_tokens (including `<|det|>`, `<|ref|>`, `<|grounding|>`, `<td>`, `<tr>`, etc.) are now correctly loaded from `tokenizer.json` with vocab expansion beyond 128K.
-3. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. Does not affect OCR quality.
-4. **Independent lm_head weights**: `lm_head.weight` ≠ `embed_tokens.weight`; C correctly loads the independent weights.
+2. **V3 output tags**: Unlimited-OCR produces `<|det|>` and `<|ref|>` detection tags that are automatically stripped in post-processing. Hallucination prefixes (e.g. "The image contains no text...[No text detected]") and orphaned HTML closing-tag runs (e.g. `</td></tr></table>`) are also auto-stripped. The 830 added_tokens (including `<|det|>`, `<|ref|>`, `<|grounding|>`, `<td>`, `<tr>`, etc.) are now correctly loaded from `tokenizer.json` with vocab expansion beyond 128K.
+3. **V3 large-image typos**: V3 on large images (30+ crops) may show minor OCR typos (e.g. "CC"→"CF") from local-crop context loss — a model limitation, not a code bug.
+4. **V3 small-image Non-Text**: V3 on very small images (≤640px) may emit `[Non-Text]` markers — the model was trained predominantly on larger document images.
+5. **SAM encoder precision drift**: C's SAM+Encoder output has minor differences from Python (corr ~0.995), caused by FP32 accumulation error amplified through 12+24 layers. V3 crop position embeddings use antialiased bicubic interpolation matching Python's `get_abs_pos`. Does not affect OCR quality.
+6. **Multi-crop reading order**: on dense multi-crop pages (6+ crops), V2/V3 output line order can be jumbled — the model reads the crop sequence but section order does not always match the visual grid. Pre-existing model behavior, unrelated to encode speed.
+7. **Independent lm_head weights**: `lm_head.weight` ≠ `embed_tokens.weight`; C correctly loads the independent weights.
 
 
 ## Differences from Python Implementation

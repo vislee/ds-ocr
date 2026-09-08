@@ -1609,6 +1609,9 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 
             /* n_parallel = n_crops local + 1 global */
             int n_parallel = n_crops + 1;
+            /* Crops already run concurrently — disable SAM's internal window
+             * threading to avoid oversubscription (restored after joins). */
+            ds_sam_window_parallel = 0;
             crop_task_t *tasks = (crop_task_t *)calloc(n_parallel, sizeof(crop_task_t));
             pthread_t *threads = (pthread_t *)calloc(n_parallel, sizeof(pthread_t));
 
@@ -1682,6 +1685,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             }
             free(tasks); free(threads);
             ds_image_free(global_img);
+            ds_sam_window_parallel = 1;
 
             if (global_failed || !global_enc_tokens) {
                 fprintf(stderr, "Global image encoding failed\n");
@@ -1817,6 +1821,9 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
              * oversubscription for large crop counts. */
             crop_task_t *vtasks = (crop_task_t *)calloc(nc, sizeof(crop_task_t));
             pthread_t *vthreads = (pthread_t *)calloc(nc, sizeof(pthread_t));
+            /* Crops already run concurrently — disable SAM's internal window
+             * threading to avoid oversubscription (restored after joins). */
+            ds_sam_window_parallel = 0;
             int max_in_flight = ds_get_num_cpus();
             if (max_in_flight < 1) max_in_flight = 1;
             for (int base = 0; base < nc; base += max_in_flight) {
@@ -1830,6 +1837,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                     pthread_join(vthreads[base + i], NULL);
             }
             free(vthreads);
+            ds_sam_window_parallel = 1;
 
             /* Accumulate crop SAM/CLIP times for the perf summary */
             for (int ci = 0; ci < nc; ci++) {
@@ -2690,6 +2698,27 @@ prompt_construction:
                         break;
                     }
                 }
+            }
+        }
+
+        /* Strip broken leading det fragments: when the first det-family token
+         * in the output is a CLOSER (<|/det|>), the opening <|det|> was lost
+         * (the model sometimes emits doubled closers) — drop each such
+         * fragment through its closer. Loop handles consecutive leftovers. */
+        {
+            int pass = 0;
+            while (pass++ < 4) {
+                int opener_pos = -1, closer_pos = -1;
+                for (int i = 0; i + 8 <= out_len; i++) {
+                    if (memcmp(output + i, "<|det|>", 7) == 0) { opener_pos = i; break; }
+                    if (memcmp(output + i, "<|/det|>", 8) == 0) { closer_pos = i; break; }
+                }
+                if (closer_pos < 0 || opener_pos >= 0) break;
+                int skip = closer_pos + 8;
+                while (skip < out_len && (output[skip] == '\n' || output[skip] == ' ')) skip++;
+                if (skip >= out_len) { output[0] = '\0'; out_len = 0; break; }
+                memmove(output, output + skip, out_len - skip + 1);
+                out_len -= skip;
             }
         }
 

@@ -66,9 +66,18 @@
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 /* Set by ds_visual_tokenizer_forward based on model version */
 static int g_sam_is_v2 = 0;
+
+/* Window-attention parallelism gate. When a single SAM forward runs alone
+ * (V1, or the small-image/global-view paths), the 25 per-layer windows are
+ * independent and run across raw pthreads (~650 of SAM's ~900 GFLOP live in
+ * the 8 window layers, and each window's small sgemms underutilize BLAS).
+ * During multi-crop encoding the crops already run concurrently, so the
+ * caller turns this off to avoid oversubscription. */
+int ds_sam_window_parallel = 1;
 
 /* ========================================================================
  * SAM LayerNorm2d (Channel-wise LayerNorm for spatial features)
@@ -418,6 +427,51 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
  * SAM ViT-B Layer Forward Pass
  * ======================================================================== */
 
+/* Context for one SAM window-attention layer, shared read-only by the
+ * per-window workers. Each window writes a disjoint win_attn slice. */
+typedef struct {
+    const float *padded_x;      /* [n_windows, win_tokens, dim] padded input */
+    float *win_attn;            /* [n_windows, win_tokens, dim] output */
+    const float *qkv_w, *qkv_b; /* fused QKV projection [3*dim, dim] */
+    const float *rel_h, *rel_w; /* relative position embeddings */
+    int n_windows, win_tokens, win_size, dim, n_heads, head_dim;
+    int tid, nthreads;
+} sam_window_task_t;
+
+/* QKV projection + attention for window w */
+static void sam_process_window(const sam_window_task_t *t, int w) {
+    int dim = t->dim, win_tokens = t->win_tokens;
+    const float *wx = t->padded_x + (size_t)w * win_tokens * dim;
+
+    /* QKV projection for this window (on padded data, matching Python) */
+    float *wqkv = (float *)malloc((size_t)win_tokens * 3 * dim * sizeof(float));
+    ds_linear(wqkv, wx, t->qkv_w, t->qkv_b, win_tokens, dim, 3 * dim);
+
+    float *wQ = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
+    float *wK = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
+    float *wV = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
+    for (int s = 0; s < win_tokens; s++) {
+        memcpy(wQ + s * dim, wqkv + s * 3 * dim, dim * sizeof(float));
+        memcpy(wK + s * dim, wqkv + s * 3 * dim + dim, dim * sizeof(float));
+        memcpy(wV + s * dim, wqkv + s * 3 * dim + 2 * dim, dim * sizeof(float));
+    }
+    free(wqkv);
+
+    float *wout = t->win_attn + (size_t)w * win_tokens * dim;
+    window_attn_forward(wout, wQ, wK, wV, win_tokens, t->n_heads, t->head_dim,
+                        t->rel_h, t->rel_w, t->win_size, t->win_size);
+
+    free(wQ); free(wK); free(wV);
+}
+
+/* Thread entry: process windows tid, tid+nthreads, tid+2*nthreads, ... */
+static void *sam_window_worker(void *arg) {
+    sam_window_task_t *t = (sam_window_task_t *)arg;
+    for (int w = t->tid; w < t->n_windows; w += t->nthreads)
+        sam_process_window(t, w);
+    return NULL;
+}
+
 static void sam_layer_forward(float *out, const float *x,
                                const ds_visual_tokenizer_t *vt,
                                int layer_idx, int seq_h, int seq_w) {
@@ -754,28 +808,49 @@ static void sam_layer_forward(float *out, const float *x,
 
         float *win_attn = (float *)calloc((size_t)n_windows * win_tokens * dim, sizeof(float));
 
-        for (int w = 0; w < n_windows; w++) {
-            float *wx = padded_x + (size_t)w * win_tokens * dim;
+        sam_window_task_t wtask = {
+            .padded_x = padded_x, .win_attn = win_attn,
+            .qkv_w = qkv_w, .qkv_b = qkv_b,
+            .rel_h = rel_h, .rel_w = rel_w,
+            .n_windows = n_windows, .win_tokens = win_tokens,
+            .win_size = win_size, .dim = dim,
+            .n_heads = n_heads, .head_dim = head_dim,
+            .tid = 0, .nthreads = 1,
+        };
 
-            /* QKV projection for this window (on padded data, matching Python) */
-            float *wqkv = (float *)malloc((size_t)win_tokens * 3 * dim * sizeof(float));
-            ds_linear(wqkv, wx, qkv_w, qkv_b, win_tokens, dim, 3 * dim);
-
-            float *wQ = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
-            float *wK = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
-            float *wV = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
-            for (int s = 0; s < win_tokens; s++) {
-                memcpy(wQ + s * dim, wqkv + s * 3 * dim, dim * sizeof(float));
-                memcpy(wK + s * dim, wqkv + s * 3 * dim + dim, dim * sizeof(float));
-                memcpy(wV + s * dim, wqkv + s * 3 * dim + 2 * dim, dim * sizeof(float));
+        if (ds_sam_window_parallel && n_windows > 1 && ds_get_threads() > 1) {
+            /* Parallel windows: raw pthreads with stride partitioning (not the
+             * shared thread pool — SAM may already be running inside a crop
+             * worker thread; the gate keeps this path single-SAM only).
+             * Window t processes t, t+nw, ... — disjoint win_attn writes.
+             * Concurrency is tunable: DS_SAM_WIN_THREADS (default = num_cpus),
+             * because each worker's small sgemms also use BLAS threads —
+             * fewer workers can beat more when BLAS oversubscribes. */
+            int nw = ds_get_num_cpus();
+            const char *nw_env = getenv("DS_SAM_WIN_THREADS");
+            if (nw_env && nw_env[0]) {
+                int v = atoi(nw_env);
+                if (v > 0) nw = v;
             }
-            free(wqkv);
-
-            float *wout = win_attn + (size_t)w * win_tokens * dim;
-            window_attn_forward(wout, wQ, wK, wV, win_tokens, n_heads, head_dim,
-                                rel_h, rel_w, win_size, win_size);
-
-            free(wQ); free(wK); free(wV);
+            if (nw > n_windows) nw = n_windows;
+            if (nw > 1) {
+                pthread_t *th = (pthread_t *)malloc((nw - 1) * sizeof(pthread_t));
+                sam_window_task_t *dt = (sam_window_task_t *)malloc(nw * sizeof(sam_window_task_t));
+                for (int i = 1; i < nw; i++) {
+                    dt[i] = wtask;
+                    dt[i].tid = i;
+                    dt[i].nthreads = nw;
+                    pthread_create(&th[i - 1], NULL, sam_window_worker, &dt[i]);
+                }
+                wtask.nthreads = nw;
+                sam_window_worker(&wtask);
+                for (int i = 1; i < nw; i++) pthread_join(th[i - 1], NULL);
+                free(th); free(dt);
+            } else {
+                for (int w = 0; w < n_windows; w++) sam_process_window(&wtask, w);
+            }
+        } else {
+            for (int w = 0; w < n_windows; w++) sam_process_window(&wtask, w);
         }
         free(padded_x);
 

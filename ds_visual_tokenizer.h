@@ -109,4 +109,10 @@ float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
  */
 int ds_visual_tokenizer_load(ds_ctx_t *ctx);
 
+/* Window-attention parallelism gate (defined in ds_visual_tokenizer.c).
+ * 1 (default): when a single SAM forward runs alone, its per-layer windows
+ * run across raw pthreads. Multi-crop encoding sets this to 0 around its
+ * concurrent crop workers to avoid oversubscription. */
+extern int ds_sam_window_parallel;
+
 #endif /* DS_VISUAL_TOKENIZER_H */

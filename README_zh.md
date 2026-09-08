@@ -65,16 +65,16 @@ make blas
 
 | 指标 | V1 | V2 (6-crop) | V3 (Unlimited-OCR, 6 crops) |
 |------|----|----|-----|
-| **总耗时** | 6.9s | 10.9s | 12.6s（原 20.6s） |
-| **编码** | 5.6s（SAM 5.1 + CLIP 0.5） | 8.7s | 7.5s（原 13.8s） |
-| **Prefill** | 0.6s (280 tok) | 1.8s (862 tok) | 1.8s (908 tok)（原 3.5s） |
-| **解码** | 0.7s (33 tok) | 0.4s (16 tok) | 3.2s (136 tok) |
-| **解码速度** | 47.9 tok/s | 39.7 tok/s | 42.3 tok/s |
-| **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 正确（det 标签 + 孤立闭合标签前缀已清理） |
+| **总耗时** | 7.5s | 11.4s | 10.1s（原 20.6s） |
+| **编码** | 5.2s（SAM 4.7 + CLIP 0.5） | 8.9s | 7.0s（原 13.8s） |
+| **Prefill** | 0.7–1.5s (280 tok) | 1.9s (862 tok) | 1.9s (908 tok)（原 3.5s） |
+| **解码** | 0.8s (33 tok) | 0.7s (16 tok) | 1.3s (52 tok) |
+| **解码速度** | 42–47 tok/s | 21–40 tok/s | 40 tok/s |
+| **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 文本正确（det/grounding 标签及残留自动清理） |
 
 > V3 相对上一版提速来源：并行 crop 编码（SAM+CLIP 按 crop 并发，与 V2 相同模式）、
 > prefill 阶段并行 BF16→F32 权重转换、SAM float32 注意力 softmax。
-> V2 的 prefill 提速来自并行转换；V1 来自 SAM softmax 修改。
+> V2 的 prefill 提速来自并行转换；V1 来自 SAM softmax + 窗口并行修改。
 
 #### M2 Pro (8 线程, CPU BLAS), 大图 1794×1578 + 小图 400×100（历史数据）
 
@@ -142,8 +142,17 @@ v1.1 主要优化：
   替代原先的全量 logits sgemm 回退（60ms+ 加一次性 631MB 转换）
 - **SAM float32 softmax**：注意力 softmax 从 double 改为 float32，
   与 Python FP32 softmax 一致。V1 的 SAM@1024 6.3s → 5.1s
-- **V3 输出清理**：模型在图表/表格类内容上偶发的孤立闭合标签前缀
-  （`</td></tr></table>`）在流式输出与最终文本中均被抑制
+- **SAM 窗口注意力并行**：单次 SAM 前向（V1、小图、V3 全局图）时 25 个窗口
+  用原生 pthread 并行（`DS_SAM_WIN_THREADS` 可调；多 crop 并发时自动关闭
+  以免过载）
+- **V3 crop 位置嵌入修复**：crop（100 token）对 16×16 CLIP 位置网格采用
+  抗锯齿 bicubic 重采样，对齐 Python 的 `get_abs_pos`
+  （`F.interpolate(mode='bicubic', antialias=True)`），不再错抄前 100 行——
+  这是 V3 在多 crop 图上幻觉 `</td></tr></table>` 前缀的根因
+- **V3 输出清理**：孤立闭合标签前缀（`</td></tr></table>`）与断裂的
+  `<|/det|>` 前缀片段在流式输出与最终文本中均被清除
+- **N-gram 禁用容量**：贪心解码每步最多收集 32 个禁用 token（det 标签密集
+  输出可能一次性禁用多个），超出才回退全量 logits
 - **编码阶段分解计时**：计时摘要现在单独显示 `SAM X ms + Encoder Y ms`
 
 小图（1-crop V2，global-only）：~40s 总耗时（decode ~3-4 tok/s，Metal GPU）/ ~5s（CPU BLAS）
@@ -323,6 +332,23 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 | `--debug` | 详细调试输出 | 关闭 |
 | `--silent` | 仅输出 OCR 文本 | 关闭 |
 
+### V3 输出后处理
+
+Unlimited-OCR（V3）训练目标包含版面/grounding 标记，原始输出可能含有非正文
+内容。引擎会自动清理——流式显示与 `ds_recognize()` 返回的文本均生效：
+
+| 残留物 | 示例 | 处理方式 |
+|--------|------|---------|
+| 检测标签 | `<\|det\|>title [x1,y1,x2,y2]<\|/det\|>` | 移除（`ds_strip_det_tags`） |
+| 引用+检测对 | `<\|ref\|>…<\|/ref\|><\|det\|>…<\|/det\|>` | 移除，保留文本 |
+| "无文字"幻觉前缀 | `The image contains no text…[No text detected]` | 移除前缀 |
+| 孤立 HTML 闭合标签前缀 | `</td></tr></table>` | 移除前缀（流式 + 最终文本） |
+| 断裂的 det 前缀片段 | `text [x1,y1,x2,y2]<\|/det\|>`（缺 opener） | 移除片段 |
+| 首尾空白 | — | 裁剪（对齐 Python `.strip()`） |
+
+闭合标签残留的根因：crop 位置编码改为对齐 Python `get_abs_pos` 的抗锯齿
+bicubic 插值后，此类残留已大幅减少；过滤器保留作为图表/表格密集页面的兜底。
+
 ### C API
 
 ```c
@@ -472,7 +498,7 @@ make test_debug        # AddressSanitizer 模式
 
 ### 版本历史
 
-- **v1.1** — 识别效果与速度优化：V3 并行 crop 编码、prefill 并行 BF16→F32 转换、n-gram 排除 argmax、SAM float32 softmax、V3 孤立闭合标签前缀清理；V2 多裁剪修复（dynamic_preprocess min_num=2），V3 小图修复（640×640→111 tokens），CLIP 位置编码双线性插值
+- **v1.1** — 识别效果与速度优化：V3 并行 crop 编码、prefill 并行 BF16→F32 转换、n-gram 排除 argmax、SAM float32 softmax、SAM 窗口注意力并行、V3 crop 位置编码 bicubic 插值修复（幻觉表格标签的根因）、V3 孤立闭合标签与断裂 det 片段清理；V2 多裁剪修复（dynamic_preprocess min_num=2），V3 小图修复（640×640→111 tokens）
 - **v1.0** — BPE tokenizer merge 加载修复（3个 bug），V2 输出质量修复，Metal GPU MoE 批处理，INT8 量化
 - **v0.9** — Unlimited-OCR V3 支持（CLIP+R-SWA），V3 多裁剪，tokenizer.json 回退，download_model.sh v1/v2/v3
 - **v0.8** — 批量 MoE prefill + 并行 encoding：16s 端到端（6× v0.5）
@@ -486,8 +512,9 @@ make test_debug        # AddressSanitizer 模式
 2. **V3 输出标签**：`<|det|>` 和 `<|ref|>` 检测标签已在后处理中自动去除；幻觉前缀（如 "The image contains no text...[No text detected]"）与孤立 HTML 闭合标签前缀（如 `</td></tr></table>`）也会自动清除。
 3. **V3 大图拼写偏差**：V3 对大图（30+ 裁剪）可能出现轻微 OCR 拼写偏差（如 "CC"→"CF"），因局部裁剪丢失上下文，属模型限制。
 4. **V3 小图 Non-Text**：V3 对极小图片（≤640px）可能输出 `[Non-Text]` 标记，模型主要在大文档图上训练。
-5. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。不影响 OCR 质量。
-6. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
+5. **SAM encoder 精度漂移**：C 的 SAM+Encoder 输出与 Python 有微小差异（corr ~0.995），源于 FP32 累积误差经 12+24 层放大。V3 crop 位置嵌入已采用与 Python `get_abs_pos` 一致的抗锯齿 bicubic 插值。不影响 OCR 质量。
+6. **多 crop 阅读顺序**：密集多 crop 页面（6+ crops）上 V2/V3 输出的行序可能错乱——模型按 crop 序列阅读，章节顺序不一定与视觉网格一致。属模型固有行为，与编码速度无关。
+7. **lm_head 权重独立**：`lm_head.weight` ≠ `embed_tokens.weight`，C 正确加载了独立权重。
 
 ## 致谢
 
