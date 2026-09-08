@@ -715,6 +715,8 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
         }
 
         /* 输入 RMSNorm (prefill 批量模式)
+         * 与 decode 路径不同, prefill 一次性处理 seq_len 个 token,
+         * 所以 ds_rms_norm 的第二个参数 seq_len > 1, 走 sgemm 批量化路径。*/
         ds_rms_norm(x_norm, x, layer->input_norm, seq_len, hidden, cfg->dec_rms_norm_eps);
 
         /* QKV 投影: 批量矩阵乘法
