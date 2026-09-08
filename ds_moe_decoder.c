@@ -500,6 +500,44 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     for (int l = 0; l < cfg->dec_layers; l++) {
         ds_dec_layer_t *layer = &dec->layers[l];
 
+        /* Prefetch next layer's weights so the kernel pages them in while
+         * this layer computes. Prefill touches ALL routed experts per layer
+         * (~440MB), so cold-cache page-in would otherwise stall every layer
+         * transition. Prefill routes through the raw gate/up/down mmaps
+         * (not the decode-only fused block), so prefetch those. */
+        if (l + 1 < cfg->dec_layers) {
+            ds_dec_layer_t *nl = &dec->layers[l + 1];
+            if (nl->wq_weight_bf16)
+                madvise((void *)nl->wq_weight_bf16,
+                        (size_t)(q_dim + kv_dim * 2) * hidden * 2, MADV_WILLNEED);
+            if (nl->wo_weight_bf16)
+                madvise((void *)nl->wo_weight_bf16,
+                        (size_t)q_dim * hidden * 2, MADV_WILLNEED);
+            for (int e = 0; e < cfg->dec_n_routed_experts; e++) {
+                if (nl->experts[e].gate_weight_bf16)
+                    madvise((void *)nl->experts[e].gate_weight_bf16,
+                            (size_t)cfg->dec_moe_inter * hidden * 2, MADV_WILLNEED);
+                if (nl->experts[e].up_weight_bf16)
+                    madvise((void *)nl->experts[e].up_weight_bf16,
+                            (size_t)cfg->dec_moe_inter * hidden * 2, MADV_WILLNEED);
+                if (nl->experts[e].down_weight_bf16)
+                    madvise((void *)nl->experts[e].down_weight_bf16,
+                            (size_t)hidden * cfg->dec_moe_inter * 2, MADV_WILLNEED);
+            }
+            if (nl->shared_gate_weight_bf16)
+                madvise((void *)nl->shared_gate_weight_bf16,
+                        (size_t)cfg->dec_n_shared_experts * cfg->dec_moe_inter * hidden * 2,
+                        MADV_WILLNEED);
+            if (nl->shared_up_weight_bf16)
+                madvise((void *)nl->shared_up_weight_bf16,
+                        (size_t)cfg->dec_n_shared_experts * cfg->dec_moe_inter * hidden * 2,
+                        MADV_WILLNEED);
+            if (nl->shared_down_weight_bf16)
+                madvise((void *)nl->shared_down_weight_bf16,
+                        (size_t)hidden * cfg->dec_n_shared_experts * cfg->dec_moe_inter * 2,
+                        MADV_WILLNEED);
+        }
+
         /* Input RMSNorm */
         ds_rms_norm(x_norm, x, layer->input_norm, seq_len, hidden, cfg->dec_rms_norm_eps);
 
@@ -1033,41 +1071,13 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     if (ctx->temperature <= 0.0f && lm_w) {
         double t_lm = ctx->profile_enabled ? ds_time_sec() : 0;
 
-        /* Step 1: Argmax over all rows — GPU path if DS_METAL_LM env var set */
-        int best_token;
-        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx) && getenv("DS_METAL_LM")) {
-            best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
-        } else {
-            best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
-        }
-        float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);
-        if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
-            /* First: if the argmax winner is in history, apply penalty */
-            for (int i = 0; i < ctx->token_history_len; i++) {
-                if (ctx->token_history[i] == best_token) {
-                    best_val = (best_val > 0) ? best_val / rp : best_val * rp;
-                    break;
-                }
-            }
-            /* Then: compute logits for other history tokens that might
-             * surpass the penalized best. Only check unique tokens. */
-            for (int i = 0; i < ctx->token_history_len; i++) {
-                int tid = ctx->token_history[i];
-                if (tid >= 0 && tid < vocab && tid != best_token) {
-                    float val = ds_bf16_dot_row(x, lm_w, hidden, tid);
-                    val = (val > 0) ? val / rp : val * rp;
-                    if (val > best_val) {
-                        best_val = val;
-                        best_token = tid;
-                    }
-                }
-            }
-        }
-
-        /* Step 3: N-gram blocking — if best token is banned, find next best.
-         * For ngram blocking we need the full argmax scan again with banned
-         * tokens excluded — but typically ngram only bans 0-1 tokens, so
-         * just check if best is banned and if so, rescan. */
+        /* Step 0: collect n-gram banned tokens up front (usually 0, at most
+         * a couple per step). This lets the argmax skip them directly —
+         * one exclusion-argmax pass (~8ms) replaces the old fallback that
+         * computed full 129280-way logits via sgemm (60ms+ plus a one-time
+         * 631MB BF16→F32 LM head conversion). */
+        int banned[8];
+        int n_banned = 0;
         int ngram_n = ctx->no_repeat_ngram_size;
         if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
             int prefix_len = ngram_n - 1;
@@ -1081,11 +1091,53 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
                     }
                 }
                 if (match) {
-                    int banned = hist[i + prefix_len];
-                    if (banned == best_token) {
-                        /* Best token is banned — need to find next best.
-                         * Fall back to full sgemm logits for this step. */
-                        goto full_logits_path;
+                    int banned_tok = hist[i + prefix_len];
+                    int dup = 0;
+                    for (int b = 0; b < n_banned; b++) {
+                        if (banned[b] == banned_tok) { dup = 1; break; }
+                    }
+                    if (!dup) {
+                        if (n_banned >= 8) goto full_logits_path;  /* pathological */
+                        banned[n_banned++] = banned_tok;
+                    }
+                }
+            }
+        }
+
+        /* Step 1: Argmax over all rows — GPU path if DS_METAL_LM env var set */
+        int best_token;
+        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx) && getenv("DS_METAL_LM") && n_banned == 0) {
+            best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
+        } else if (n_banned > 0) {
+            best_token = ds_argmax_matvec_bf16_excluding(x, lm_w, hidden, vocab, banned, n_banned);
+        } else {
+            best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
+        }
+        float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);
+        if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
+            /* First: if the argmax winner is in history, apply penalty */
+            for (int i = 0; i < ctx->token_history_len; i++) {
+                if (ctx->token_history[i] == best_token) {
+                    best_val = (best_val > 0) ? best_val / rp : best_val * rp;
+                    break;
+                }
+            }
+            /* Then: compute logits for other history tokens that might
+             * surpass the penalized best. Only check unique tokens.
+             * Banned tokens never win (excluded above). */
+            for (int i = 0; i < ctx->token_history_len; i++) {
+                int tid = ctx->token_history[i];
+                if (tid >= 0 && tid < vocab && tid != best_token) {
+                    int is_banned = 0;
+                    for (int b = 0; b < n_banned; b++) {
+                        if (banned[b] == tid) { is_banned = 1; break; }
+                    }
+                    if (is_banned) continue;
+                    float val = ds_bf16_dot_row(x, lm_w, hidden, tid);
+                    val = (val > 0) ? val / rp : val * rp;
+                    if (val > best_val) {
+                        best_val = val;
+                        best_token = tid;
                     }
                 }
             }

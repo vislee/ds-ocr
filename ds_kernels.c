@@ -657,9 +657,33 @@ void ds_linear_nobias(float *y, const float *x, const float *W,
     ds_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
-/* Convert bf16 buffer to f32 buffer */
+/* Convert bf16 buffer to f32 buffer.
+ * Large conversions (expert weights during prefill, LM head F32 fallback)
+ * are memory-bound — split across the thread pool. Prefill converts ~5GB of
+ * expert weights per run; the serial loop made that ~1.4s of pure copy. */
+typedef struct {
+    uint32_t *dst;
+    const uint16_t *src;
+    size_t n;
+} ds_bf16_conv_task_t;
+
+static void ds_bf16_conv_worker(int tid, int n_threads, void *arg) {
+    ds_bf16_conv_task_t *t = (ds_bf16_conv_task_t *)arg;
+    size_t chunk = (t->n + n_threads - 1) / n_threads;
+    size_t start = (size_t)tid * chunk;
+    size_t end = start + chunk;
+    if (end > t->n) end = t->n;
+    for (size_t i = start; i < end; i++)
+        t->dst[i] = ((uint32_t)t->src[i]) << 16;
+}
+
 static void ds_bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     uint32_t *d = (uint32_t *)(void *)dst;
+    if (n >= (size_t)1 << 16) {
+        ds_bf16_conv_task_t task = { d, src, n };
+        ds_parallel_for(ds_bf16_conv_worker, &task);
+        return;
+    }
     for (size_t i = 0; i < n; i++)
         d[i] = ((uint32_t)src[i]) << 16;
 }
@@ -1122,9 +1146,8 @@ float *ds_bf16_to_f32_alloc(const uint16_t *src, size_t n) {
 }
 
 void ds_bf16_to_f32_convert(float *dst, const uint16_t *src, size_t n) {
-    uint32_t *d = (uint32_t *)(void *)dst;
-    for (size_t i = 0; i < n; i++)
-        d[i] = ((uint32_t)src[i]) << 16;
+    /* Route through the shared converter — parallel for large buffers */
+    ds_bf16_to_f32_buf(dst, src, n);
 }
 
 /* NEON-optimized batch conversion dispatch */

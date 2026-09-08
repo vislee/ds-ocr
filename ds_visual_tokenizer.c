@@ -330,29 +330,27 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
             }
         }
 
-        /* Step 3: Row-wise softmax in float64 for precision */
+        /* Step 3: Row-wise softmax in float32 (matches Python FP32 softmax) */
         {
-            double *softmax_buf = (double *)malloc(n_tokens * sizeof(double));
             for (int i = 0; i < n_tokens; i++) {
                 float *row = scores + i * n_tokens;
-                double max_s = -1e30;
+                float max_s = -1e30f;
                 for (int j = 0; j < n_tokens; j++) {
-                    double s = (double)row[j];
+                    float s = row[j];
                     if (s > max_s) max_s = s;
-                    softmax_buf[j] = s;
                 }
-                double sum_e = 0.0;
+                float sum_e = 0.0f;
                 for (int j = 0; j < n_tokens; j++) {
-                    softmax_buf[j] = exp(softmax_buf[j] - max_s);
-                    sum_e += softmax_buf[j];
+                    float e = expf(row[j] - max_s);
+                    row[j] = e;
+                    sum_e += e;
                 }
-                if (sum_e > 0.0) {
-                    double inv = 1.0 / sum_e;
+                if (sum_e > 0.0f) {
+                    float inv = 1.0f / sum_e;
                     for (int j = 0; j < n_tokens; j++)
-                        row[j] = (float)(softmax_buf[j] * inv);
+                        row[j] *= inv;
                 }
             }
-            free(softmax_buf);
         }
 
         /* Step 4: attn_out_h = scores @ V_h  (BLAS sgemm) */
@@ -654,30 +652,32 @@ static void sam_layer_forward(float *out, const float *x,
                 fprintf(stderr, "Dumped block11 head0 scores+relpos_bias (%d x %d)\n", seq_len, seq_len);
             }
 
-            /* Step 2b: Softmax in float64 for stability (row-wise) */
-            double *softmax_buf = (double *)malloc(seq_len * sizeof(double));
-
+            /* Step 2b: Softmax (row-wise), float32.
+             * Python's nn.Softmax runs on FP32 tensors — float32 here matches
+             * it and is ~4x faster than the previous double-precision loop
+             * (16.7M exp() calls per head on 1024x1024 input made softmax the
+             * single largest SAM cost). */
             for (int i = 0; i < seq_len; i++) {
                 float *score_row = scores + i * seq_len;
 
-                double max_s = -1e30;
+                float max_s = -1e30f;
                 for (int j = 0; j < seq_len; j++) {
-                    double s = (double)score_row[j];
-                    softmax_buf[j] = s;
+                    float s = score_row[j];
                     if (s > max_s) max_s = s;
                 }
 
-                double sum_e = 0.0;
+                float sum_e = 0.0f;
                 for (int j = 0; j < seq_len; j++) {
-                    softmax_buf[j] = exp(softmax_buf[j] - max_s);
-                    sum_e += softmax_buf[j];
+                    float e = expf(score_row[j] - max_s);
+                    score_row[j] = e;
+                    sum_e += e;
                 }
-                if (sum_e > 0.0) {
+                if (sum_e > 0.0f) {
+                    float inv = 1.0f / sum_e;
                     for (int j = 0; j < seq_len; j++)
-                        score_row[j] = (float)(softmax_buf[j] / sum_e);
+                        score_row[j] *= inv;
                 }
             }
-            free(softmax_buf);
 
             /* Step 3: attn_out_h = softmax_scores @ V_h
              * scores is [seq_len, seq_len], V_h is [seq_len, head_dim] with stride dim

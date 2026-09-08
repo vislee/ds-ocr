@@ -114,7 +114,10 @@ static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
 
     /* Append piece to buffer */
     if (buf_len + piece_len >= (int)sizeof(ctx->_det_buf) - 1) {
-        /* Buffer would overflow — flush what we have */
+        /* Buffer would overflow — flush what we have.
+         * Overflow during the prefix phase is implausible (256 bytes of
+         * closing tags); give up on prefix suppression if it happens. */
+        ctx->_v3_prefix_done = 1;
         if (buf_len > 0) {
             buf[buf_len] = '\0';
             cb(buf, ud);
@@ -139,6 +142,51 @@ static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
         buf_len += piece_len;
         buf[buf_len] = '\0';
         *pbuf_len = buf_len;
+    }
+
+    /* ── Start-of-output orphaned closing-tag suppression ──
+     * The model occasionally opens with a run of HTML closing tags such as
+     * "</td></tr></table>" when it tries to parse diagram/table-like content.
+     * Recognized text never begins mid-table, so drop the run (and any
+     * leading whitespace). Tokens are held back until the decision is
+     * possible: either real content appears, or generation ends. */
+    if (!ctx->_v3_prefix_done) {
+        int p = 0;
+        int partial_tag = 0;
+        int saw_content = 0;
+        while (p < buf_len) {
+            char c = buf[p];
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t') { p++; continue; }
+            if (c == '<') {
+                if (p + 1 >= buf_len) { partial_tag = 1; break; }        /* lone '<' */
+                if (buf[p + 1] == '/') {
+                    int gt = p + 2;
+                    while (gt < buf_len && buf[gt] != '>') gt++;
+                    if (gt >= buf_len) { partial_tag = 1; break; }       /* partial "</x" */
+                    p = gt + 1;
+                    continue;
+                }
+            }
+            saw_content = 1;
+            break;
+        }
+        /* Decision not yet possible — keep buffering */
+        if (partial_tag || (!saw_content && p == buf_len)) {
+            if (buf_len < (int)sizeof(ctx->_det_buf) - 8) {
+                *pbuf_len = buf_len;
+                return;
+            }
+            /* Buffer nearly full of tags — give up suppressing */
+        }
+        ctx->_v3_prefix_done = 1;
+        if (p > 0) {
+            buf_len -= p;
+            memmove(buf, buf + p, buf_len);
+            buf[buf_len] = '\0';
+            *pbuf_len = buf_len;
+            if (buf_len == 0) return;  /* nothing but the dropped prefix */
+        }
+        /* Fall through to det-tag logic with the remaining text */
     }
 
     /* Try to strip complete det/ref tags from buffer */
@@ -246,6 +294,27 @@ static void *crop_worker(void *arg) {
     t->enc_tokens = ds_encoder_forward_v2(t->ctx, t->sam_tokens, t->n_sam_tokens,
                                            &t->n_enc_tokens, t->tokens_per_crop,
                                            t->ctx->vis_tokenizer.causal_query_768_embeddings);
+    t->enc_time = ds_time_sec() - e0;
+    free(t->sam_tokens);
+    t->sam_tokens = NULL;
+    if (!t->enc_tokens) { t->failed = 1; return NULL; }
+    return NULL;
+}
+
+/* Worker for V3 (Unlimited-OCR) local crop: SAM + CLIP + projector.
+ * Stores the raw CLIP output (WITH newlines) — grid assembly happens on the
+ * main thread after joining, so each crop's [100, 1280] block lands in place. */
+static void *v3_crop_worker(void *arg) {
+    crop_task_t *t = (crop_task_t *)arg;
+    double t0 = ds_time_sec();
+    t->sam_tokens = ds_sam_forward_image(t->ctx, t->crop, &t->n_sam_tokens, NULL);
+    t->sam_time = ds_time_sec() - t0;
+    if (!t->sam_tokens) { t->failed = 1; return NULL; }
+
+    double e0 = ds_time_sec();
+    t->enc_tokens = ds_clip_encoder_forward(t->ctx, NULL, 0, 0, 0,
+                                             t->sam_tokens, t->n_sam_tokens,
+                                             &t->n_enc_tokens);
     t->enc_time = ds_time_sec() - e0;
     free(t->sam_tokens);
     t->sam_tokens = NULL;
@@ -1120,6 +1189,11 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     ds_config_t *cfg = &ctx->config;
     int hidden = cfg->dec_hidden;
 
+    /* Reset per-run V3 streaming filter state */
+    ctx->_det_buf_len = 0;
+    ctx->_det_buf[0] = '\0';
+    ctx->_v3_prefix_done = 0;
+
     /* Initialize dump directory if DS_DUMP_TENSORS is set */
     ds_dump_init();
 
@@ -1241,7 +1315,9 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 
             int n_sam_tokens;
             g_dump_crop_id = 6;  /* Global crop uses ID 6 */
+            double t_sam_v2 = ds_time_sec();
             float *global_sam = ds_sam_forward_image(ctx, global_img, &n_sam_tokens, NULL);
+            ctx->perf_sam_ms += (ds_time_sec() - t_sam_v2) * 1000.0;
             ds_image_free(global_img);
             if (!global_sam) return NULL;
 
@@ -1287,9 +1363,11 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             }
 
             int n_global_enc;
+            double t_enc_v2 = ds_time_sec();
             float *global_enc = ds_encoder_forward_v2(ctx, global_sam, n_sam_tokens,
                                                        &n_global_enc, 256,
                                                        ctx->vis_tokenizer.causal_query_embeddings);
+            ctx->perf_encoder_ms += (ds_time_sec() - t_enc_v2) * 1000.0;
             free(global_sam);
             if (!global_enc) {
                 fprintf(stderr, "Encoder forward failed for global image\n");
@@ -1445,6 +1523,11 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                     n_global_enc_tokens = tasks[i].n_enc_tokens;
                 }
             }
+            /* Accumulate crop SAM/encoder times for the perf summary */
+            for (int i = 0; i < n_parallel; i++) {
+                ctx->perf_sam_ms += tasks[i].sam_time * 1000.0;
+                ctx->perf_encoder_ms += tasks[i].enc_time * 1000.0;
+            }
             free(tasks); free(threads);
             ds_image_free(global_img);
 
@@ -1511,10 +1594,14 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         /* ── Global view ── */
         ds_image_t *gimg = ds_image_pad(&img, 1024, 127);
         if (!gimg) return NULL;
+        double t_v3sam = ds_time_sec();
         int n_sg; float *sg = ds_sam_forward_image(ctx, gimg, &n_sg, NULL);
+        ctx->perf_sam_ms += (ds_time_sec() - t_v3sam) * 1000.0;
         ds_image_free(gimg);
         if (!sg) return NULL;
+        double t_v3clip = ds_time_sec();
         int n_cg; float *cg = ds_clip_encoder_forward(ctx, NULL, 0, 0, 0, sg, n_sg, &n_cg);
+        ctx->perf_encoder_ms += (ds_time_sec() - t_v3clip) * 1000.0;
         free(sg);
         if (!cg) return NULL;
 
@@ -1564,23 +1651,48 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             if (ds_verbose >= 1)
                 fprintf(stderr, "V3: %d crops (%dx%d), local %dx%d→%d tokens\n", nc, cw, ch, lh, lw, n_lnl);
 
+            /* Parallel: encode local crops concurrently (same pattern as V2
+             * multi-crop). SAM and CLIP forwards only read shared weights and
+             * use thread-local buffers, so one pthread per crop is safe.
+             * Crops run in waves of at most num_cpus to bound BLAS
+             * oversubscription for large crop counts. */
+            crop_task_t *vtasks = (crop_task_t *)calloc(nc, sizeof(crop_task_t));
+            pthread_t *vthreads = (pthread_t *)calloc(nc, sizeof(pthread_t));
+            int max_in_flight = ds_get_num_cpus();
+            if (max_in_flight < 1) max_in_flight = 1;
+            for (int base = 0; base < nc; base += max_in_flight) {
+                int wave = nc - base < max_in_flight ? nc - base : max_in_flight;
+                for (int i = 0; i < wave; i++) {
+                    vtasks[base + i].ctx = ctx;
+                    vtasks[base + i].crop = crops[base + i];
+                    pthread_create(&vthreads[base + i], NULL, v3_crop_worker, &vtasks[base + i]);
+                }
+                for (int i = 0; i < wave; i++)
+                    pthread_join(vthreads[base + i], NULL);
+            }
+            free(vthreads);
+
+            /* Accumulate crop SAM/CLIP times for the perf summary */
+            for (int ci = 0; ci < nc; ci++) {
+                ctx->perf_sam_ms += vtasks[ci].sam_time * 1000.0;
+                ctx->perf_encoder_ms += vtasks[ci].enc_time * 1000.0;
+            }
+
+            /* Assemble local grid from each crop's CLIP output */
             float *lf = (float *)calloc(n_lnl, hidden * sizeof(float));
             for (int ci = 0; ci < nc; ci++) {
+                if (vtasks[ci].failed || !vtasks[ci].enc_tokens) continue;
                 int cr = ci / cw, cc = ci % cw;
-                int nsc; float *sc = ds_sam_forward_image(ctx, crops[ci], &nsc, NULL);
-                if (!sc) continue;
-                int ncc; float *cc2 = ds_clip_encoder_forward(ctx, NULL, 0, 0, 0, sc, nsc, &ncc);
-                free(sc);
-                if (!cc2) continue;
                 /* Strip newlines: 111 → 100 */
                 for (int lr = 0; lr < lgrid; lr++) {
                     int so = lr * (lgrid + 1) * hidden;
                     int dr = cr * lgrid + lr, dc = cc * lgrid;
                     int do_ = (dr * lrw + dc) * hidden;
-                    memcpy(lf + do_, cc2 + so, lgrid * hidden * sizeof(float));
+                    memcpy(lf + do_, vtasks[ci].enc_tokens + so, lgrid * hidden * sizeof(float));
                 }
-                free(cc2);
+                free(vtasks[ci].enc_tokens);
             }
+            free(vtasks);
             /* Insert newlines in local grid */
             if (nl) {
                 float *lnl = (float *)malloc(n_lnl * hidden * sizeof(float));
@@ -1609,15 +1721,18 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         /* Step 1: Visual tokenizer (SAM) — resize to 1024x1024 */
         int n_visual_tokens;
         float *patch_embeds = NULL;
+        double t_sam = ds_time_sec();
         float *visual_tokens = ds_visual_tokenizer_forward(ctx, pixels, width, height, channels,
                                                             &n_visual_tokens, &patch_embeds,
                                                             NULL, NULL, NULL);
+        ctx->perf_sam_ms = (ds_time_sec() - t_sam) * 1000.0;
         if (!visual_tokens) {
             fprintf(stderr, "Visual tokenizer failed\n");
             return NULL;
         }
 
         /* Step 2: Encoder (CLIP V1 or DeepEncoder V2) */
+        double t_enc = ds_time_sec();
         if (cfg->enc_type == 1) {
             encoder_output = ds_clip_encoder_forward(ctx,
                                                       NULL, 0, 0, 0,
@@ -1629,6 +1744,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                                                     cfg->enc_causal_flow_queries,
                                                     ctx->vis_tokenizer.causal_query_embeddings);
         }
+        ctx->perf_encoder_ms = (ds_time_sec() - t_enc) * 1000.0;
         free(patch_embeds);
         free(visual_tokens);
         if (!encoder_output) {
@@ -2359,6 +2475,38 @@ prompt_construction:
                         out_len -= skip;
                     }
                     break;
+                }
+            }
+        }
+
+        /* Strip leading orphaned HTML closing-tag run (e.g. "</td></tr></table>").
+         * Same rationale as the streaming suppression: output never begins
+         * mid-table, so an opening run of closing tags is structural noise. */
+        {
+            int p = 0;
+            while (p < out_len) {
+                char c = output[p];
+                if (c == ' ' || c == '\n' || c == '\r' || c == '\t') { p++; continue; }
+                if (c == '<' && p + 1 < out_len && output[p + 1] == '/') {
+                    int gt = p + 2;
+                    while (gt < out_len && output[gt] != '>') gt++;
+                    if (gt >= out_len) break;
+                    p = gt + 1;
+                    continue;
+                }
+                break;
+            }
+            if (p > 0) {
+                if (p >= out_len) {
+                    /* Entire output was closing tags/whitespace */
+                    output[0] = '\0';
+                    out_len = 0;
+                } else {
+                    while (p < out_len && (output[p] == '\n' || output[p] == ' ' ||
+                                           output[p] == '\r' || output[p] == '\t'))
+                        p++;
+                    memmove(output, output + p, out_len - p + 1);
+                    out_len -= p;
                 }
             }
         }

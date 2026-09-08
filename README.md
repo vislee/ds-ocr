@@ -55,18 +55,21 @@ make blas
 > benefits memory-constrained devices and x86; on M2 Pro with Metal, decode speed is
 > similar to BF16 due to GPU overhead.
 
-#### M4 Max (16-core, 48 GB, CPU BLAS), 1794×1578 large image
+#### M4 Max (14-core, 36 GB, CPU BLAS), 1600×2264 document (Unlimited-OCR cover, 6 crops)
 
-| Metric | V1 | V2 (6-crop) | V3 (Unlimited-OCR) |
-|--------|----|----|---------------------|
-| **Total time** | 11.6s | ~18s* | 76.4s (30 crops) |
-| **Encoding** | 6.0s | ~10s* | 42.6s (30 crops × SAM+CLIP) |
-| **Prefill** | 0.7s (286 tokens) | ~1.0s* | 3.9s (3328 tokens) |
-| **Decode** | 5.0s (233 tokens) | ~6.5s* | 30.0s (499 tokens) |
-| **Decode speed** | 47.0 tok/s | ~44 tok/s* | 16.6 tok/s |
-| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags stripped) |
+| Metric | V1 | V2 (6-crop) | V3 (Unlimited-OCR, 6 crops) |
+|--------|----|----|-----------------------------|
+| **Total time** | 6.9s | 10.9s | 12.6s *(was 20.6s)* |
+| **Encoding** | 5.6s (SAM 5.1 + CLIP 0.5) | 8.7s | 7.5s *(was 13.8s)* |
+| **Prefill** | 0.6s (280 tokens) | 1.8s (862 tokens) | 1.8s (908 tokens) *(was 3.5s)* |
+| **Decode** | 0.7s (33 tokens) | 0.4s (16 tokens) | 3.2s (136 tokens) |
+| **Decode speed** | 47.9 tok/s | 39.7 tok/s | 42.3 tok/s |
+| **Output quality** | ⚠️ Minor typos | ✅ Correct | ✅ Correct (det tags + orphan closing-tag prefix stripped) |
 
-> \* V2 M4 Max estimated from V1 scaling ratio (V2 encoding ~1.6× V1 due to multi-crop).
+> V3 speedups vs the previous release: parallel crop encoding (SAM+CLIP run
+> concurrently across crops, like V2), parallel BF16→F32 weight conversion in
+> prefill, and float32 attention softmax in SAM. V2 prefill gains from the same
+> parallel conversion; V1 from the SAM softmax change.
 
 #### M2 Pro vs M4 Max Comparison (CPU BLAS, V2 6-crop)
 
@@ -85,7 +88,7 @@ make blas
 |-------|-----------|------------|----------|
 | **V2** | Dynamic multi-crop, best accuracy, flexible input sizes | Slower encoding (6+ crops) | **General use (recommended)** |
 | **V1** | Fastest single-crop, simplest pipeline | 1024×1024 stretch, BF16 precision typos | Quick scans, small images |
-| **V3** | Detailed output, sliding window attention | Very slow for large images (30 crops), repetition issues | Small images ≤640px, structured docs |
+| **V3** | Detailed output, sliding window attention | More crops for large images (parallel-encoded), occasional structural-tag artifacts (auto-stripped) | Small images ≤640px, structured docs |
 
 > V3's decode speed is ~3× slower than V1/V2 due to LlamaAttention (10 heads × 128 dim)
 > vs DeepSeek-V2 MLA compression. For small images (≤640px, 1 crop), V3 matches V1
@@ -117,6 +120,27 @@ Key optimizations in v0.9:
   projection into a single matvec, improving L2 cache reuse of the input vector.
 - **8-thread decode**: All cores used for decode (argmax LM head benefits from
   8T; small expert matvecs are marginally slower but overall faster).
+
+Key optimizations in v1.1:
+- **V3 parallel crop encoding**: Unlimited-OCR local crops (640×640) now run
+  SAM+CLIP concurrently — one pthread per crop, wave-scheduled at `num_cpus`.
+  V3 encoding on a 6-crop image: 13.8s → 7.5s.
+- **Parallel BF16→F32 conversion**: The per-call weight conversion used by
+  batched prefill (experts ~5GB per pass) is split across the thread pool.
+  Prefill for ~900-token prompts: 3.5s → 1.8s.
+- **Prefill weight prefetch**: `madvise(MADV_WILLNEED)` on the next layer's
+  gate/up/down expert weights overlaps page-in with compute.
+- **N-gram exclusion argmax**: banned tokens are collected before the LM-head
+  argmax and skipped via `ds_argmax_matvec_bf16_excluding` — one ~8ms pass
+  replaces the full-logits sgemm fallback (60ms+ plus a one-time 631MB
+  conversion) on banned steps.
+- **SAM float32 softmax**: attention softmax switched from double to float32,
+  matching Python's FP32 softmax. SAM@1024 on V1: 6.3s → 5.1s.
+- **V3 output cleanup**: orphaned leading HTML closing-tag runs
+  (`</td></tr></table>`) — a model artifact on diagram/table-like content —
+  are suppressed in both streaming output and final text.
+- **Encoding stage breakdown**: the timing summary now reports
+  `SAM X ms + Encoder Y ms` separately.
 
 **v0.9 = 8× v0.5 = 61× Python PyTorch (CPU BF16 ~736s)**
 

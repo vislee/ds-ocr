@@ -61,16 +61,20 @@ make blas
 
 > ⚠️ Metal GPU 当前在 M2 Pro 上 decode/prefill 路径存在性能回退，CPU BLAS 模式更快。
 
-#### M4 Max (16-core, 48 GB, CPU BLAS), 大图 1794×1578
+#### M4 Max (14-core, 36 GB, CPU BLAS), 1600×2264 文档图（Unlimited-OCR 封面，6 crops）
 
-| 指标 | V1 | V2 (6-crop, 估算) | V3 (30-crop) |
+| 指标 | V1 | V2 (6-crop) | V3 (Unlimited-OCR, 6 crops) |
 |------|----|----|-----|
-| **总耗时** | 11.6s | ~18s | 76.4s |
-| **编码** | 6.0s | ~10s | 42.6s |
-| **Prefill** | 0.7s | ~1.0s | 3.9s |
-| **解码** | 5.0s (233 tok) | ~6.5s | 30.0s (499 tok) |
-| **解码速度** | 47.0 tok/s | ~44 tok/s | 16.6 tok/s |
-| **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 正确 |
+| **总耗时** | 6.9s | 10.9s | 12.6s（原 20.6s） |
+| **编码** | 5.6s（SAM 5.1 + CLIP 0.5） | 8.7s | 7.5s（原 13.8s） |
+| **Prefill** | 0.6s (280 tok) | 1.8s (862 tok) | 1.8s (908 tok)（原 3.5s） |
+| **解码** | 0.7s (33 tok) | 0.4s (16 tok) | 3.2s (136 tok) |
+| **解码速度** | 47.9 tok/s | 39.7 tok/s | 42.3 tok/s |
+| **输出质量** | ⚠️ 少量拼写偏差 | ✅ 正确 | ✅ 正确（det 标签 + 孤立闭合标签前缀已清理） |
+
+> V3 相对上一版提速来源：并行 crop 编码（SAM+CLIP 按 crop 并发，与 V2 相同模式）、
+> prefill 阶段并行 BF16→F32 权重转换、SAM float32 注意力 softmax。
+> V2 的 prefill 提速来自并行转换；V1 来自 SAM softmax 修改。
 
 #### M2 Pro vs M4 Max 对比 (CPU BLAS, V2 6-crop)
 
@@ -87,7 +91,7 @@ make blas
 |------|------|------|---------|
 | **V2** | 动态多裁剪、精度最佳、输入尺寸灵活 | 编码较慢（6+ crops） | **通用（推荐）** |
 | **V1** | 最快的单裁剪、管线最简 | 1024×1024 拉伸、BF16 精度偏差 | 快速扫描、小图 |
-| **V3** | 输出详细、滑动窗口注意力 | 大图极慢（30 crops）、易重复 | 小图 ≤640px、结构化文档 |
+| **V3** | 输出详细、滑动窗口注意力 | 大图 crop 较多（已并行编码）、偶发结构标签残留（已自动清理） | 小图 ≤640px、结构化文档 |
 
 ## 性能
 
@@ -111,6 +115,23 @@ v0.9 主要优化：
 - **Fused expert forward**：`ds_expert_forward_fused()` 合并 gate+up 投影为单次 matvec，
   提升 L2 cache 对输入向量的复用
 - **8 线程 decode**：argmax LM head 受益于 8T；小 expert matvec 略慢但总体更快
+
+v1.1 主要优化：
+- **V3 并行 crop 编码**：Unlimited-OCR 局部 crop（640×640）的 SAM+CLIP 按 crop
+  并发执行（每个 crop 一个 pthread，按 CPU 核数分波调度，与 V2 相同模式）。
+  6-crop 图像 V3 编码 13.8s → 7.5s
+- **并行 BF16→F32 转换**：批量 prefill 使用的逐层权重转换（expert 权重每轮 ~5GB）
+  拆分到线程池并行执行。~900 token 的 prefill 3.5s → 1.8s
+- **Prefill 权重预取**：对下一层 gate/up/down expert 权重发起
+  `madvise(MADV_WILLNEED)`，page-in 与计算重叠
+- **N-gram 排除 argmax**：先收集 n-gram 禁用 token，再用
+  `ds_argmax_matvec_bf16_excluding` 一次扫描跳过——被禁用步长只需 ~8ms，
+  替代原先的全量 logits sgemm 回退（60ms+ 加一次性 631MB 转换）
+- **SAM float32 softmax**：注意力 softmax 从 double 改为 float32，
+  与 Python FP32 softmax 一致。V1 的 SAM@1024 6.3s → 5.1s
+- **V3 输出清理**：模型在图表/表格类内容上偶发的孤立闭合标签前缀
+  （`</td></tr></table>`）在流式输出与最终文本中均被抑制
+- **编码阶段分解计时**：计时摘要现在单独显示 `SAM X ms + Encoder Y ms`
 
 小图（1-crop V2，global-only）：~40s 总耗时（decode ~3-4 tok/s，Metal GPU）/ ~5s（CPU BLAS）
 

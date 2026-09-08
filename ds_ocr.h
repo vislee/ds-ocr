@@ -467,6 +467,7 @@ typedef struct {
     /* V3 streaming det tag filter state */
     char _det_buf[256];             /* Buffer for accumulating potential det/ref tags */
     int _det_buf_len;               /* Current length of buffered text */
+    int _v3_prefix_done;            /* 1 = start-of-output closing-tag check finished */
 
     /* Metal GPU acceleration context (NULL if Metal unavailable) */
     struct ds_metal_ctx *metal_ctx;

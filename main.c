@@ -173,9 +173,10 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr,
                 "Inference: %.0f ms, %d text tokens (%.2f tok/s decode)\n"
-                "  Encoding: %.0f ms | Prefill: %.0f ms | Decode: %.0f ms\n",
+                "  Encoding: %.0f ms (SAM %.0f + Encoder %.0f) | Prefill: %.0f ms | Decode: %.0f ms\n",
                 ctx->perf_total_ms, ctx->perf_text_tokens, tokens_per_sec,
-                ctx->perf_encode_ms, ctx->perf_prefill_ms, ctx->perf_decode_ms);
+                ctx->perf_encode_ms, ctx->perf_sam_ms, ctx->perf_encoder_ms,
+                ctx->perf_prefill_ms, ctx->perf_decode_ms);
     }
 
     /* Per-layer profiler output */
