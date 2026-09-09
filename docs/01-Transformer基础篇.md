@@ -682,3 +682,8 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
 8. **因果掩码**：解码器生成时只看过去，编码器理解时看全部
 
 **下一步**：在 [02-MoE混合专家篇](./02-MoE混合专家篇.md) 中，我们将深入 MoE 架构——看 ds-ocr 的 64 个专家如何分工合作。
+---
+
+## 🔭 进阶延伸
+
+本篇的后续深化见：06-视觉编码器篇（2D 位置与 patch 化的图像版）、10-论文导读（Attention/RoPE/RMSNorm 原文导读）。
