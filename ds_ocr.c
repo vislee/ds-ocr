@@ -2466,9 +2466,13 @@ prompt_construction:
     int n_generated = 0;
     int eos_token = DS_TOKEN_EOS;
 
+    /* ── Step 5: 自回归解码主循环 ──
+     * 【理论】自回归生成：每步把上一步选出的 token 喂回模型取下一个，
+     * 直到 EOS 或步数上限。KV cache 让每步只算 1 个新 token（O(1) 而非 O(L)）。
+     * 【注意】step 0 的 token 已在 prefill 阶段算出（first_token），此处直接使用。 */
     for (int step = 0; step < ctx->max_new_tokens; step++) {
         /* Check KV cache bounds */
-        if (ctx->kv_cache_len >= ctx->kv_cache_max) break;
+        if (ctx->kv_cache_len >= ctx->kv_cache_max) break;   /* 缓存槽位用尽：硬上限保护 */
 
         int token;
         if (step == 0 && first_token >= 0) {
@@ -2479,7 +2483,9 @@ prompt_construction:
             if (ds_verbose >= 1)
                 fprintf(stderr, "Step 0: token=%d (from prefill logits)\n", token);
         } else {
-            /* Decode: process current token, get next token */
+            /* Decode: process current token, get next token
+             * dec_input 此时持有上一步 token 的嵌入（BF16→F32 展开）；
+             * 内部走 12 层 decoder + LM head argmax，返回下一 token id */
             token = ds_decoder_forward(ctx, dec_input);
             if (ds_verbose >= 3 && step < 5) {
                 /* Print top-3 logits for first decode steps */
@@ -2515,11 +2521,11 @@ prompt_construction:
                 /* Ban EOS and Ġ during warmup. V3 model tends to oscillate
                  * between EOS and Ġ (space prefix), producing "10." loops.
                  * Banning both forces the model to pick meaningful content tokens. */
-                logits[eos_token] = -1e30f;
+                logits[eos_token] = -1e30f;          /* EOS 置 -inf：softmax 下概率为 0 */
                 if (cfg->model_version == 3) logits[223] = -1e30f; /* Ban Ġ for V3 */
                 int best_id = 0;
                 float best_val = logits[0];
-                for (int i = 1; i < cfg->vocab_size; i++) {
+                for (int i = 1; i < cfg->vocab_size; i++) {   /* 在被禁 EOS 后的剩余词表上重新 argmax */
                     if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
                 }
                 token = best_id;
@@ -2554,38 +2560,43 @@ prompt_construction:
             }
         }
 
-        /* Record token in history for repetition penalty */
+        /* Record token in history for repetition penalty
+         * 历史表同时服务两个机制：重复惩罚（rp>1 时查 logit）与 n-gram 阻断 */
         if (ctx->token_history && ctx->token_history_len < ctx->token_history_cap) {
             ctx->token_history[ctx->token_history_len++] = token;
         }
         if (ds_verbose >= 2) fprintf(stderr, "  token[%d] = %d\n", step, token);
 
-        /* Decode token to text */
+        /* Decode token to text —— BPE 词表反查得 UTF-8 片段；字节级 BPE 保证任意 id 可解码 */
         if (tokenizer) {
             const char *piece = ds_tokenizer_decode(tokenizer, token);
             if (piece) {
                 int piece_len = (int)strlen(piece);
-                while (out_len + piece_len + 1 >= capacity) {
+                while (out_len + piece_len + 1 >= capacity) {   /* 输出缓冲倍增扩容 */
                     capacity *= 2;
                     output = (char *)realloc(output, capacity);
                 }
-                memcpy(output + out_len, piece, piece_len);
+                memcpy(output + out_len, piece, piece_len);   /* 权威输出缓冲：含标签，最后统一清理 */
                 out_len += piece_len;
                 output[out_len] = '\0';
 
-                /* Stream token — with V3 det tag filtering for streaming output */
+                /* Stream token — with V3 det tag filtering for streaming output
+                 * 流式显示走独立过滤器（V3 会拦 det 标签/孤立闭合标签），
+                 * 不影响 output 权威缓冲 */
                 if (ctx->token_cb) {
                     ds_stream_filter_det(ctx, piece);
                 }
             }
         }
 
-        /* Set embedding for next token from tok_embeddings */
+        /* Set embedding for next token from tok_embeddings
+         * 【理论】token embedding 查表：BF16 语义是 F32 截断低 16 位尾数，
+         * 所以还原只需左移 16 位（bit pattern 直接解释为 F32），无乘法无查表 */
         if (ctx->decoder.tok_embeddings_bf16 && token < cfg->vocab_size) {
             /* Convert bf16 embedding to f32 */
             const uint16_t *emb = ctx->decoder.tok_embeddings_bf16 + (size_t)token * hidden;
             for (int i = 0; i < hidden; i++) {
-                uint32_t f32_bits = ((uint32_t)emb[i]) << 16;
+                uint32_t f32_bits = ((uint32_t)emb[i]) << 16;   /* BF16→F32 就是补零低 16 位 */
                 memcpy(&dec_input[i], &f32_bits, sizeof(float));
             }
         }

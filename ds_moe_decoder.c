@@ -288,44 +288,49 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     int top_k = cfg->dec_top_k;
     int n_shared = cfg->dec_n_shared_experts;
 
-    /* Step 1: Router gate scores */
-    float scores_buf[DS_MAX_EXPERTS];
+    /* Step 1: Router gate scores
+     * 路由器是一个 [64,1280] 的小线性层：scores[e] = x·W_gate[e]。
+     * 理论上每 token 只有 top-6/64 专家被激活 → 激活参数 ~570M / 总参 3B，
+     * 这就是 MoE "稀疏激活"带来的容量-算力解耦（见 docs/02-MoE混合专家篇）。 */
+    float scores_buf[DS_MAX_EXPERTS];          /* 栈上 64×4B=256B，免 malloc */
     float *scores = (n_experts <= DS_MAX_EXPERTS) ? scores_buf :
                     (float *)malloc(n_experts * sizeof(float));
     /* Use BF16 gate weight to match Python's BF16 precision.
      * F32 gate weight can select different experts than Python BF16,
      * causing accuracy degradation especially for long sequences. */
     ds_moe_router_bf16(scores, x, layer->gate_weight_bf16, hidden, n_experts);
+    /* 关键：路由用 BF16 权重。F32 路由可能与 Python 选出不同专家——
+     * 排名相近的两个专家在 F32/BF16 下次序可交换，一旦换路输出就系统性偏离 */
 
     /* Step 2: Softmax over all experts first, then select top-K (matching Python).
      * Previously ds_moe_top_k did softmax over only top-K, which was wrong —
      * the softmax values should be computed over all 64 experts before selecting. */
     {
-        float max_s = -1e30f;
+        float max_s = -1e30f;                       /* 数值稳定：减去最大值防 exp 上溢 */
         for (int e = 0; e < n_experts; e++)
             if (scores[e] > max_s) max_s = scores[e];
         float sum_exp = 0.0f;
         for (int e = 0; e < n_experts; e++) {
-            scores[e] = ds_fast_expf(scores[e] - max_s);
+            scores[e] = ds_fast_expf(scores[e] - max_s);  /* softmax 分子 e^(s-max) */
             sum_exp += scores[e];
         }
-        float inv = 1.0f / sum_exp;
+        float inv = 1.0f / sum_exp;                 /* 归一化 Σp_e = 1 */
         for (int e = 0; e < n_experts; e++)
             scores[e] *= inv;
     }
     int top_indices[DS_MAX_EXPERTS];
     float top_weights[DS_MAX_EXPERTS];
-    for (int k = 0; k < top_k; k++) {
+    for (int k = 0; k < top_k; k++) {               /* 选择法取 top-6：64×6 次比较，~微秒级 */
         int best = -1; float best_score = -1e30f;
         for (int e = 0; e < n_experts; e++) {
             int already = 0;
-            for (int j = 0; j < k; j++)
+            for (int j = 0; j < k; j++)             /* 跳过已入选的专家（无放回 top-k） */
                 if (top_indices[j] == e) { already = 1; break; }
             if (already) continue;
             if (scores[e] > best_score) { best_score = scores[e]; best = e; }
         }
-        top_indices[k] = best;
-        top_weights[k] = best_score;
+        top_indices[k] = best;      /* 第 k 名专家的编号 */
+        top_weights[k] = best_score;/* 其 softmax 概率——加权组合系数（DeepSeek-V2 不再 renorm） */
     }
     if (scores != scores_buf) free(scores);
 
@@ -377,11 +382,11 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
         madvise((void *)(block_base + min_off), max_end - min_off, MADV_WILLNEED);
     }
     for (int k = 0; k < top_k; k++) {
-        int expert_id = top_indices[k];
+        int expert_id = top_indices[k];   /* 依路由概率降序访问：概率高的专家权重更可能已驻留缓存 */
         /* Prefetch next expert's down weight (in mmap'd region, not in block) */
         if (k + 1 < top_k) {
             int next_id = top_indices[k + 1];
-            size_t down_bytes = (size_t)hidden * moe_inter * 2;
+            size_t down_bytes = (size_t)hidden * moe_inter * 2;   /* 下一个专家 down 权重 [1280,896]≈2.2MB */
             madvise((void *)layer->experts[next_id].down_weight_bf16, down_bytes, MADV_WILLNEED);
         }
         /* Use INT4 path if quantized weights available, otherwise BF16 */
@@ -440,7 +445,7 @@ shared_experts:
                                       hidden, shared_inter,
                                       shared_gate_up_buf, shared_gate_buf,
                                       shared_up_buf, shared_swiglu_buf);
-        ds_vec_add(output, output, shared_out_buf, hidden);
+        ds_vec_add(output, output, shared_out_buf, hidden);  /* 共享专家输出直接累加进残差 */
     } else if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE") &&
         layer->shared_gate_up_fused_bf16 && layer->shared_down_weight_bf16) {
         /* ── Metal GPU path: shared experts ── */
@@ -450,11 +455,12 @@ shared_experts:
                                  layer->shared_down_weight_bf16,
                                  hidden, shared_inter, output);
     } else if (layer->shared_gate_up_fused_bf16) {
-        /* Fused gate+up path: single matvec [hidden → 2*shared_inter] */
+        /* Fused gate+up path: single matvec [hidden → 2*shared_inter]
+         * 融合优势：一次 matvec 读一遍 x（1280 float 复用两次投影），权重组件也连续 */
         int shared_inter = n_shared * moe_inter;
         ds_linear_nobias_bf16(shared_gate_up_buf, x, layer->shared_gate_up_fused_bf16,
                                1, hidden, 2 * shared_inter);
-        /* Split into gate and up */
+        /* Split into gate and up —— fused 布局约定：前半 gate，后半 up */
         memcpy(shared_gate_buf, shared_gate_up_buf, shared_inter * sizeof(float));
         memcpy(shared_up_buf, shared_gate_up_buf + shared_inter, shared_inter * sizeof(float));
 
@@ -539,9 +545,9 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
                                 hidden, q_dim, kv_dim);
 
     /* Per-head Q/K RMSNorm (DeepSeek-V2 V1 style; V2/OCR-2 does not use these) */
-    if (layer->q_norm_weight)
+    if (layer->q_norm_weight)   /* q_norm: [128] 每 head 一份共享缩放，10 个 head 各自归一 */
         ds_rms_norm_per_head(q, layer->q_norm_weight, 1, n_heads, head_dim, cfg->dec_rms_norm_eps);
-    if (layer->k_norm_weight)
+    if (layer->k_norm_weight)   /* k_norm 同理作用于 10 个 KV head；K 归一化使注意力分数量级稳定 */
         ds_rms_norm_per_head(k, layer->k_norm_weight, 1, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
 
     /* RoPE: 对 Q 和 K 应用旋转位置编码
@@ -552,21 +558,22 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      * 预计算的 cos/sin 值存储在 ctx->rope_cache_cos/sin 中，
      * 预先计算好所有位置（直到 max_seq_len）的三角函数值，
      * 避免每步重复计算 sin/cos。*/
-    float *cos_vals = ctx->rope_cache_cos + pos * head_dim;
-    float *sin_vals = ctx->rope_cache_sin + pos * head_dim;
-    ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);
-    ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);
+    float *cos_vals = ctx->rope_cache_cos + pos * head_dim;  /* 第 pos 个位置的 cos 表项 [64] */
+    float *sin_vals = ctx->rope_cache_sin + pos * head_dim;  /* sin 表项 [64]；两表启动时一次算好 */
+    ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);   /* Q: 10 个 head 一起旋转 */
+    ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);/* K: 同一位置旋转，保证 Q·K 相对相位正确 */
 
     if (ctx->profile_enabled) ctx->perf_layer_qkv_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
 
     /* Store K, V directly into F32 KV cache (no BF16 conversion needed).
      * This eliminates the per-step batch BF16→F32 conversion that previously
      * dominated attention time (O(seq_len) conversion per decode step). */
-    int cache_offset = ctx->kv_cache_len;
-    float *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);
-    float *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);
-    ds_kv_store_f32(cache_k_row, k, kv_dim);
-    ds_kv_store_f32(cache_v_row, v, kv_dim);
+    int cache_offset = ctx->kv_cache_len;                        /* 当前 token 写入的缓存槽位 */
+    float *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);  /* K 行地址 = base + (layer*max_seq+pos)*stride */
+    float *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);  /* V 行地址，K/V 分开两块缓存 */
+    ds_kv_store_f32(cache_k_row, k, kv_dim);   /* 写 K [1280 float=5KB]；F32 直存是 v0.7 优化，
+                                                    免去旧方案每步 O(seq_len) 的 BF16→F32 重转换 */
+    ds_kv_store_f32(cache_v_row, v, kv_dim);   /* 写 V [5KB]；此后每个未来 token 的注意力都会读它 */
 
     /* Causal attention — read directly from F32 KV cache (zero conversion).
      * The cache is aligned and contiguous for optimal sequential read.
@@ -579,16 +586,16 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      * where window_start = max(prefill_token_count, kv_seq_len - sliding_window_size)
      * During prefill (cache_offset < prefill_token_count), use full causal attention. */
     if (ctx->profile_enabled) t0 = ds_time_sec();
-    float *attn_out = ctx->dec_attn_out;
-    float *k_base = ds_kv_k_layer(ctx, layer_idx);
-    float *v_base = ds_kv_v_layer(ctx, layer_idx);
-    int kv_seq_len = cache_offset + 1;
-    int kv_stride = ctx->_kv_row_stride;
+    float *attn_out = ctx->dec_attn_out;            /* 注意力输出 [1280] */
+    float *k_base = ds_kv_k_layer(ctx, layer_idx);  /* 本层 K 缓存基址（读全部历史位置） */
+    float *v_base = ds_kv_v_layer(ctx, layer_idx);  /* 本层 V 缓存基址 */
+    int kv_seq_len = cache_offset + 1;              /* 可见长度 = 历史缓存 + 当前 token（因果掩码） */
+    int kv_stride = ctx->_kv_row_stride;            /* 行跨度 ≥ kv_dim，64B 对齐利 SIMD 读取 */
 
     if (cfg->sliding_window_size > 0 && cache_offset >= ctx->prefill_token_count) {
         /* R-SWA decode path: attend only to reference + sliding window */
-        int prefill_len = ctx->prefill_token_count;
-        int W = cfg->sliding_window_size;
+        int prefill_len = ctx->prefill_token_count;   /* 参考集长度：视觉+prompt token（如 908） */
+        int W = cfg->sliding_window_size;             /* 滑窗 W=128：只看最近 128 个已生成 token */
         int window_start = prefill_len > (kv_seq_len - W) ? prefill_len : (kv_seq_len - W);
 
         /* Two non-contiguous ranges: [0..prefill_len-1] and [window_start..kv_seq_len-1]
@@ -621,6 +628,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *proj_out = ctx->dec_proj_out;
     ds_linear_nobias_bf16(proj_out, attn_out, layer->wo_weight_bf16, 1, q_dim, hidden);
+    /* wo: [1280,1280] BF16 matvec，把 10 个 head 的拼接输出混合回残差流 */
     if (ctx->profile_enabled) ctx->perf_layer_proj_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
 
     /* Post-attention: fused residual add + RMS norm.
@@ -641,7 +649,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
                 ctx->moe_expert_outputs);
 
     /* Add MLP output + residual (SIMD vector add) */
-    ds_vec_add(out, out, mlp_out, hidden);
+    ds_vec_add(out, out, mlp_out, hidden);   /* out = x + moe_out：残差写入交换缓冲，供下一层使用 */
 
     if (ctx->profile_enabled) {
         ctx->perf_layer_mlp_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
@@ -1191,7 +1199,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     /* Process through all layers */
     float *out = ctx->dec_layer_out;
     for (int l = 0; l < cfg->dec_layers; l++) {
-        decoder_layer_forward(ctx, x, out, l, ctx->kv_cache_len);
+        decoder_layer_forward(ctx, x, out, l, ctx->kv_cache_len);  /* 第 l 层：读 x 写 out */
         float *tmp = x; x = out; out = tmp;  /* swap pointers, avoid memcpy */
         
         /* Debug: dump hidden state after each layer for comparison */
@@ -1218,10 +1226,10 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     int _step_before = ctx->kv_cache_len;
 
     /* Advance KV cache position */
-    ctx->kv_cache_len++;
+    ctx->kv_cache_len++;    /* 本 token 的 K/V 已在层循环内写入，现在对所有层"可见" */
 
     /* Final RMSNorm */
-    ds_rms_norm(x, x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);
+    ds_rms_norm(x, x, dec->norm, 1, hidden, cfg->dec_rms_norm_eps);  /* 最后一层 norm，输出进入 LM head */
 
     /* Debug: dump norm output for first decode steps */
     if (getenv("DS_DUMP_DECODE_STEPS") && _step_before < 865) {
@@ -1277,21 +1285,24 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
          * one exclusion-argmax pass (~8ms) replaces the old fallback that
          * computed full 129280-way logits via sgemm (60ms+ plus a one-time
          * 631MB BF16→F32 LM head conversion). */
-        int banned[32];
+        int banned[32];              /* 本步被 n-gram 规则禁止的 token（贪心解码专用） */
         int n_banned = 0;
         int ngram_n = ctx->no_repeat_ngram_size;
         if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
+            /* n-gram 阻断理论（HuggingFace no_repeat_ngram_size）：
+             * 若历史末尾的 (n-1) gram 在历史中出现过，则所有曾接续它的 token
+             * 都被禁掉——从机制上杜绝重复（V3 默认 n=35，见 docs/05-性能优化实战篇） */
             int prefix_len = ngram_n - 1;
             int *hist = ctx->token_history;
             int hist_len = ctx->token_history_len;
-            for (int i = 0; i <= hist_len - prefix_len - 1; i++) {
+            for (int i = 0; i <= hist_len - prefix_len - 1; i++) {  /* 遍历所有历史 n-gram 起点 */
                 int match = 1;
-                for (int j = 0; j < prefix_len; j++) {
+                for (int j = 0; j < prefix_len; j++) {              /* 逐位比较 (n-1) gram */
                     if (hist[i + j] != hist[hist_len - prefix_len + j]) {
                         match = 0; break;
                     }
                 }
-                if (match) {
+                if (match) {                                        /* 命中：其后续 token 加入禁用表 */
                     int banned_tok = hist[i + prefix_len];
                     int dup = 0;
                     for (int b = 0; b < n_banned; b++) {
@@ -1310,13 +1321,15 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx) && getenv("DS_METAL_LM") && n_banned == 0) {
             best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
         } else if (n_banned > 0) {
+            /* 有禁用 token：单次排除式 argmax（~8ms），跳过 sgemm 全量回退 */
             best_token = ds_argmax_matvec_bf16_excluding(x, lm_w, hidden, vocab, banned, n_banned);
         } else {
-            best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);
+            best_token = ds_argmax_matvec_bf16(x, lm_w, hidden, vocab);   /* 常规路径：一次流式扫描 ~8ms */
         }
-        float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);
+        float best_val = ds_bf16_dot_row(x, lm_w, hidden, best_token);   /* 补算冠军的 logit 值（惩罚要用） */
         if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
-            /* First: if the argmax winner is in history, apply penalty */
+            /* First: if the argmax winner is in history, apply penalty
+             * 重复惩罚 HF 语义：logit>0 时 ÷rp，<0 时 ×rp（都朝抑制方向推） */
             for (int i = 0; i < ctx->token_history_len; i++) {
                 if (ctx->token_history[i] == best_token) {
                     best_val = (best_val > 0) ? best_val / rp : best_val * rp;

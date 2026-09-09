@@ -180,27 +180,33 @@ static struct {
 };
 
 static void *ds_worker_loop(void *arg) {
+    /* 【理论】常驻 worker 的 fork-join 模式（消除线程创建开销）：
+     * - generation 计数器区分"第几轮任务"，worker 醒来后比对代数，
+     *   旧唤醒信号被自然丢弃（避免条件变量竞态）。
+     * - 主线程跑 fn(0,...) 同时 worker 跑 fn(tid,...)，join 用 n_done 计数 +
+     *   cond_done 单向通知，barrier 开销 ~微秒级。
+     * - 与 cblas_sgemm 的内部分线程"纵向"并行不同，这里按输出"横向"切分。 */
     int tid = *(int *)arg;
     int my_gen = 0;
 
     for (;;) {
         pthread_mutex_lock(&tp.mutex);
-        while (tp.generation == my_gen && !tp.shutdown)
+        while (tp.generation == my_gen && !tp.shutdown)      /* while 而非 if：防虚假唤醒 */
             pthread_cond_wait(&tp.cond_work, &tp.mutex);
         if (tp.shutdown) {
             pthread_mutex_unlock(&tp.mutex);
             return NULL;
         }
-        my_gen = tp.generation;
+        my_gen = tp.generation;      /* 领取本轮任务代号 */
         ds_parallel_fn_t fn = tp.fn;
         void *a = tp.arg;
         int nt = tp.n_threads;
-        pthread_mutex_unlock(&tp.mutex);
+        pthread_mutex_unlock(&tp.mutex);   /* 执行期间不持锁，各区间的写入互不相交 */
 
         fn(tid, nt, a);
 
         pthread_mutex_lock(&tp.mutex);
-        if (++tp.n_done >= tp.n_threads - 1)
+        if (++tp.n_done >= tp.n_threads - 1)      /* 最后一个完成者唤醒主线程 */
             pthread_cond_signal(&tp.cond_done);
         pthread_mutex_unlock(&tp.mutex);
     }
@@ -997,6 +1003,14 @@ void ds_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 
 void ds_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
+    /* BF16 权重线性层 y = x @ Wᵀ 的统一入口，按 seq_len 分派：
+     *
+     * ┌ seq_len==1（decode）：NEON/AVX BF16 matvec，逐行流式点积。
+     * │  理论：单 token 时这是内存带宽问题——权重一次读入即用，
+     * │  转 F32 再 sgemm 反而要写出+读回 2 倍流量。
+     * └ seq_len>1（prefill）：先转 F32（并行），再 cblas_sgemm。
+     *    理论：多 token 时算术强度↑，变成吞吐问题，sgemm 的
+     *    寄存器分块/重排序远胜逐 token matvec（实测 100×）。 */
     if (seq_len == 1) {
         ds_bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
@@ -1464,6 +1478,19 @@ void ds_layer_norm(float *out, const float *x, const float *weight, const float 
     }
 }
 
+/* ========================================================================
+ * RMSNorm — Root Mean Square Layer Normalization
+ * ========================================================================
+ * 【理论】(Zhang & Sennrich, 2019)
+ *   RMSNorm(x) = x / sqrt(mean(x²) + ε) · g
+ * 与 LayerNorm 的区别：不减均值 μ、不算方差 σ²，只除以均方根 RMS。
+ * 省去两次遍历（求 μ、求 σ²），在 LLM 推理里通常快 ~10-15%，
+ * 且效果与 LayerNorm 相当——DeepSeek/Qwen/LLaMA 全系采用。
+ *
+ * 【本实现】hidden=1280，每次 decode 调 2×12+1=25 次（每层输入+post-attn+最终）。
+ * 三条 SIMD 路径（AVX-512 / AVX2 / NEON）+ 标量回退，逻辑相同：
+ *   第一遍：累加 Σx²      （FMA：乘加同一条指令）
+ *   第二遍：x·rms_inv·g   （rms_inv = 1/sqrt(Σx²/n + ε)，先求倒数再乘，除法只做一次） */
 void ds_rms_norm(float *out, const float *x, const float *weight,
                    int seq_len, int hidden, float eps) {
     for (int s = 0; s < seq_len; s++) {
@@ -1552,7 +1579,10 @@ void ds_rms_norm(float *out, const float *x, const float *weight,
 
 void ds_rms_norm_per_head(float *x, const float *weight,
                              int seq_len, int n_heads, int head_dim, float eps) {
-    /* x is [seq, n_heads * head_dim] - normalize each [head_dim] segment */
+    /* x is [seq, n_heads * head_dim] - normalize each [head_dim] segment
+     * 【理论】QK-Norm（Dehghani et al. 2023）：对每个 head 的 Q/K 向量独立做
+     * RMSNorm。作用是把注意力分数 logit = q·k/√d 的量级拉回稳定区间，
+     * 抑制注意力熵塌缩。本工程 DeepSeek-V2 解码器 10 head × 128 维。*/
     int hidden = n_heads * head_dim;
     for (int s = 0; s < seq_len; s++) {
         for (int h = 0; h < n_heads; h++) {
@@ -1825,6 +1855,9 @@ typedef struct {
 } ds_swiglu_direct_task_t;
 
 static void ds_swiglu_direct_worker(int tid, int n_threads, void *arg) {
+    /* 每个 worker 处理 [s0, s1) 区间的 token，区间互斥无需锁。
+     * SiLU 恒等式: z·sigmoid(z) = z / (1 + e^(-z))——把"乘 sigmoid"化成一次除法；
+     * Apple 平台用 vForce 向量化 exp，其余平台用多项式快速 exp。 */
     ds_swiglu_direct_task_t *t = (ds_swiglu_direct_task_t *)arg;
     int chunk = (t->seq_len + n_threads - 1) / n_threads;
     int s0 = tid * chunk;
@@ -1856,6 +1889,12 @@ static void ds_swiglu_direct_worker(int tid, int n_threads, void *arg) {
 
 void ds_swiglu_direct(float *out, const float *gate_buf, const float *up_buf,
                        int seq_len, int intermediate) {
+    /* 【理论】SwiGLU（Shazeer 2020, GLU 变体）：FFN(x) = SiLU(x·W_g) ⊙ (x·W_u)
+     *   SiLU(z) = z·sigmoid(z)（即 silu/swish，平滑版 ReLU）
+     * 门控 ⊙ 让网络"选择性地"放大部分激活，实践上比 GELU-FFN 收敛更好。
+     * 本工程中间维 6848（dense）/1792（expert）。
+     * 【实现】out[i] = silu(gate[i]) * up[i]，单遍顺序读写（cache 友好）；
+     * 多 token（prefill）且量够大时拆给线程池。 */
     ds_swiglu_direct_task_t task = {
         .out = out, .gate = gate_buf, .up = up_buf,
         .seq_len = seq_len, .intermediate = intermediate
