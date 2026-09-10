@@ -1756,5 +1756,6 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
 
 int ds_decoder_load(ds_ctx_t *ctx) {
     /* Weight loading is done in ds_ocr.c during ds_load() */
+    (void)ctx;
     return 0;
 }

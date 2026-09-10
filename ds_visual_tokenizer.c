@@ -136,6 +136,7 @@ static float get_rel_pos_v2(const float *rel_pos, int head_dim,
 
 static float get_rel_pos_v1(const float *rel_pos, int n_heads, int head_dim,
                              int q_coord, int k_coord, int rel_size, int head_idx) {
+    (void)n_heads;  /* V1 索引只依赖 head_idx，n_heads 仅用于形状校验 */
     int rel_offset = q_coord - k_coord + rel_size - 1;
     if (rel_offset < 0 || rel_offset >= 2 * rel_size - 1) return 0.0f;
     /* V1: shape [n_heads, head_dim, 2*rel_size-1] */
@@ -155,7 +156,7 @@ static float get_rel_pos_v1(const float *rel_pos, int n_heads, int head_dim,
  * q: query tensor, shape [n_heads * seq_len * head_dim] in (heads, seq, dim) layout
  *    For V2: q[h * seq_len * head_dim + qi * head_dim + d]
  */
-static void add_rel_pos_bias(float *attn_scores, int n_heads,
+static void __attribute__((unused)) add_rel_pos_bias(float *attn_scores, int n_heads,
                               int q_h, int q_w, int k_h, int k_w,
                               const float *rel_pos_h, const float *rel_pos_w,
                               int head_dim, int is_v2,
@@ -1514,5 +1515,6 @@ float *ds_sam_forward(ds_ctx_t *ctx, const unsigned char *pixels,
 
 /* Weight Loading (done in ds_ocr.c during ds_load()) */
 int ds_visual_tokenizer_load(ds_ctx_t *ctx) {
+    (void)ctx;
     return 0;
 }

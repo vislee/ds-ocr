@@ -119,7 +119,10 @@ static void dmatvec(ds_metal_ctx_t *c, id<MTLBuffer> yb, id<MTLBuffer> xb,
     c->ndispatch++;
 }
 
-static void dswiglu(ds_metal_ctx_t *c, id<MTLBuffer> ob, id<MTLBuffer> gub, int inter) {
+/* Named-kernel dispatch helpers. ds_metal_moe_experts currently inlines its
+ * own encoder passes, so these may be unused in a given build — keep them as
+ * the wrapper API for their registered kernels. */
+static void __attribute__((unused)) dswiglu(ds_metal_ctx_t *c, id<MTLBuffer> ob, id<MTLBuffer> gub, int inter) {
     id<MTLComputePipelineState> ps = get_ps(c, "swiglu");
     if (!ps) return;
     id<MTLCommandBuffer> cmd = [c->q commandBuffer];
@@ -134,7 +137,7 @@ static void dswiglu(ds_metal_ctx_t *c, id<MTLBuffer> ob, id<MTLBuffer> gub, int 
     c->ndispatch++;
 }
 
-static void dscale_add(ds_metal_ctx_t *c, id<MTLBuffer> dst, id<MTLBuffer> src,
+static void __attribute__((unused)) dscale_add(ds_metal_ctx_t *c, id<MTLBuffer> dst, id<MTLBuffer> src,
                         float scale, int n) {
     id<MTLComputePipelineState> ps = get_ps(c, "scale_add");
     if (!ps) return;
@@ -151,7 +154,7 @@ static void dscale_add(ds_metal_ctx_t *c, id<MTLBuffer> dst, id<MTLBuffer> src,
     c->ndispatch++;
 }
 
-static void dzero(ds_metal_ctx_t *c, id<MTLBuffer> buf, int n) {
+static void __attribute__((unused)) dzero(ds_metal_ctx_t *c, id<MTLBuffer> buf, int n) {
     id<MTLComputePipelineState> ps = get_ps(c, "zero_fill");
     if (!ps) return;
     id<MTLCommandBuffer> cmd = [c->q commandBuffer];
@@ -190,7 +193,19 @@ ds_metal_ctx_t *ds_metal_init(void) {
                                                     encoding:NSUTF8StringEncoding error:nil];
         if (code) {
             MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
-            opt.fastMathEnabled = YES;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+            if (@available(macOS 15.0, *)) {
+                opt.mathMode = MTLMathModeFast;
+            } else
+#endif
+            {
+                /* fastMathEnabled is deprecated in favor of mathMode on the
+                 * macOS 15 SDK, but is the only option on older runtimes. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                opt.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+            }
             c->lib = [dev newLibraryWithSource:code options:opt error:&err];
             if (!c->lib && err) {
                 fprintf(stderr, "Metal: compile error: %s\n",
@@ -260,6 +275,7 @@ void ds_metal_register_expert_block(ds_metal_ctx_t *c, const void *block_ptr, si
 void ds_metal_matvec_bf16(ds_metal_ctx_t *c, float *y, const float *x,
                             const uint16_t *W, const float *bias,
                             int in_dim, int out_dim) {
+    (void)bias;  /* bf16_matvec kernel 无 bias 输入；带 bias 请用 bf16_matvec_bias 路径 */
     if (!c||!y||!x||!W) return;
     c->x_b = ensure_buf(c->dev, c->x_b, &c->x_n, in_dim);
     c->y_b = ensure_buf(c->dev, c->y_b, &c->y_n, out_dim);

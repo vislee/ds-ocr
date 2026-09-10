@@ -101,8 +101,8 @@ static float rand_float(void) {
     return 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0f;
 }
 
-/* Helper: fill array with random floats */
-static void fill_random(float *x, int n) {
+/* Helper: fill array with random floats (used by tests as they need it) */
+static void __attribute__((unused)) fill_random(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] = rand_float();
 }
 

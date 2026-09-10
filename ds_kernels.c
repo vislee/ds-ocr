@@ -45,14 +45,19 @@
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
 #include <unistd.h>
 #endif
 
-/* Helper: truncate F32 to BF16 precision and back (matches Python BF16 intermediate precision) */
-static inline float ds_f32_to_bf16_to_f32(float x) {
+/* Helper: truncate F32 to BF16 precision and back (matches Python BF16 intermediate precision)
+ * Scalar reference for the SIMD rounding paths (e.g. the vaddq/vandq BF16 conversion);
+ * kept even when unused so numerical debugging can call it directly. */
+static __attribute__((unused)) inline float ds_f32_to_bf16_to_f32(float x) {
     uint32_t u;
     memcpy(&u, &x, sizeof(u));
     u = (u + 0x8000) & 0xFFFF0000u;  /* Round to nearest BF16 */
@@ -312,6 +317,7 @@ void ds_expert_forward(float *out, const float *x,
      *
      * 此函数是 CPU 路径的专家前向，每路由专家调用一次。
      * 性能方面，gate 和 up 的 BF16 matvec 各占 ~50% 的计算时间。*/
+    (void)gate_up_buf;  /* 保留在签名中以兼容调用方；SwiGLU 已改用 ds_swiglu_direct */
     ds_linear_nobias_bf16(gate_buf, x, gate_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, up_bf16, 1, hidden, intermediate);
 
@@ -423,6 +429,7 @@ void ds_expert_combine(float *output, const float *expert_outputs,
                        const int *top_indices, const float *top_weights,
                        int top_k, int hidden) {
     /* output[hidden] = sum_k(top_weights[k] * expert_outputs[k, hidden]) */
+    (void)top_indices;  /* 未选中专家的权重已置零，无需按索引跳过 */
     memset(output, 0, hidden * sizeof(float));
     for (int k = 0; k < top_k; k++) {
         float w = top_weights[k];

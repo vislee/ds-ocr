@@ -4,6 +4,8 @@ build/
 *.dSYM/
 ds_ocr
 ds_ocr_asan
+test_ds_ocr
+test_int4
 *.metallib
 
 # Debug dumps

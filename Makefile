@@ -165,11 +165,15 @@ $(TARGET): $(OBJS) main.o
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 ds_metal.o: ds_metal.m ds_metal.h ds_metal_shaders.metal
-	$(CC) $(CFLAGS) -fobjc-arc -framework Metal -framework Foundation -c -o $@ $<
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
+ifeq ($(UNAME_S),Darwin)
+debug: LDFLAGS = -lm -lpthread -framework Metal -framework Foundation -fsanitize=address
+else
 debug: LDFLAGS += -fsanitize=address
+endif
 debug:
 	@$(MAKE) clean
 	@$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"

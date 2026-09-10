@@ -3,6 +3,7 @@
  */
 
 #include "ds_platform_ocr.h"
+#include <stddef.h>
 
 #if defined(__APPLE__) && defined(USE_APPLE_VISION)
 

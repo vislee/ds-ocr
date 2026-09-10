@@ -218,6 +218,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
                                 const unsigned char *rgb_pixels, int width, int height, int channels,
                                 const float *sam_features, int n_sam_tokens,
                                 int *out_seq_len) {
+    /* CLIP 直接消费 SAM 特征，原始像素参数仅为保持公共 API 兼容 */
+    (void)rgb_pixels; (void)width; (void)height; (void)channels;
     ds_clip_encoder_t *clip = &ctx->clip_encoder;
     ds_config_t *cfg = &ctx->config;
     int clip_dim = DS_CLIP_HIDDEN; /* 1024 */
@@ -503,7 +505,7 @@ static void enc_linear_f64acc(float *y, const float *x, const float *W, const fl
     }
 }
 
-static void enc_linear_nobias_f64acc(float *y, const float *x, const float *W,
+static void __attribute__((unused)) enc_linear_nobias_f64acc(float *y, const float *x, const float *W,
                                        int seq_len, int in_dim, int out_dim) {
     enc_linear_f64acc(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
@@ -843,5 +845,6 @@ float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
 
 /* Weight Loading (done in ds_ocr.c during ds_load()) */
 int ds_encoder_load(ds_ctx_t *ctx) {
+    (void)ctx;
     return 0;
 }

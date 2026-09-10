@@ -78,15 +78,19 @@ static void ds_dump_tensor(const char *name, const float *data, int n,
     }
 }
 
+/* Debug helpers — not every TU calls all of them, so mark them __unused
+ * to keep them available for debugging without -Wunused-function noise. */
+#define DS_DUMP_UNUSED __attribute__((unused))
+
 /* Dump 2D tensor in [rows, cols] layout */
-static void ds_dump_tensor2d(const char *name, const float *data,
+static void DS_DUMP_UNUSED ds_dump_tensor2d(const char *name, const float *data,
                               int rows, int cols, const char *shape_info) {
     if (!ds_dump_enabled()) return;
     ds_dump_tensor(name, data, rows * cols, shape_info);
 }
 
 /* Create dump directory */
-static void ds_dump_init(void) {
+static void DS_DUMP_UNUSED ds_dump_init(void) {
     if (!ds_dump_enabled()) return;
 #ifdef _WIN32
     _mkdir("dump");

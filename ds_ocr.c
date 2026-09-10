@@ -1360,7 +1360,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     int n_encoder_tokens = 0;
     float *encoder_output = NULL;  /* [n_encoder_tokens, dec_hidden] */
     char tokenizer_path[4096];
-    const char *model_dir_str = ctx->model_dir ? ctx->model_dir : ".";
+    const char *model_dir_str = ctx->model_dir;
     ds_tokenizer_t *tokenizer = NULL;
 
     if (cfg->model_version == 2 && cfg->enc_type != 1) {
@@ -1407,7 +1407,6 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         if (pil_pixels && use_crop) {
             int pil_n_crops = 6; /* fixed for test截屏.png */
             int pil_local_size = 768;
-            int pil_global_size = 1024;
 
             /* Load local crops from bin: 6 x 3 x 768 x 768 */
             int local_total = pil_n_crops * 3 * pil_local_size * pil_local_size;
@@ -2328,7 +2327,7 @@ prompt_construction:
                 fprintf(stderr, "Slow prefill: %d tokens one-by-one...\n", prefix_len);
             for (int i = 0; i < prefix_len; i++) {
                 memcpy(dec_input, input_embeds + i * hidden, hidden * sizeof(float));
-                int tok = ds_decoder_forward(ctx, dec_input);
+                (void)ds_decoder_forward(ctx, dec_input);
                 if (i == prefix_len - 1) {
                     /* Last prefix token — use its logits for first generated token */
                     if (ctx->dec_logits) {
