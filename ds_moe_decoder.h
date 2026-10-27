@@ -78,7 +78,8 @@
  * 路由专家: 按expert分组的 Gather-Compute-Scatter 模式 → 30×加速
  * v0.5→v0.9: Prefill从30s降到0.93s
  */
-void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len);
+/* 返回 0 成功；-1 表示 KV 缓存越界（kv_cache_len + seq_len > kv_cache_max） */
+int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len);
 
 /* ds_decoder_forward — 解码器前向传播（单token生成）
  *

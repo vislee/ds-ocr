@@ -1117,86 +1117,91 @@ int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
     return ds_argmax_matvec_bf16_excluding(x, W_bf16, in_dim, out_dim, NULL, 0);
 }
 
-/* Argmax with token ID exclusion list (for V3 det tag suppression).
- * Each thread's chunk skips excluded token IDs when checking the best. */
+/* True if id appears in the exclusion list (n is tiny, linear scan) */
+static int ds_id_excluded(const int *exclude_ids, int n_exclude, int id) {
+    for (int e = 0; e < n_exclude; e++)
+        if (exclude_ids[e] == id) return 1;
+    return 0;
+}
+
+/* Exact argmax over [0, out_dim) with excluded rows skipped.
+ * Splits the range into contiguous segments around the sorted/deduped
+ * excluded ids and runs the fast range kernel on each segment, so the
+ * result is the TRUE best non-excluded row. The previous per-thread /
+ * per-chunk fallbacks dropped a thread's (or chunk's) runner-up when its
+ * best was excluded and could return a lower-ranked token. Cost: one
+ * extra full-vocab scan (~8ms) on the rare ban-hit step. */
+static int ds_argmax_rescan_excluding(const float *x, const uint16_t *W_bf16,
+                                      int in_dim, int out_dim,
+                                      const int *exclude_ids, int n_exclude) {
+    int ex[64];
+    int n = n_exclude < 64 ? n_exclude : 64;
+    for (int i = 0; i < n; i++) ex[i] = exclude_ids[i];
+    /* Insertion sort + dedupe (n is tiny) */
+    for (int i = 1; i < n; i++) {
+        int v = ex[i], j = i - 1;
+        while (j >= 0 && ex[j] > v) { ex[j + 1] = ex[j]; j--; }
+        ex[j + 1] = v;
+    }
+    int m = 0;
+    for (int i = 0; i < n; i++)
+        if (i == 0 || ex[i] != ex[i - 1]) ex[m++] = ex[i];
+
+    int best = -1;
+    float best_val = -1e30f;
+    int start = 0;
+    for (int k = 0; k < m; k++) {
+        int e = ex[k];
+        if (e < start) continue;         /* duplicate or unsorted leftover */
+        if (e > out_dim - 1) break;      /* beyond vocab */
+        if (e > start) {
+            int chunk_best;
+            float chunk_val;
+            argmax_bf16_range(x, W_bf16, in_dim, start, e, &chunk_best, &chunk_val);
+            if (chunk_val > best_val) { best_val = chunk_val; best = chunk_best; }
+        }
+        start = e + 1;
+    }
+    if (start < out_dim) {
+        int chunk_best;
+        float chunk_val;
+        argmax_bf16_range(x, W_bf16, in_dim, start, out_dim, &chunk_best, &chunk_val);
+        if (chunk_val > best_val) { best_val = chunk_val; best = chunk_best; }
+    }
+    return best >= 0 ? best : 0;
+}
+
+/* Argmax with token ID exclusion list (n-gram blocking, EOS warmup ban).
+ * The common case (winner not excluded) costs one streaming argmax; when
+ * the winner IS excluded we rescan exactly around the excluded rows. */
 int ds_argmax_matvec_bf16_excluding(const float *x, const uint16_t *W_bf16,
                                        int in_dim, int out_dim,
                                        const int *exclude_ids, int n_exclude) {
-    if (tp.n_threads <= 1) {
-        int best;
+    int best;
+    if (tp.n_threads > 1) {
+        ds_argmax_task_t task;
+        task.x = x;
+        task.W_bf16 = W_bf16;
+        task.in_dim = in_dim;
+        task.out_dim = out_dim;
+        ds_parallel_for(ds_argmax_worker, &task);
+
+        best = task.best_idx[0];
+        float best_val = task.best_val[0];
+        for (int i = 1; i < tp.n_threads; i++) {
+            if (task.best_val[i] > best_val) {
+                best_val = task.best_val[i];
+                best = task.best_idx[i];
+            }
+        }
+    } else {
         float best_val;
         argmax_bf16_range(x, W_bf16, in_dim, 0, out_dim, &best, &best_val);
-        for (int e = 0; e < n_exclude; e++) {
-            if (best == exclude_ids[e]) {
-                /* Best was excluded — redo argmax and skip excluded IDs.
-                 * For small exclusion lists, just re-do the argmax ignoring them. */
-                int second_best = 0;
-                float second_val = -1e30f;
-                for (int chunk_start = 0; chunk_start < out_dim; chunk_start += 8192) {
-                    int chunk_end = chunk_start + 8192;
-                    if (chunk_end > out_dim) chunk_end = out_dim;
-                    int chunk_best;
-                    float chunk_val;
-                    argmax_bf16_range(x, W_bf16, in_dim, chunk_start, chunk_end, &chunk_best, &chunk_val);
-                    int skip = 0;
-                    for (int e2 = 0; e2 < n_exclude; e2++) {
-                        if (chunk_best == exclude_ids[e2]) { skip = 1; break; }
-                    }
-                    if (!skip && chunk_val > second_val) {
-                        second_val = chunk_val;
-                        second_best = chunk_best;
-                    }
-                }
-                return second_best;
-            }
-        }
-        return best;
     }
 
-    ds_argmax_task_t task;
-    task.x = x;
-    task.W_bf16 = W_bf16;
-    task.in_dim = in_dim;
-    task.out_dim = out_dim;
-    ds_parallel_for(ds_argmax_worker, &task);
-
-    int best = task.best_idx[0];
-    float best_val = task.best_val[0];
-    for (int i = 1; i < tp.n_threads; i++) {
-        if (task.best_val[i] > best_val) {
-            best_val = task.best_val[i];
-            best = task.best_idx[i];
-        }
-    }
-    /* Check if the global best is in the exclusion list */
-    for (int e = 0; e < n_exclude; e++) {
-        if (best == exclude_ids[e]) {
-            /* Global best was excluded — find best from per-thread results
-             * that is NOT in the exclusion list. */
-            int found = 0;
-            int second_best = -1;
-            float second_val = -1e30f;
-            for (int i = 0; i < tp.n_threads; i++) {
-                int tid_best = task.best_idx[i];
-                float tid_val = task.best_val[i];
-                int tid_excluded = 0;
-                for (int e2 = 0; e2 < n_exclude; e2++) {
-                    if (tid_best == exclude_ids[e2]) { tid_excluded = 1; break; }
-                }
-                if (tid_excluded) continue;
-                if (!found || tid_val > second_val) {
-                    second_val = tid_val;
-                    second_best = tid_best;
-                    found = 1;
-                }
-            }
-            if (found) return second_best;
-            /* Fallback: if ALL thread bests are excluded, compute dot products
-             * for a small set of common tokens to find the real best.
-             * This should never happen in practice with 8 threads and 4 excluded IDs. */
-            break;
-        }
-    }
+    if (n_exclude > 0 && ds_id_excluded(exclude_ids, n_exclude, best))
+        return ds_argmax_rescan_excluding(x, W_bf16, in_dim, out_dim,
+                                          exclude_ids, n_exclude);
     return best;
 }
 

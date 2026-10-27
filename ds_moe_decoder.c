@@ -121,7 +121,7 @@
  * 处理64个路由专家(top-6) + 2个共享专家的完整计算流程。
  * 所有buffer由调用者提供（复用ctx中的预分配内存），避免反复malloc/free。*/
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
+                         ds_config_t *cfg, ds_ctx_t *ctx,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
@@ -228,14 +228,35 @@ static void dense_ffn_forward(float *output, const float *x,
     ds_linear_nobias_bf16(gate_buf, x, layer->dense_gate_weight_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, layer->dense_up_weight_bf16, 1, hidden, intermediate);
 
+    /* BF16 truncation — matches the prefill dense path (and Python autocast).
+     * The decode path previously skipped these, so layer-0 outputs drifted
+     * from the prefill-truncated distribution that produced the first token. */
+    {
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) {
+            ds_bf16_truncate_array(gate_buf, intermediate);
+            ds_bf16_truncate_array(up_buf, intermediate);
+        }
+    }
+
     /* SwiGLU: SiLU(gate) * up — direct computation without interleaving.
      * Previously: gate_up[2*i]=gate[i], gate_up[2*i+1]=up[i], then ds_swiglu_multiply.
      * That interleaving caused non-sequential writes (cache-unfriendly).
      * ds_swiglu_direct computes SiLU(gate[i]) * up[i] directly. */
     ds_swiglu_direct(swiglu_buf, gate_buf, up_buf, 1, intermediate);
 
+    {
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) ds_bf16_truncate_array(swiglu_buf, intermediate);
+    }
+
     /* Down projection */
     ds_linear_nobias_bf16(output, swiglu_buf, layer->dense_down_weight_bf16, 1, intermediate, hidden);
+
+    {
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) ds_bf16_truncate_array(output, hidden);
+    }
 
     if (own_gate) free(gate_buf);
     if (own_up) free(up_buf);
@@ -251,7 +272,7 @@ static void dense_ffn_forward(float *output, const float *x,
  * 所有 buffer 由调用者传入（decode 时复用 ctx 中的预分配内存），
  * 避免每步 malloc/free 的开销。*/
 static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx, int layer_idx,
+                         ds_config_t *cfg, ds_ctx_t *ctx, int layer_idx,
                          float *dense_gate_buf, float *dense_up_buf, float *dense_swiglu_buf,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
@@ -264,7 +285,7 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
         dense_ffn_forward(output, x, layer, cfg, dense_gate_buf, dense_up_buf, dense_swiglu_buf);
     } else {
         /* MoE */
-        moe_forward(output, x, layer, cfg, metal_ctx,
+        moe_forward(output, x, layer, cfg, ctx,
                     expert_gate_buf, expert_up_buf,
                     expert_gate_up_buf, expert_hidden_buf,
                     shared_gate_buf, shared_up_buf,
@@ -275,7 +296,7 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
 }
 
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
+                         ds_config_t *cfg, ds_ctx_t *ctx,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
@@ -340,7 +361,7 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
 
-    if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE")) {
+    if (ctx->metal_ctx && ctx->metal_moe_env && ds_metal_is_available(ctx->metal_ctx)) {
         /* ── Metal GPU path: MoE expert forward ── */
         const uint16_t *gate_up_ptrs[DS_MAX_EXPERTS];
         const uint16_t *down_ptrs[DS_MAX_EXPERTS];
@@ -349,7 +370,7 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
             down_ptrs[k] = layer->experts[top_indices[k]].down_weight_bf16;
         }
         /* GPU computes combined expert output directly into 'output' */
-        ds_metal_moe_experts(metal_ctx, x, gate_up_ptrs, down_ptrs,
+        ds_metal_moe_experts(ctx->metal_ctx, x, gate_up_ptrs, down_ptrs,
                               top_weights, top_k, hidden, moe_inter, output);
         /* Skip CPU combine since GPU already combines */
         if (!expert_outputs_buf) free(expert_outputs);
@@ -446,11 +467,11 @@ shared_experts:
                                       shared_gate_up_buf, shared_gate_buf,
                                       shared_up_buf, shared_swiglu_buf);
         ds_vec_add(output, output, shared_out_buf, hidden);  /* 共享专家输出直接累加进残差 */
-    } else if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE") &&
+    } else if (ctx->metal_ctx && ctx->metal_moe_env && ds_metal_is_available(ctx->metal_ctx) &&
         layer->shared_gate_up_fused_bf16 && layer->shared_down_weight_bf16) {
         /* ── Metal GPU path: shared experts ── */
         int shared_inter = n_shared * moe_inter;
-        ds_metal_shared_experts(metal_ctx, x,
+        ds_metal_shared_experts(ctx->metal_ctx, x,
                                  layer->shared_gate_up_fused_bf16,
                                  layer->shared_down_weight_bf16,
                                  hidden, shared_inter, output);
@@ -639,7 +660,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *mlp_out = ctx->dec_expert_out;  /* reuse preallocated buffer */
-    mlp_forward(mlp_out, x_norm, layer, cfg, ctx->metal_ctx, layer_idx,
+    mlp_forward(mlp_out, x_norm, layer, cfg, ctx, layer_idx,
                 ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                 ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                 ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
@@ -661,7 +682,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
  * Decoder Prefill (multiple tokens)
  * ======================================================================== */
 
-void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
+int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     ds_moe_decoder_t *dec = &ctx->decoder;
     ds_config_t *cfg = &ctx->config;
     int hidden = cfg->dec_hidden;
@@ -671,6 +692,14 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* KV cache bounds: a prefix larger than the cache would write past the
+     * end of this layer's slab into the next layer's (silent corruption). */
+    if (ctx->kv_cache_len + seq_len > ctx->kv_cache_max) {
+        fprintf(stderr, "ds_decoder_prefill: prefix %d + cached %d exceeds KV cache %d\n",
+                seq_len, ctx->kv_cache_len, ctx->kv_cache_max);
+        return -1;
+    }
 
     /* Allocate prefill buffers */
     float *x = (float *)malloc(seq_len * hidden * sizeof(float));
@@ -1134,6 +1163,7 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     }
 
     free(x); free(x_norm); free(Q); free(K); free(V);
+    return 0;
 }
 
 /* ========================================================================
@@ -1240,13 +1270,13 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     }
 
     /* BF16 intermediate truncation: match Python's autocast("cuda", dtype=bfloat16).
-     * Python computes the entire decoder in BF16, including attention Q/K/V,
-     * attention scores, and the final RMSNorm output before LM head.
-     * C's F32 path produces higher-precision logits where EOS tends to dominate.
-     * Truncating the final hidden state to BF16 before LM head makes logits
-     * closer to Python's distribution, reducing the EOS-vs-content logit gap. */
+     * Applied for ALL versions and unconditionally, aligning the decode path
+     * with ds_decoder_prefill (which always truncates the final hidden state
+     * before the LM head). Previously only V3 truncated here, so V1/V2 decode
+     * steps ran at a different precision than the prefill that produced the
+     * first token. */
     extern int ds_bf16_simulate_python;
-    if (ds_bf16_simulate_python && cfg->model_version == 3) {
+    if (ds_bf16_simulate_python) {
         ds_bf16_truncate_array(x, hidden);
     }
 
@@ -1285,8 +1315,14 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
          * one exclusion-argmax pass (~8ms) replaces the old fallback that
          * computed full 129280-way logits via sgemm (60ms+ plus a one-time
          * 631MB BF16→F32 LM head conversion). */
-        int banned[32];              /* 本步被 n-gram 规则禁止的 token（贪心解码专用） */
+        int banned[48];              /* 本步被禁的 token：warmup ban + n-gram 规则 */
         int n_banned = 0;
+        /* Warmup ban (min_new_tokens): EOS（V3 另加 Ġ）直接进入排除表，
+         * 让流式 argmax 从"当前步"的分布里选出真正的次优 token。
+         * 旧实现是在调用方用"陈旧的 prefill logits"做事后抑制，
+         * 会选到与当前步无关甚至连续重复的 token。 */
+        for (int b = 0; b < ctx->dec_argmax_n_ban && b < 8; b++)
+            banned[n_banned++] = ctx->dec_argmax_ban[b];
         int ngram_n = ctx->no_repeat_ngram_size;
         if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
             /* n-gram 阻断理论（HuggingFace no_repeat_ngram_size）：
@@ -1309,7 +1345,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
                         if (banned[b] == banned_tok) { dup = 1; break; }
                     }
                     if (!dup) {
-                        if (n_banned >= 32) goto full_logits_path;  /* pathological */
+                        if (n_banned >= 40) goto full_logits_path;  /* pathological */
                         banned[n_banned++] = banned_tok;
                     }
                 }
@@ -1318,7 +1354,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
 
         /* Step 1: Argmax over all rows — GPU path if DS_METAL_LM env var set */
         int best_token;
-        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx) && getenv("DS_METAL_LM") && n_banned == 0) {
+        if (ctx->metal_ctx && ctx->metal_lm_env && ds_metal_is_available(ctx->metal_ctx) && n_banned == 0) {
             best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
         } else if (n_banned > 0) {
             /* 有禁用 token：单次排除式 argmax（~8ms），跳过 sgemm 全量回退 */
@@ -1506,6 +1542,12 @@ full_logits_path:
         }
     }
 
+    /* Warmup ban tokens (min_new_tokens) — same semantics as the fast path */
+    for (int b = 0; b < ctx->dec_argmax_n_ban; b++) {
+        int t = ctx->dec_argmax_ban[b];
+        if (t >= 0 && t < vocab) logits[t] = -1e30f;
+    }
+
     /* Find argmax from logits */
     int token = 0;
     float best = logits[0];
@@ -1579,6 +1621,12 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
     int kv_dim = n_kv_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
     int kv_stride = ctx->_kv_row_stride;
+
+    if (ctx->kv_cache_len + n_tokens > ctx->kv_cache_max) {
+        fprintf(stderr, "ds_decoder_forward_batch: %d + cached %d exceeds KV cache %d\n",
+                n_tokens, ctx->kv_cache_len, ctx->kv_cache_max);
+        return;
+    }
 
     /* Allocate batch buffers */
     float *x = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
@@ -1670,7 +1718,7 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
             /* MoE — per-token (same as decode path, no batch benefit for MoE routing) */
             for (int s = 0; s < n_tokens; s++) {
                 float *mlp_out = ctx->dec_expert_out;
-                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, ctx->metal_ctx, l,
+                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, ctx, l,
                             ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                             ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                             ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,

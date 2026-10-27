@@ -1073,8 +1073,13 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
      * Using F32 directly avoids the per-step BF16→F32 batch conversion that
      * previously dominated attention time (reconverting entire cache each step).
      * Memory is 2x larger but the bandwidth savings from eliminating conversion
-     * and the sequential read performance gain more than compensate. */
-    int max_seq = 4096;
+     * and the sequential read performance gain more than compensate.
+     *
+     * V3 (Unlimited-OCR) targets long documents: a 32-crop prefix alone
+     * reaches ~3800 tokens, so the old fixed 4096 slots silently truncated
+     * generation mid-document (decode loop breaks when the cache fills).
+     * 8192 covers prefix + 4096 generated tokens (~1 GB F32 for 12 layers). */
+    int max_seq = (cfg->model_version == 3) ? 8192 : 4096;
     ctx->kv_cache_max = max_seq;
     ctx->kv_cache_len = 0;
 
@@ -1233,6 +1238,10 @@ ds_ctx_t *ds_load(const char *model_dir) {
     /* Initialize Metal GPU acceleration (optional, no error if unavailable) */
     ctx->metal_ctx = ds_metal_init();
     ctx->metal_enabled = (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx)) ? 1 : 0;
+    /* Hoist the per-token env lookups out of the decode hot path:
+     * moe_forward/argmax used to call getenv() ~24x per generated token. */
+    ctx->metal_moe_env = getenv("DS_METAL_MOE") != NULL;
+    ctx->metal_lm_env = getenv("DS_METAL_LM") != NULL;
     if (ctx->metal_enabled && getenv("DS_NO_METAL")) {
         ctx->metal_enabled = 0;
         if (ds_verbose >= 1) fprintf(stderr, "Metal GPU acceleration: disabled by DS_NO_METAL\n");
@@ -1264,6 +1273,12 @@ void ds_free(ds_ctx_t *ctx) {
     if (ctx->metal_ctx) {
         ds_metal_free(ctx->metal_ctx);
         ctx->metal_ctx = NULL;
+    }
+
+    /* Free cached tokenizer (loaded once in ds_recognize_image) */
+    if (ctx->tokenizer_handle) {
+        ds_tokenizer_free((ds_tokenizer_t *)ctx->tokenizer_handle);
+        ctx->tokenizer_handle = NULL;
     }
 
     /* Free safetensors */
@@ -1345,6 +1360,9 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     ctx->_det_buf_len = 0;
     ctx->_det_buf[0] = '\0';
     ctx->_v3_prefix_done = 0;
+
+    /* Reset per-run argmax ban list (set per decode step below) */
+    ctx->dec_argmax_n_ban = 0;
 
     /* Initialize dump directory if DS_DUMP_TENSORS is set */
     ds_dump_init();
@@ -1634,8 +1652,11 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 pthread_create(&threads[gi], NULL, crop_worker_global, &tasks[gi]);
             }
 
-            /* Wait for all tasks and collect results */
-            int global_failed = 0;
+            /* Wait for ALL tasks and collect results.
+             * Join every thread before any cleanup: bailing out on the first
+             * failure used to free `tasks` while later crop workers were
+             * still writing through their task pointers (use-after-free). */
+            int failed_seen = 0;
             float *global_enc_tokens = NULL;
             int n_global_enc_tokens = 0;
 
@@ -1643,16 +1664,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 pthread_join(threads[i], NULL);
                 if (tasks[i].failed) {
                     fprintf(stderr, "Encoding failed for crop %d\n", i);
-                    if (i < n_crops) {
-                        /* Local crop failed — cleanup */
-                        for (int j = 0; j < n_parallel; j++) free(tasks[j].enc_tokens);
-                        free(tasks); free(threads); free(local_features);
-                        ds_image_free(global_img);
-                        goto cleanup_crops;
-                    } else {
-                        /* Global crop failed */
-                        global_failed = 1;
-                    }
+                    failed_seen = 1;
                     continue;
                 }
                 if (ds_verbose >= 1) {
@@ -1686,9 +1698,10 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             ds_image_free(global_img);
             ds_sam_window_parallel = 1;
 
-            if (global_failed || !global_enc_tokens) {
-                fprintf(stderr, "Global image encoding failed\n");
+            if (failed_seen || !global_enc_tokens) {
+                fprintf(stderr, "Multi-crop encoding failed\n");
                 free(local_features);
+                free(global_enc_tokens);
                 goto cleanup_crops;
             }
 
@@ -1844,10 +1857,18 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 ctx->perf_encoder_ms += vtasks[ci].enc_time * 1000.0;
             }
 
-            /* Assemble local grid from each crop's CLIP output */
+            /* Assemble local grid from each crop's CLIP output.
+             * A failed crop must abort the run: silently leaving a zeroed
+             * region in the feature grid feeds the decoder garbage and
+             * yields a confidently wrong OCR result. */
             float *lf = (float *)calloc(n_lnl, hidden * sizeof(float));
+            int crop_failed = 0;
             for (int ci = 0; ci < nc; ci++) {
-                if (vtasks[ci].failed || !vtasks[ci].enc_tokens) continue;
+                if (vtasks[ci].failed || !vtasks[ci].enc_tokens) {
+                    fprintf(stderr, "V3: crop %d encoding failed — aborting\n", ci);
+                    crop_failed = 1;
+                    break;
+                }
                 int cr = ci / cw, cc = ci % cw;
                 /* Strip newlines: 111 → 100 */
                 for (int lr = 0; lr < lgrid; lr++) {
@@ -1857,6 +1878,16 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                     memcpy(lf + do_, vtasks[ci].enc_tokens + so, lgrid * hidden * sizeof(float));
                 }
                 free(vtasks[ci].enc_tokens);
+                vtasks[ci].enc_tokens = NULL; /* failure path below frees all entries */
+            }
+            if (crop_failed) {
+                for (int ci = 0; ci < nc; ci++) free(vtasks[ci].enc_tokens);
+                free(vtasks);
+                free(lf);
+                free(gnl);
+                for (int i = 0; i < nc; i++) ds_image_free(crops[i]);
+                free(crops);
+                return NULL;
             }
             free(vtasks);
             /* Insert newlines in local grid */
@@ -2000,17 +2031,25 @@ prompt_construction:
 
     /* Load tokenizer early (needed for prompt encoding in V2).
      * Try vocab.json first (standalone format), then tokenizer.json (HuggingFace format).
-     * tokenizer.json model.vocab has the same {token:id} structure as vocab.json. */
-    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir_str);
-    tokenizer = ds_tokenizer_load(tokenizer_path);
-    if (!tokenizer) {
-        /* Fallback: extract model.vocab from tokenizer.json.
-         * ds_tokenizer_load_from_tokenizer_json() parses the nested format. */
-        snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", model_dir_str);
-        tokenizer = ds_tokenizer_load_from_tokenizer_json(tokenizer_path);
+     * tokenizer.json model.vocab has the same {token:id} structure as vocab.json.
+     * The tokenizer is cached on the ctx and reused across recognize calls —
+     * loading parses a multi-MB vocab, and the old per-call load also leaked
+     * (ds_tokenizer_free was never invoked in this function). */
+    if (ctx->tokenizer_handle) {
+        tokenizer = (ds_tokenizer_t *)ctx->tokenizer_handle;
+    } else {
+        snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/vocab.json", model_dir_str);
+        tokenizer = ds_tokenizer_load(tokenizer_path);
+        if (!tokenizer) {
+            /* Fallback: extract model.vocab from tokenizer.json.
+             * ds_tokenizer_load_from_tokenizer_json() parses the nested format. */
+            snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", model_dir_str);
+            tokenizer = ds_tokenizer_load_from_tokenizer_json(tokenizer_path);
+        }
+        ctx->tokenizer_handle = tokenizer;
+        if (!tokenizer && ds_verbose >= 1)
+            fprintf(stderr, "Note: neither vocab.json nor tokenizer.json found, tokenizer not loaded\n");
     }
-    if (!tokenizer && ds_verbose >= 1)
-        fprintf(stderr, "Note: neither vocab.json nor tokenizer.json found, tokenizer not loaded\n");
 
     float *input_embeds = NULL;
     int prefix_len = 0;
@@ -2325,25 +2364,30 @@ prompt_construction:
              * potential bugs in batched prefill. */
             if (ds_verbose >= 1)
                 fprintf(stderr, "Slow prefill: %d tokens one-by-one...\n", prefix_len);
-            for (int i = 0; i < prefix_len; i++) {
+            for (int i = 0; i < prefix_len - 1; i++) {
                 memcpy(dec_input, input_embeds + i * hidden, hidden * sizeof(float));
                 (void)ds_decoder_forward(ctx, dec_input);
-                if (i == prefix_len - 1) {
-                    /* Last prefix token — use its logits for first generated token */
-                    if (ctx->dec_logits) {
-                        float *logits = ctx->dec_logits;
-                        int vocab = cfg->vocab_size;
-                        float best_val = -1e30f;
-                        int best_id = 0;
-                        for (int v = 0; v < vocab; v++) {
-                            if (logits[v] > best_val) { best_val = logits[v]; best_id = v; }
-                        }
-                        first_token = best_id;
-                    }
-                    if (ds_verbose >= 1)
-                        fprintf(stderr, "Slow prefill done, first token=%d\n", first_token);
-                }
             }
+            /* Last prefix token through the batched path: unlike the fast
+             * argmax path, ds_decoder_prefill writes ctx->dec_logits, so the
+             * first-token selection below reads CURRENT logits (routing the
+             * last token through ds_decoder_forward left dec_logits holding
+             * uninitialized memory). */
+            memcpy(dec_input, input_embeds + (prefix_len - 1) * hidden, hidden * sizeof(float));
+            ds_decoder_prefill(ctx, dec_input, 1);
+            /* Last prefix token — use its logits for first generated token */
+            if (ctx->dec_logits) {
+                float *logits = ctx->dec_logits;
+                int vocab = cfg->vocab_size;
+                float best_val = -1e30f;
+                int best_id = 0;
+                for (int v = 0; v < vocab; v++) {
+                    if (logits[v] > best_val) { best_val = logits[v]; best_id = v; }
+                }
+                first_token = best_id;
+            }
+            if (ds_verbose >= 1)
+                fprintf(stderr, "Slow prefill done, first token=%d\n", first_token);
         } else {
             /* Debug: dump input_embeds for comparison with Python */
             {
@@ -2358,7 +2402,12 @@ prompt_construction:
                     }
                 }
             }
-            ds_decoder_prefill(ctx, input_embeds, prefix_len);
+            if (ds_decoder_prefill(ctx, input_embeds, prefix_len) != 0) {
+                fprintf(stderr, "Prefill failed: prefix exceeds KV cache\n");
+                free(dec_input);
+                free(input_embeds);
+                return NULL;
+            }
             /* Use prefill logits for first token selection */
             if (ctx->dec_logits) {
                 float *logits = ctx->dec_logits;
@@ -2471,7 +2520,11 @@ prompt_construction:
      * 【注意】step 0 的 token 已在 prefill 阶段算出（first_token），此处直接使用。 */
     for (int step = 0; step < ctx->max_new_tokens; step++) {
         /* Check KV cache bounds */
-        if (ctx->kv_cache_len >= ctx->kv_cache_max) break;   /* 缓存槽位用尽：硬上限保护 */
+        if (ctx->kv_cache_len >= ctx->kv_cache_max) {
+            fprintf(stderr, "Warning: KV cache full (%d tokens) — output truncated\n",
+                    ctx->kv_cache_len);
+            break;   /* 缓存槽位用尽：硬上限保护 */
+        }
 
         int token;
         if (step == 0 && first_token >= 0) {
@@ -2482,6 +2535,18 @@ prompt_construction:
             if (ds_verbose >= 1)
                 fprintf(stderr, "Step 0: token=%d (from prefill logits)\n", token);
         } else {
+            /* Warmup ban (min_new_tokens): declare banned tokens up front so
+             * the fast argmax excludes them EXACTLY from the current step's
+             * distribution. (The old post-hoc suppression re-argmaxed over
+             * ctx->dec_logits, which the fast path never updates — it was
+             * still holding the prefill logits, so the "runner-up" came from
+             * a stale distribution and could repeat every step.) */
+            ctx->dec_argmax_n_ban = 0;
+            if (step < ctx->min_new_tokens) {
+                ctx->dec_argmax_ban[ctx->dec_argmax_n_ban++] = eos_token;
+                if (cfg->model_version == 3)
+                    ctx->dec_argmax_ban[ctx->dec_argmax_n_ban++] = 223; /* Ġ */
+            }
             /* Decode: process current token, get next token
              * dec_input 此时持有上一步 token 的嵌入（BF16→F32 展开）；
              * 内部走 12 层 decoder + LM head argmax，返回下一 token id */
@@ -2707,6 +2772,44 @@ prompt_construction:
                         stripped = 1;
                         break;
                     }
+                }
+            }
+        }
+
+        /* Strip leading dot-grid rows: with correctly interpolated SAM pos
+         * embeds the model sometimes opens with a run of lines made purely
+         * of dots and whitespace — its placeholder for an empty detection
+         * grid (same artifact class as the orphaned det closers stripped
+         * below, which the pre-fix pipeline opened with). Recognized text
+         * never begins with a dot-only line, so drop the run. */
+        {
+            int p = 0;
+            int saw_dot_line = 0;
+            while (p < out_len) {
+                int line_start = p;
+                int saw_dot = 0, saw_other = 0;
+                while (p < out_len && output[p] != '\n') {
+                    if (output[p] == '.') saw_dot = 1;
+                    else if (output[p] != ' ' && output[p] != '\r' && output[p] != '\t')
+                        saw_other = 1;
+                    p++;
+                }
+                if (saw_other) { p = line_start; break; }
+                if (saw_dot) saw_dot_line = 1;
+                p++; /* consume newline; whitespace-only and dot-only lines
+                        both belong to the leading placeholder grid */
+            }
+            if (saw_dot_line && p > 0) {
+                if (p >= out_len) {
+                    /* Entire output was dot rows (blank page) */
+                    output[0] = '\0';
+                    out_len = 0;
+                } else {
+                    while (p < out_len && (output[p] == '\n' || output[p] == ' ')) p++;
+                    memmove(output, output + p, out_len - p + 1);
+                    out_len -= p;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "V3: stripped leading dot-grid rows\n");
                 }
             }
         }

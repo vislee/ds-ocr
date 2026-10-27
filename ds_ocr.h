@@ -195,7 +195,7 @@ typedef struct {
     /* SAM ViT-B encoder weights */
     float *sam_patch_embed_weight;      /* [768, 3, 16, 16] */
     float *sam_patch_embed_bias;        /* [768] */
-    float *sam_pos_embed;               /* [577, 768] */
+    float *sam_pos_embed;               /* [1, 64, 64, 768] 2D spatial grid, no CLS (all versions) */
 
     /* SAM transformer layers (12 layers) */
     struct {
@@ -463,6 +463,17 @@ typedef struct {
     ds_token_cb token_cb;
     void *token_cb_userdata;
 
+    /* Cached BPE tokenizer — loaded once per ctx, freed in ds_free().
+     * Opaque pointer to avoid a ds_tokenizer.h header cycle. */
+    void *tokenizer_handle;
+
+    /* Per-call argmax ban list (e.g. EOS during min_new_tokens warmup).
+     * Consumed by the decode fast path so banned tokens are excluded
+     * exactly from the streaming argmax, instead of being suppressed
+     * after the fact from stale prefill logits. */
+    int dec_argmax_ban[8];
+    int dec_argmax_n_ban;
+
     /* Inference settings */
     int max_new_tokens;        /* Max tokens to generate (default: 4096) */
     float temperature;         /* Sampling temperature (default: 0.0 = greedy) */
@@ -513,6 +524,8 @@ typedef struct {
     /* Metal GPU acceleration context (NULL if Metal unavailable) */
     struct ds_metal_ctx *metal_ctx;
     int metal_enabled;              /* 1 = use Metal for MoE/LM head, 0 = CPU only */
+    int metal_moe_env;              /* DS_METAL_MOE present at load time (hoisted getenv) */
+    int metal_lm_env;               /* DS_METAL_LM present at load time (hoisted getenv) */
 } ds_ctx_t;
 
 /* ========================================================================
@@ -570,8 +583,10 @@ float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
                            int n_tokens, int *out_seq_len,
                            int n_causal_queries, const float *causal_queries);
 
-/* Decoder prefill (multiple tokens) */
-void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len);
+/* Decoder prefill (multiple tokens).
+ * Returns 0 on success, -1 if the KV cache would overflow
+ * (kv_cache_len + seq_len > kv_cache_max). */
+int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len);
 
 /* Decoder forward (single token, uses KV cache, returns greedy token) */
 int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed);

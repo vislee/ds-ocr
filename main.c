@@ -83,7 +83,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --temp <f>    Sampling temperature (default: 0 = greedy)\n");
     fprintf(stderr, "  --rp <f>      Repetition penalty (default: 1.0, try 1.1-1.5)\n");
     fprintf(stderr, "  --ngram <n>   No-repeat ngram size (default: 0, try 20-35 if output is degenerate)\n");
-    fprintf(stderr, "  --min-tokens <n> Min tokens before allowing EOS (default: 256, 0 to disable)\n");
+    fprintf(stderr, "  --min-tokens <n> Min tokens before allowing EOS (default: 0; Unlimited-OCR: 32; 0 disables)\n");
     fprintf(stderr, "  --vision      Use macOS Vision OCR backend (no model required)\n");
     fprintf(stderr, "  --vision-fast Use macOS Vision OCR backend in fast mode\n");
     fprintf(stderr, "  --profile     Profile per-layer timing breakdown\n");
@@ -161,8 +161,18 @@ int main(int argc, char **argv) {
     ds_verbose = verbosity;
     /* BF16中间截断: 默认开启，模拟Python的BF16计算路径
      * 不开启时F32精度与Python的BF16训练路径不一致，12层MoE后EOS logit偏低，
-     * 导致OCR文本结束后产生幻觉内容 */
-    ds_bf16_simulate_python = getenv("DS_BF16_SIMULATE_PYTHON") ? 1 : 0;
+     * 导致OCR文本结束后产生幻觉内容。
+     * 关闭方式: DS_BF16_SIMULATE_PYTHON=0（也接受 false/off）。
+     * 旧实现是"env 存在即开启"——默认反而关闭，且设为 0 仍会开启，
+     * 与 ds_ocr.c 里文档化的契约（默认开启）完全相反。 */
+    {
+        const char *env = getenv("DS_BF16_SIMULATE_PYTHON");
+        if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0 ||
+                    strcmp(env, "FALSE") == 0 || strcmp(env, "off") == 0))
+            ds_bf16_simulate_python = 0;
+        else
+            ds_bf16_simulate_python = 1;
+    }
 
     /* ── macOS Vision OCR 快捷路径（不使用模型） ── */
     if (use_platform_ocr) {
