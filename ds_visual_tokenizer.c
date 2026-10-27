@@ -1239,12 +1239,17 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     /* Add positional embedding (with interpolation for non-1024 inputs) */
     float *x = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
 
-    if (cfg->model_version == 2) {
-        /* V2: pos_embed is 2D spatial [1, src_grid, src_grid, 768]
-         * src_grid = image_size / patch_size = 1024/16 = 64
-         * If input is 768x768, grid = 48, need bicubic interpolation 64->48 */
+    /* All versions (V1/V2/V3): the checkpoint stores pos_embed as a 2D spatial
+     * grid [1, 64, 64, 768] with NO CLS token — verified in all three model
+     * safetensors headers. Inputs smaller than 1024² (V2 768 crops → grid 48,
+     * V3 640 crops/small images → grid 40) need bicubic interpolation 64→grid,
+     * matching Python's get_abs_pos_sam(). Indexing is row-major over the
+     * ACTUAL patch grid; the old per-version branches (V1 "+1 CLS offset",
+     * V3 "no interpolation") were both wrong and the V1 one also read past
+     * the end of the 4096-row tensor. */
+    {
         int src_grid = cfg->image_size / DS_SAM_PATCH_SIZE;  /* 64 */
-        int tgt_grid = grid_h;  /* may differ from src_grid for 768x768 inputs */
+        int tgt_grid = grid_h;  /* may differ from src_grid for 768/640 inputs */
 
         float *pos_embed = vt->sam_pos_embed;
         float *interp_pos = NULL;
@@ -1286,26 +1291,6 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         }
 
         if (interp_pos) free(interp_pos);
-    } else if (cfg->model_version == 3) {
-        /* V3 (Unlimited-OCR): pos_embed is 2D spatial [1, 64, 64, 768] (same as V2)
-         * No CLS token, no interpolation needed for 1024×1024 input (64×64 patches).
-         * Uses the same 2D spatial indexing as V2. */
-        for (int p = 0; p < n_patches; p++) {
-            int row = p / grid_w;
-            int col = p % grid_w;
-            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
-                    + vt->sam_pos_embed[(row * grid_w + col) * DS_SAM_EMBED_DIM + d];
-            }
-        }
-    } else {
-        /* V1: pos_embed is 1D sequence [1, n_patches+1, 768] (with CLS token at index 0) */
-        for (int p = 0; p < n_patches; p++) {
-            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
-                    + vt->sam_pos_embed[(p + 1) * DS_SAM_EMBED_DIM + d];
-            }
-        }
     }
     free(patch_spatial);
 
@@ -1466,8 +1451,10 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
              * Same as V2 — pad to maintain aspect ratio, don't stretch. */
             resized_img = ds_image_pad(&img, target_size, 127);
         } else {
-            /* V1: stretch to target size */
-            resized_img = ds_image_resize(&img, target_size, target_size);
+            /* V1: Python's crop-mode global view is ImageOps.pad(image,(1024,1024),127)
+             * — pad to preserve aspect ratio. The old stretch distorted the
+             * aspect ratio of non-square documents before SAM ever saw them. */
+            resized_img = ds_image_pad(&img, target_size, 127);
         }
         if (!resized_img) {
             fprintf(stderr, "Failed to resize image\n");
