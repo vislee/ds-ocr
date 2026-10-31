@@ -1,0 +1,4 @@
+# source: engine-baseline r2-B8 2026-10-31（领导批准重冻；与旧标签差异=坐标抖动/项目符号字形/一处歧义字形，内容等价，见 BLOCKED B8）
+<PAGE><BLOCK>text[86, 0, 720, 142]<FORK>- skip: 实现了白名单功能。
+<BLOCK>text[86, 338, 738, 495]<FORK>- deny: 实现了黑名单功能。
+<BLOCK>text[88, 698, 227, 823]<FORK>• CC:

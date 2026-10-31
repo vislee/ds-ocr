@@ -38,7 +38,7 @@ UNAME_S := $(shell uname -s)
 # Source files (shared between main binary and test binary)
 SRCS = ds_ocr.c ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_avx.c \
        ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
-       ds_tokenizer.c ds_safetensors.c ds_quantize.c
+       ds_tokenizer.c ds_safetensors.c ds_quantize.c ds_dash.c
 ifeq ($(UNAME_S),Darwin)
 SRCS += ds_platform_ocr.m ds_metal.m
 METALLIB = ds_metal_shaders.metallib
@@ -217,3 +217,40 @@ ds_platform_ocr.o: ds_platform_ocr.c ds_platform_ocr.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 endif
 test.o: test.c ds_ocr.h ds_kernels.h ds_safetensors.h ds_tokenizer.h ds_image.h
+
+# ════════════════════════════════════════════════════════════════════
+# 单元测试 + 覆盖率（r3）: make test_unit && make coverage
+# test_unit 为 unity 编译（直接 #include ds_dash.c / ds_ocr.c 以触达
+# static 函数），其余目标文件正常链接；--coverage 出 gcov/llvm-cov 数据。
+# ════════════════════════════════════════════════════════════════════
+COV_FLAGS = --coverage
+UNIT_SRCS = ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_avx.c \
+            ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
+            ds_tokenizer.c ds_safetensors.c ds_quantize.c
+
+test_unit: test_unit.c ds_dash.c ds_ocr.c $(UNIT_SRCS) ds_metal.m ds_kernels.h ds_ocr.h ds_dash.h
+	$(CC) $(CFLAGS) $(COV_FLAGS) -fobjc-arc -c -o ds_metal_ut.o ds_metal.m
+	$(CC) $(CFLAGS) $(COV_FLAGS) -c -o test_unit-tu.o test_unit.c
+	@set -e; for f in $(UNIT_SRCS); do \
+	    $(CC) $(CFLAGS) $(COV_FLAGS) -c -o test_unit-$${f%.c}.o $$f; \
+	done
+	$(CC) $(COV_FLAGS) -o $@ test_unit-tu.o test_unit-ds_*.o ds_metal_ut.o \
+	  -lm -lpthread -framework Accelerate -framework Foundation -framework Metal -framework CoreGraphics
+
+UT_E2E_FILTER = test_e2e_all_models
+
+coverage-unit: test_unit
+	@rm -f *.gcda
+	UT_SKIP_E2E=1 ./test_unit
+	@echo "── 覆盖率（单元测试，无 e2e）──"
+	@for g in test_unit-ds_*.gcda; do \
+	    [ -f "$$g" ] && xcrun llvm-cov gcov "$$g" 2>/dev/null | grep -E "Lines executed|^File" | paste - - ; \
+	done
+
+coverage: test_unit
+	@rm -f *.gcda *.gcno            # 清掉旧二进制的覆盖数据（防 corrupt arc tag）
+	./test_unit
+	@echo "── 覆盖率报告（核心文件，行覆盖）──"
+	@for g in test_unit-ds_*.gcda; do \
+	    [ -f "$$g" ] && xcrun llvm-cov gcov "$$g" 2>/dev/null | grep -E "Lines executed|^File" | paste - - ; \
+	done

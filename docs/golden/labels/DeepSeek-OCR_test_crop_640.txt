@@ -1,0 +1,10 @@
+# source: engine-baseline 2026-10-30（人工对照原图核对通过）
+# Description
+
+云WAF系统，支持黑白名单和CC的防护。  
+系统分为以下阶段：  
+
+- skip: 实现了白名单功能。  
+- deny: 实现了黑名单功能。  
+- cc:  
+  - 离线分析策略

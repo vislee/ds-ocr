@@ -1,0 +1,2 @@
+# source: engine-baseline r2-B8 2026-10-31（领导批准重冻；与旧标签差异=坐标抖动/项目符号字形/一处歧义字形，内容等价，见 BLOCKED B8）
+<PAGE><BLOCK>text[38, 186, 999, 701]<FORK>- filter 过滤，实现了请求头的增删改、请求cookie的增删改、响应头的增删改、响应cookie的增删改、响应状态码置写和敏感信息过滤等。

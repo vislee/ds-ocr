@@ -2383,6 +2383,100 @@ void ds_causal_attention_aligned(float *out, const float *Q, const float *K, con
  * Reference Sliding Window Attention (R-SWA) for Unlimited-OCR
  * ======================================================================== */
 
+float ds_dot_bf16xf32(const uint16_t *k, const float *q, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) {
+        union { uint32_t u; float f; } e;
+        e.u = (uint32_t)k[i] << 16;
+        s += q[i] * e.f;
+    }
+    return s;
+}
+
+void ds_axpy_bf16xf32(float *o, const uint16_t *v, float w, int n) {
+    for (int i = 0; i < n; i++) {
+        union { uint32_t u; float f; } e;
+        e.u = (uint32_t)v[i] << 16;
+        o[i] += w * e.f;
+    }
+}
+
+/* R-SWA decode: 每 head 独立（在线 softmax 只依赖本 head 的 Q/O），
+ * 参考集 [0,prefill_len) + 窗口 [window_start,kv_seq_len) 两段扫描按 head 切分并行。 */
+typedef struct {
+    float *out; const float *Q; const float *K_base; const float *V_base;
+    const uint16_t *K16; const uint16_t *V16;   /* BF16 KV 模式（r2 任务2） */
+    int bf16;
+    int n_heads, head_dim; float scale; int kv_stride;
+    int prefill_len, window_start, kv_seq_len;
+} ds_rswa_attn_task_t;
+
+static void ds_rswa_attn_worker(int tid, int nt, void *arg) {
+    ds_rswa_attn_task_t *t = (ds_rswa_attn_task_t *)arg;
+    int chunk = (t->n_heads + nt - 1) / nt;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    for (int h = h0; h < h1; h++) {
+        const float *q = t->Q + h * t->head_dim;
+        float *o = t->out + h * t->head_dim;
+        const float *k_h = t->bf16 ? NULL : t->K_base + h * t->head_dim;
+        const float *v_h = t->bf16 ? NULL : t->V_base + h * t->head_dim;
+        const uint16_t *k16 = t->bf16 ? t->K16 + h * t->head_dim : NULL;
+        const uint16_t *v16 = t->bf16 ? t->V16 + h * t->head_dim : NULL;
+        float max_s = -1e30f, sum_e = 0.0f;
+        for (int d = 0; d < t->head_dim; d++) o[d] = 0.0f;
+
+        /* Range 1: reference [0, prefill_len) + Range 2: window
+         * [window_start, kv_seq_len)，两段共用同一在线 softmax 状态 */
+        for (int range = 0; range < 2; range++) {
+            int j0 = range == 0 ? 0 : t->window_start;
+            int j1 = range == 0 ? t->prefill_len : t->kv_seq_len;
+            for (int j = j0; j < j1; j++) {
+                float score;
+                if (t->bf16) {
+                    score = ds_dot_bf16xf32(k16 + (size_t)j * t->kv_stride, q, t->head_dim) * t->scale;
+                } else {
+                    const float *k_row = k_h + (size_t)j * t->kv_stride;
+                    score = ds_dot_f32(q, k_row, t->head_dim) * t->scale;
+                }
+                if (j + 2 < j1) {
+                    if (t->bf16) {
+                        __builtin_prefetch(k16 + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                        __builtin_prefetch(v16 + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                    } else {
+                        __builtin_prefetch(k_h + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                        __builtin_prefetch(v_h + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                    }
+                }
+                if (score > max_s) {
+                    float corr = ds_fast_expf(max_s - score);
+                    sum_e = sum_e * corr + 1.0f;
+                    if (t->bf16) {
+                        /* o = o*corr + v（与 F32 路径 ds_vec_scale_add 同一数学） */
+                        ds_vec_scale_inplace(o, corr, t->head_dim);
+                        ds_axpy_bf16xf32(o, v16 + (size_t)j * t->kv_stride, 1.0f, t->head_dim);
+                    } else {
+                        const float *v_row = v_h + (size_t)j * t->kv_stride;
+                        ds_vec_scale_add(o, v_row, corr, t->head_dim);
+                    }
+                    max_s = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_s);
+                    sum_e += wt;
+                    if (t->bf16) {
+                        ds_axpy_bf16xf32(o, v16 + (size_t)j * t->kv_stride, wt, t->head_dim);
+                    } else {
+                        const float *v_row = v_h + (size_t)j * t->kv_stride;
+                        ds_vec_axpy_inplace(o, v_row, wt, t->head_dim);
+                    }
+                }
+            }
+        }
+        if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, t->head_dim);
+    }
+}
+
 void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, const float *V_base,
                                 int seq_q, int n_heads, int n_kv_heads, int head_dim,
                                 float scale, int kv_stride,
@@ -2403,6 +2497,17 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
 
     if (seq_q == 1 && n_heads == n_kv_heads) {
         /* Single-token decode fast path */
+        if (tp.n_threads > 1 && n_heads >= 2) {
+            ds_rswa_attn_task_t task = {
+                .out = out, .Q = Q, .K_base = K_base, .V_base = V_base,
+                .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+                .kv_stride = kv_stride,
+                .prefill_len = prefill_len, .window_start = window_start,
+                .kv_seq_len = kv_seq_len
+            };
+            ds_parallel_for(ds_rswa_attn_worker, &task);
+            return;
+        }
         for (int h = 0; h < n_heads; h++) {
             const float *q = Q + h * head_dim;
             const float *k_h = K_base + h * head_dim;
@@ -2459,6 +2564,7 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
         return;
     }
 
+
     /* General path: compute attention over combined reference + window positions.
      * For each head, build a compact K/V array from the two ranges,
      * then use standard attention. This is slower but handles GQA correctly. */
@@ -2510,6 +2616,33 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
 
         if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, head_dim);
     }
+}
+
+void ds_rswa_attention_aligned_bf16(float *out, const float *Q, const void *K_base, const void *V_base,
+                                    int seq_q, int n_heads, int n_kv_heads, int head_dim,
+                                    float scale, int kv_stride,
+                                    int prefill_len, int window_start, int kv_seq_len, int bf16) {
+    if (seq_q != 1 || n_heads != n_kv_heads) {
+        /* BF16 模式仅 V3/V4 解码（seq_q=1, MHA）；防御性断言 */
+        fprintf(stderr, "rswa_bf16: unsupported shape seq_q=%d\n", seq_q);
+        memset(out, 0, (size_t)seq_q * n_heads * head_dim * sizeof(float));
+        return;
+    }
+    ds_rswa_attn_task_t task = {
+        .out = out, .Q = Q,
+        .K_base = (const float *)K_base, .V_base = (const float *)V_base,
+        .K16 = (const uint16_t *)K_base, .V16 = (const uint16_t *)V_base,
+        .bf16 = bf16,
+        .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+        .kv_stride = kv_stride,
+        .prefill_len = prefill_len, .window_start = window_start,
+        .kv_seq_len = kv_seq_len
+    };
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        ds_parallel_for(ds_rswa_attn_worker, &task);
+        return;
+    }
+    ds_rswa_attn_worker(0, 1, &task);
 }
 
 void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {

@@ -502,3 +502,21 @@ const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
     }
     return NULL;
 }
+
+/* multi_safetensors_madvise_unused — 加载完成后丢弃映射页的常驻副本
+ *
+ * 权重加载会把「整份 mmap」读一遍（每个 tensor 都摸过），清洁文件页因此
+ * 全部驻留；其中专家权重/lm_head 等已被拷贝进连续 malloc 块或 F32 化，
+ * mmap 里的源页此后不再被读。对这些页做 MADV_DONTNEED 可立即归还物理页
+ * （~4-5GB）：它们是 MAP_PRIVATE 文件映射的干净页，此后任何指针触碰都会
+ * 从 page cache 廉价重入（无磁盘 I/O），正确性不受影响。
+ * DS_NO_MADVISE=1 可关闭（调试对照用）。 */
+void multi_safetensors_madvise_unused(multi_safetensors_t *ms) {
+    if (!ms) return;
+    if (getenv("DS_NO_MADVISE")) return;
+    for (int i = 0; i < ms->num_shards; i++) {
+        safetensors_file_t *sf = ms->shards[i];
+        if (sf && sf->data && sf->file_size > 0)
+            madvise(sf->data, sf->file_size, MADV_DONTNEED);
+    }
+}

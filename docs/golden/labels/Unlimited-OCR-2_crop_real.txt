@@ -1,0 +1,3 @@
+# source: engine-baseline 2026-10-30（人工对照原图核对通过）
+<PAGE><BLOCK>title[92, 131, 634, 336]<FORK>Description
+<BLOCK>text[86, 556, 999, 969]<FORK>云WAF系统，支持黑白名单和CC的防护系统分为以下阶段：

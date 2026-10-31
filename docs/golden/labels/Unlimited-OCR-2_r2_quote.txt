@@ -1,0 +1,2 @@
+# source: engine-baseline r2 2026-10-31（人工对照原图核对通过）
+<PAGE><BLOCK>text[43, 113, 911, 852]<FORK>wafcore只需返回200或403. 200表示通过，403表示命中规则。命中规则时，wafcore要使用 X-WAF-Action 头返回对应的action。通过 X-WAF-Reason 头指定封禁的原因，格式为 waf:id，ratelimit:item。通过 X-WAF-Payload 头返回匹配规则的负载。

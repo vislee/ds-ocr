@@ -45,3 +45,11 @@ CLAUDE.md
 *.jpg
 unlimited-ocr/
 ME1782374049768.png
+
+# Coverage artifacts
+*.gcda
+*.gcno
+*.gcov
+# Local scratch
+1
+docs/intert/

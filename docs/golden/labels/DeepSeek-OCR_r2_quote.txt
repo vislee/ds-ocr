@@ -1,0 +1,2 @@
+# source: engine-baseline r2 2026-10-31（人工对照原图核对通过）
+wafcore只需返回200或403。200表示通过，403表示命中规则。命中规则时，wafcore要使用X-WAF-Action头返回对应的action。通过X-WAF-Reason头指定封禁的原因，格式为waf:id，ratelimit:item。通过X-WAF-Payload头返回匹配规则的负载。
