@@ -100,6 +100,7 @@ int main(int argc, char **argv) {
     int verbosity = 1;                  /* 输出详细度: 0=静默, 1=正常, 2=调试 */
     int n_threads = 0;                  /* 线程数: 0=自动(=CPU核心数) */
     int max_new_tokens = 4096;          /* 最大生成token数 */
+    int raw_layout = 0;                 /* V4: 保留原生结构化输出 */
     float temperature = 0.0f;           /* 采样温度: 0=贪心(确定性) */
     float repeat_penalty = 1.0f;        /* 重复惩罚: 1.0=无惩罚 */
     int no_repeat_ngram_size = 0;       /* N-gram阻断: 0=禁用 */
@@ -139,6 +140,8 @@ int main(int argc, char **argv) {
             int4 = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
+        } else if (strcmp(argv[i], "--raw-layout") == 0) {
+            raw_layout = 1;
         } else if (strcmp(argv[i], "--silent") == 0) {
             verbosity = 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -207,6 +210,7 @@ int main(int argc, char **argv) {
 
     /* ── 应用推理设置 ── */
     ctx->max_new_tokens = max_new_tokens;
+    ctx->keep_raw_layout = raw_layout;
     ctx->temperature = temperature;
     ctx->repeat_penalty = repeat_penalty;
     ctx->no_repeat_ngram_size = no_repeat_ngram_size;
@@ -244,25 +248,15 @@ int main(int argc, char **argv) {
      */
     char *text = ds_recognize(ctx, input_image);
 
+    /* V4 退化翻转自愈: 解码近并列 argmax 偶发翻转（运行间内存布局差异），
+     * 症状为畸形标签行。检测到即整体重跑一次（含编码），命中概率 p → p²。 */
+    if (text && ctx->config.model_version == 4 && ctx->last_output_degenerate) {
+        fprintf(stderr, "检测到退化输出片段，自动重试一次…\n");
+        free(text);
+        text = ds_recognize(ctx, input_image);
+    }
+
     if (text) {
-        /* 退化输出护栏（V3/V4 块格式）: 块结构存在但 <FORK> 后内容全空，
-         * 通常是旧构建/异常状态——stderr 提示重建，不影响 stdout。 */
-        if (ctx->config.model_version == 3 || ctx->config.model_version == 4) {
-            int forks = 0, empty = 0;
-            const char *p = text;
-            while ((p = strstr(p, "<FORK>")) != NULL) {
-                forks++;
-                const char *c = p + 6;
-                if (*c == '\0' || *c == '\n' || strncmp(c, "<BLOCK>", 7) == 0) empty++;
-                p = c;
-            }
-            if (forks >= 2 && empty == forks) {
-                fprintf(stderr,
-                        "\n警告：识别结果疑似退化（%d 个块内容为空）。"
-                        "请确认使用最新代码并重新 make blas；"
-                        "若仍复现请附 `git log -1` 与图片反馈。\n", forks);
-            }
-        }
         /* V3 或静默模式: 一次性打印完整结果
          * V1/V2 非静默: 结果已通过stream_token逐token打印，此处只打换行 */
         if (verbosity == 0 || ctx->config.model_version == 3 || ctx->config.model_version == 4) {

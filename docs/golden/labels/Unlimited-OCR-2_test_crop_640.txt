@@ -1,9 +1,8 @@
-# source: engine-baseline 2026-10-30（人工对照原图核对通过）
-<PAGE><BLOCK>title<LEVEL1>[88, 62, 611, 158]<FORK>Description
-<BLOCK>text[84, 262, 980, 315]<FORK>云WAF系统，支持黑白名单和CC的防护。
-<BLOCK>text[85, 387, 507, 440]<FORK>系统分为以下阶段：
-<BLOCK>other[129, 509, 748, 818]<FORK>
-<BLOCK>text[130, 511, 728, 569]<FORK>- skip: 实现了白名单功能。
-<BLOCK>text[130, 638, 747, 694]<FORK>- deny: 实现了黑名单功能。
-<BLOCK>text[131, 771, 260, 812]<FORK>- cc:
-<BLOCK>text[227, 892, 588, 941]<FORK>- 离线分析策略
+# source: engine-baseline r3 2026-10-31（V4 输出净化后重冻：默认剥离布局标签/丢弃空容器与畸形行，--raw-layout 可还原；用户指示的输出优化）
+Description
+云WAF系统，支持黑白名单和CC的防护。
+系统分为以下阶段：
+- skip: 实现了白名单功能。
+- deny: 实现了黑名单功能。
+- cc:
+- 离线分析策略

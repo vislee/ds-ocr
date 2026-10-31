@@ -540,6 +540,9 @@ static void *crop_worker_global(void *arg) {
  * 自动检测让用户无需指定版本，一个二进制兼容所有模型。
  * ======================================================================== */
 
+static void ds_v4_warn_degenerate(const char *t);
+static int ds_v4_strip_layout(char *t, int len, int *malformed_out);
+
 static int detect_model_version(const char *model_dir) {
     /* Check config.json for model type indicators */
     char path[1024];
@@ -2879,6 +2882,18 @@ prompt_construction:
             fprintf(stderr, "V4DBG raw output (%d bytes): [", out_len);
         if (ds_verbose >= 1) { fwrite(output, 1, out_len < 300 ? out_len : 300, stderr); fprintf(stderr, "]\n"); }
         out_len = ds_strip_det_tags(output, out_len);
+        if (cfg->model_version == 4) {
+            /* 退化护栏须在净化前（依赖原始块结构）；默认净化输出，
+             * --raw-layout 时保留原生结构化格式 */
+            ds_v4_warn_degenerate(output);
+            int malformed = 0;
+            if (!ctx->keep_raw_layout) {
+                out_len = ds_v4_strip_layout(output, out_len, &malformed);
+                ctx->last_output_degenerate = (malformed > 0) || getenv("DS_FORCE_RETRY") != NULL;  /* DS_FORCE_RETRY: 自愈链路联调 */
+            } else {
+                ctx->last_output_degenerate = 0;
+            }
+        }
         /* V3 hallucination prefix removal: when the model's first token
          * is forced past EOS, it may generate a short English hallucination
          * before the actual OCR content. Common patterns:
@@ -3051,6 +3066,61 @@ prompt_construction:
 
     ds_rss_probe("final");
     return output;
+}
+
+/* ds_v4_warn_degenerate — V4 退化输出护栏（须在布局净化【前】调用，需原始块结构）：
+ * ≥2 个 <FORK> 块且内容全空 → stderr 提示（多为旧构建；stdout 不变）。 */
+static void ds_v4_warn_degenerate(const char *t) {
+    int forks = 0, empty = 0;
+    const char *p = t;
+    while ((p = strstr(p, "<FORK>")) != NULL) {
+        forks++;
+        const char *c = p + 6;
+        if (*c == '\0' || *c == '\n' || strncmp(c, "<BLOCK>", 7) == 0) empty++;
+        p = c;
+    }
+    if (forks >= 2 && empty == forks)
+        fprintf(stderr,
+                "\n警告：识别结果疑似退化（%d 个块内容为空）。"
+                "请确认使用最新代码并重新 make blas；"
+                "若仍复现请附 `git log -1` 与图片反馈。\n", forks);
+}
+
+/* ds_v4_strip_layout — V4 输出净化：剥布局标签、丢空内容块（r3 输出优化）。
+ * 行式原地重写（输出 ≤ 输入）：
+ *   <PAGE>                     → 删（多页分隔对纯文本无意义）
+ *   <BLOCK>type[坐标]<FORK>内容 → 只留「内容」（type/LEVEL/坐标丢弃）
+ *   <FORK> 后内容为空白的块     → 整行丢弃（空容器块）
+ *   其它行（模型偶尔输出的裸文本）→ 原样保留 */
+static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
+    char *w = t;
+    char *p = t;
+    char *end = t + len;
+    int malformed = 0;
+    while (p < end) {
+        char *eol = memchr(p, '\n', (size_t)(end - p));
+        char *le = eol ? eol : end;
+        const char *src = p;
+        size_t n = (size_t)(le - p);
+        if (n >= 6 && strncmp(src, "<PAGE>", 6) == 0) { src += 6; n -= 6; }
+        char *fk = NULL;
+        for (char *q = (char *)src; q + 6 <= src + n; q++)
+            if (strncmp(q, "<FORK>", 6) == 0) { fk = q; break; }
+        if (!fk && n >= 7 && strstr(src, "<BLOCK>") != NULL) malformed++;   /* 畸形标签行（无 FORK）→ 退化翻转信号 */
+        if (fk) {
+            const char *content = fk + 6;
+            size_t clen = (size_t)(src + n - content);
+            size_t k = clen;
+            while (k > 0 && (content[k - 1] == ' ' || content[k - 1] == '\t' || content[k - 1] == '\r')) k--;
+            if (k == 0) { p = eol ? eol + 1 : end; continue; }   /* 空内容块：整行丢弃 */
+            src = content; n = clen;
+        }
+        if (n > 0) { memmove(w, src, n); w += n; }
+        if (eol) { *w++ = '\n'; p = eol + 1; } else { p = end; }
+    }
+    *w = '\0';
+    if (malformed_out) *malformed_out = malformed;
+    return (int)(w - t);
 }
 
 /* ds_strip_det_tags — V3后处理：去除检测坐标标签

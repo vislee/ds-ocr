@@ -487,6 +487,9 @@ typedef struct {
 
     /* Inference settings */
     int max_new_tokens;        /* Max tokens to generate (default: 4096) */
+    int keep_raw_layout;
+    int last_output_degenerate;  /* V4: 最近一次识别检测到畸形标签行（退化翻转信号，供 CLI 重试） */       /* V4: 1 = 保留原生 <BLOCK>[坐标]<FORK> 结构化输出（--raw-layout）；
+                                  0 = 默认剥离布局标签、丢弃空内容块，输出干净文本 */
     float temperature;         /* Sampling temperature (default: 0.0 = greedy) */
     float repeat_penalty;      /* Repetition penalty (default: 1.0 = none, 1.1-1.5 typical) */
     int num_local_crops;       /* Number of local crop regions (0-6) */

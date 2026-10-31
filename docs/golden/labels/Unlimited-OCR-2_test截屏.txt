@@ -1,19 +1,17 @@
-# source: engine-baseline 2026-10-30（人工对照原图核对通过）
-<PAGE><BLOCK>title<LEVEL1>[31, 25, 220, 67]<FORK>Description
-<BLOCK>text[29, 104, 351, 130]<FORK>云WAF系统，支持黑白名单和CC的防护。
-<BLOCK>text[30, 154, 183, 179]<FORK>系统分为以下阶段：
-<BLOCK>other[44, 206, 254, 278]<FORK>
-<BLOCK>text[44, 206, 251, 232]<FORK>- skip: 实现了白名单功能。
-<BLOCK>text[44, 257, 255, 281]<FORK>- deny: 实现了黑名单功能。
-<BLOCK>text[45, 311, 94, 331]<FORK>- cc:
-<BLOCK>other[76, 358, 208, 435]<FORK>
-<BLOCK>text[76, 358, 208, 383]<FORK>- 离线分析策略
-<BLOCK>text[76, 408, 188, 433]<FORK>- 自定义策略
-<BLOCK>text[44, 459, 348, 484]<FORK>- waf: 转到wafcore，实现了waf功能。
-<BLOCK>text[45, 510, 170, 534]<FORK>- ratelimit 限速
-<BLOCK>text[44, 559, 970, 615]<FORK>- filter 过滤，实现了请求头的增删改、请求cookie的增删改、响应头的增删改、响应cookie的增删改、响应状态码重写和敏感信息过滤等。
-<BLOCK>text[29, 640, 137, 664]<FORK>Back to TOC
-<BLOCK>title<LEVEL1>[29, 706, 138, 743]<FORK>Action
-<BLOCK>text[28, 785, 677, 810]<FORK>支持的封禁动作，配置的时候注意配置正确。适用于jfe的配置，和wafcore的配置.
-<BLOCK>text[71, 835, 877, 921]<FORK>wafcore只需返回200或403.200表示通过，403表示命中规则。命中规则时，wafcore要使用 X-WAF-Action 头返回对应的action。通过 X-WAF-Reason 头指定封禁的原因，格式为 waf:id，ratelimit:item。通过 X-WAF-Payload 头返回匹配规则的负载。
-<BLOCK>text[30, 947, 137, 969]<FORK>Back to TOC
+# source: engine-baseline r3 2026-10-31（V4 输出净化后重冻：默认剥离布局标签/丢弃空容器与畸形行，--raw-layout 可还原；用户指示的输出优化）
+Description
+云WAF系统，支持黑白名单和CC的防护。
+系统分为以下阶段：
+- skip: 实现了白名单功能。
+- deny: 实现了黑名单功能。
+- cc:
+- 离线分析策略
+- 自定义策略
+- waf: 转到wafcore，实现了waf功能。
+- ratelimit 限速
+- filter 过滤，实现了请求头的增删改、请求cookie的增删改、响应头的增删改、响应cookie的增删改、响应状态码重写和敏感信息过滤等。
+Back to TOC
+Action
+支持的封禁动作，配置的时候注意配置正确。适用于jfe的配置，和wafcore的配置.
+wafcore只需返回200或403.200表示通过，403表示命中规则。命中规则时，wafcore要使用 X-WAF-Action 头返回对应的action。通过 X-WAF-Reason 头指定封禁的原因，格式为 waf:id，ratelimit:item。通过 X-WAF-Payload 头返回匹配规则的负载。
+Back to TOC
