@@ -245,6 +245,24 @@ int main(int argc, char **argv) {
     char *text = ds_recognize(ctx, input_image);
 
     if (text) {
+        /* 退化输出护栏（V3/V4 块格式）: 块结构存在但 <FORK> 后内容全空，
+         * 通常是旧构建/异常状态——stderr 提示重建，不影响 stdout。 */
+        if (ctx->config.model_version == 3 || ctx->config.model_version == 4) {
+            int forks = 0, empty = 0;
+            const char *p = text;
+            while ((p = strstr(p, "<FORK>")) != NULL) {
+                forks++;
+                const char *c = p + 6;
+                if (*c == '\0' || *c == '\n' || strncmp(c, "<BLOCK>", 7) == 0) empty++;
+                p = c;
+            }
+            if (forks >= 2 && empty == forks) {
+                fprintf(stderr,
+                        "\n警告：识别结果疑似退化（%d 个块内容为空）。"
+                        "请确认使用最新代码并重新 make blas；"
+                        "若仍复现请附 `git log -1` 与图片反馈。\n", forks);
+            }
+        }
         /* V3 或静默模式: 一次性打印完整结果
          * V1/V2 非静默: 结果已通过stream_token逐token打印，此处只打换行 */
         if (verbosity == 0 || ctx->config.model_version == 3 || ctx->config.model_version == 4) {
