@@ -68,6 +68,7 @@
  */
 
 #include "ds_moe_decoder.h"
+#include "ds_dash.h"              /* V4 DASH 块稀疏注意力 */
 #include "ds_kernels.h"
 #include "ds_safetensors.h"
 #include "ds_metal.h"
@@ -162,34 +163,29 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
 
 /* ========================================================================
  * KV Cache Access Helpers — F32 direct storage (no BF16 conversion)
+ * 实现移至 ds_dash.h (ds_kv_k_row/ds_kv_v_row static inline)，供 V4 DASH 模块共用
  * ======================================================================== */
 
-/* Get pointer to K cache row for a given layer and position.
- * 布局: cache[layers][max_seq][kv_row_stride], kv_row_stride >= kv_dim. */
-static inline float *ds_kv_k_row(ds_ctx_t *ctx, int layer, int pos) {
-    int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
-}
-
-static inline float *ds_kv_v_row(ds_ctx_t *ctx, int layer, int pos) {
-    int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
-}
-
 /* Get pointer to start of K/V cache for a layer (row 0) */
-static inline float *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
+static inline void *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
     int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride;
+    size_t elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    return (char *)ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride * elem;
 }
 
-static inline float *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
+static inline void *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
     int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride;
+    size_t elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    return (char *)ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride * elem;
 }
 
 /* Store F32 K/V directly into the aligned F32 KV cache */
-static inline void ds_kv_store_f32(float *dst, const float *src, int n) {
-    memcpy(dst, src, (size_t)n * sizeof(float));
+static inline void ds_kv_store_row(ds_ctx_t *ctx, void *dst, const float *src, int n) {
+    if (ctx->kv_bf16) {
+        ds_f32_to_bf16_batch((uint16_t *)dst, src, n);
+    } else {
+        memcpy(dst, src, (size_t)n * sizeof(float));
+    }
 }
 
 /* ========================================================================
@@ -361,7 +357,8 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
 
-    if (ctx->metal_ctx && ctx->metal_moe_env && ds_metal_is_available(ctx->metal_ctx)) {
+    if (ctx->metal_ctx && ctx->metal_moe_env && ds_metal_is_available(ctx->metal_ctx) &&
+        layer->experts[top_indices[0]].gate_up_fused_bf16) {   /* 无连续块（r2 任务3）→ CPU split 路径 */
         /* ── Metal GPU path: MoE expert forward ── */
         const uint16_t *gate_up_ptrs[DS_MAX_EXPERTS];
         const uint16_t *down_ptrs[DS_MAX_EXPERTS];
@@ -404,11 +401,13 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     }
     for (int k = 0; k < top_k; k++) {
         int expert_id = top_indices[k];   /* 依路由概率降序访问：概率高的专家权重更可能已驻留缓存 */
-        /* Prefetch next expert's down weight (in mmap'd region, not in block) */
+        /* Prefetch next expert's weights (mmap'd region; r2 任务3 后 gate/up 也走 mmap) */
         if (k + 1 < top_k) {
             int next_id = top_indices[k + 1];
-            size_t down_bytes = (size_t)hidden * moe_inter * 2;   /* 下一个专家 down 权重 [1280,896]≈2.2MB */
-            madvise((void *)layer->experts[next_id].down_weight_bf16, down_bytes, MADV_WILLNEED);
+            size_t inter_bytes = (size_t)hidden * moe_inter * 2;
+            madvise((void *)layer->experts[next_id].gate_weight_bf16, inter_bytes, MADV_WILLNEED);
+            madvise((void *)layer->experts[next_id].up_weight_bf16, inter_bytes, MADV_WILLNEED);
+            madvise((void *)layer->experts[next_id].down_weight_bf16, inter_bytes, MADV_WILLNEED);
         }
         /* Use INT4 path if quantized weights available, otherwise BF16 */
         if (layer->int4_enabled && layer->experts_int4[expert_id].gate_up_fused.qweight) {
@@ -578,9 +577,20 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      *
      * 预计算的 cos/sin 值存储在 ctx->rope_cache_cos/sin 中，
      * 预先计算好所有位置（直到 max_seq_len）的三角函数值，
-     * 避免每步重复计算 sin/cos。*/
-    float *cos_vals = ctx->rope_cache_cos + pos * head_dim;  /* 第 pos 个位置的 cos 表项 [64] */
-    float *sin_vals = ctx->rope_cache_sin + pos * head_dim;  /* sin 表项 [64]；两表启动时一次算好 */
+     * 避免每步重复计算 sin/cos。
+     *
+     * V4 (DASH): 换用 page2d 二维 RoPE 表 (ds_dash 维护)——
+     * tok 轴页内计数 + page 轴页号 mod 2，是官方 sparse_main_rope_mode="page2d"。*/
+    float *cos_vals, *sin_vals;
+    if (cfg->model_version == 4) {
+        extern void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which); /* 0=cos,1=sin */
+        int pos_v4 = ctx->kv_cache_len;
+        cos_vals = (float *)ds_dash_rope_row(ctx, pos_v4, 0);
+        sin_vals = (float *)ds_dash_rope_row(ctx, pos_v4, 1);
+    } else {
+        cos_vals = ctx->rope_cache_cos + pos * head_dim;  /* 第 pos 个位置的 cos 表项 [64] */
+        sin_vals = ctx->rope_cache_sin + pos * head_dim;  /* sin 表项 [64]；两表启动时一次算好 */
+    }
     ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);   /* Q: 10 个 head 一起旋转 */
     ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);/* K: 同一位置旋转，保证 Q·K 相对相位正确 */
 
@@ -590,11 +600,10 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      * This eliminates the per-step batch BF16→F32 conversion that previously
      * dominated attention time (O(seq_len) conversion per decode step). */
     int cache_offset = ctx->kv_cache_len;                        /* 当前 token 写入的缓存槽位 */
-    float *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);  /* K 行地址 = base + (layer*max_seq+pos)*stride */
-    float *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);  /* V 行地址，K/V 分开两块缓存 */
-    ds_kv_store_f32(cache_k_row, k, kv_dim);   /* 写 K [1280 float=5KB]；F32 直存是 v0.7 优化，
-                                                    免去旧方案每步 O(seq_len) 的 BF16→F32 重转换 */
-    ds_kv_store_f32(cache_v_row, v, kv_dim);   /* 写 V [5KB]；此后每个未来 token 的注意力都会读它 */
+    void *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);  /* K 行地址 = base + (layer*max_seq+pos)*stride */
+    void *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);
+    ds_kv_store_row(ctx, cache_k_row, k, kv_dim);   /* F32 直存（V1/V2）；BF16 存储（V3/V4，r2 任务2） */
+    ds_kv_store_row(ctx, cache_v_row, v, kv_dim);
 
     /* Causal attention — read directly from F32 KV cache (zero conversion).
      * The cache is aligned and contiguous for optimal sequential read.
@@ -613,7 +622,20 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     int kv_seq_len = cache_offset + 1;              /* 可见长度 = 历史缓存 + 当前 token（因果掩码） */
     int kv_stride = ctx->_kv_row_stride;            /* 行跨度 ≥ kv_dim，64B 对齐利 SIMD 读取 */
 
-    if (cfg->sliding_window_size > 0 && cache_offset >= ctx->prefill_token_count) {
+    if (cfg->model_version == 4) {
+        /* V4: DASH 块稀疏注意力（官方 _dash_decode_forward）。
+         * DS_V4_FULLATTN=1: 诊断开关——decode 走全量因果注意力（无路由/偏置），
+         * 用于区分“路由选块问题”与“坐标/数值问题”。 */
+        static int _full_attn = -1;
+        if (_full_attn < 0) _full_attn = getenv("DS_V4_FULLATTN") ? 1 : 0;
+        if (_full_attn) {
+            ds_causal_attention_aligned(attn_out, q, k_base, v_base,
+                                        1, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                                        scale, cache_offset, kv_stride);
+        } else {
+            ds_dash_attention_decode(ctx, layer_idx, x, attn_out);
+        }
+    } else if (cfg->sliding_window_size > 0 && cache_offset >= ctx->prefill_token_count) {
         /* R-SWA decode path: attend only to reference + sliding window */
         int prefill_len = ctx->prefill_token_count;   /* 参考集长度：视觉+prompt token（如 908） */
         int W = cfg->sliding_window_size;             /* 滑窗 W=128：只看最近 128 个已生成 token */
@@ -623,20 +645,14 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
          * For efficiency, we compute attention manually with these two ranges.
          * If window_start <= prefill_len, the ranges overlap and we just use
          * [0..kv_seq_len-1] (which happens during warmup when kv_seq_len < prefill_len + W). */
-        if (window_start <= prefill_len) {
-            /* Warmup phase: no gap between reference and window, use full attention */
-            ds_causal_attention_aligned(attn_out, q, k_base, v_base,
-                                        1, kv_seq_len, n_heads, n_kv_heads, head_dim,
-                                        scale, cache_offset, kv_stride);
-        } else {
-            /* Steady state: gap between reference and window.
-             * Compute Q@K^T for reference range and window range separately,
-             * then combine into a single softmax. */
-            ds_rswa_attention_aligned(attn_out, q, k_base, v_base,
+        /* 统一走 RSWA worker: warmup（window_start==prefill_len）时两段连续
+         * 覆盖 [0,kv_seq_len)，j 顺序与全量因果一致 → 逐位一致；
+         * BF16 时 worker 内用 bf16×f32 点积/axpy（r2 任务2）。 */
+        ds_rswa_attention_aligned_bf16(attn_out, q, k_base, v_base,
                                        1, n_heads, n_kv_heads, head_dim,
                                        scale, kv_stride,
-                                       prefill_len, window_start, kv_seq_len);
-        }
+                                       prefill_len, window_start, kv_seq_len,
+                                       ctx->kv_bf16);
     } else {
         /* Standard causal attention (prefill or no R-SWA) */
         ds_causal_attention_aligned(attn_out, q, k_base, v_base,
@@ -797,27 +813,33 @@ int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             fprintf(stderr, "Dumped layer 0 Q/K/V/x_norm for Python comparison\n");
         }
 
-        /* Apply RoPE using precomputed cache */
+        /* Apply RoPE using precomputed cache (V4: page2d 表) */
         {
             int base = ctx->kv_cache_len;
-            ds_apply_rope_neox(Q, ctx->rope_cache_cos + base * head_dim,
-                               ctx->rope_cache_sin + base * head_dim,
-                               seq_len, n_heads, head_dim);
-            ds_apply_rope_neox(K, ctx->rope_cache_cos + base * head_dim,
-                               ctx->rope_cache_sin + base * head_dim,
-                               seq_len, n_kv_heads, head_dim);
+            float *cos_p, *sin_p;
+            if (cfg->model_version == 4) {
+                extern void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which);
+                cos_p = (float *)ds_dash_rope_row(ctx, base, 0);
+                sin_p = (float *)ds_dash_rope_row(ctx, base, 1);
+            } else {
+                cos_p = ctx->rope_cache_cos + base * head_dim;
+                sin_p = ctx->rope_cache_sin + base * head_dim;
+            }
+            ds_apply_rope_neox(Q, cos_p, sin_p, seq_len, n_heads, head_dim);
+            ds_apply_rope_neox(K, cos_p, sin_p, seq_len, n_kv_heads, head_dim);
         }
 
         /* Store K, V directly into F32 KV cache (no BF16 conversion) */
         for (int s = 0; s < seq_len; s++) {
             int pos = ctx->kv_cache_len + s;
-            float *cache_k_row = ds_kv_k_row(ctx, l, pos);
-            float *cache_v_row = ds_kv_v_row(ctx, l, pos);
-            ds_kv_store_f32(cache_k_row, K + s * kv_dim, kv_dim);
-            ds_kv_store_f32(cache_v_row, V + s * kv_dim, kv_dim);
+            void *cache_k_row = ds_kv_k_row(ctx, l, pos);
+            void *cache_v_row = ds_kv_v_row(ctx, l, pos);
+            ds_kv_store_row(ctx, cache_k_row, K + s * kv_dim, kv_dim);
+            ds_kv_store_row(ctx, cache_v_row, V + s * kv_dim, kv_dim);
         }
 
-        /* Causal attention (prefill all tokens) — read directly from F32 KV cache */
+        /* Causal attention (prefill all tokens) — read directly from F32 KV cache.
+         * V4: DASH 路由注意力（官方 _infer_prefill_attend + _forward_dense）*/
         {
             int total_kv_len = ctx->kv_cache_len + seq_len;
             float *k_base = ds_kv_k_layer(ctx, l);
@@ -825,9 +847,29 @@ int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             int kv_stride = ctx->_kv_row_stride;
 
             float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
-            ds_causal_attention_aligned(attn_out, Q, k_base, v_base,
-                                seq_len, total_kv_len,
-                                n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
+            if (cfg->model_version == 4) {
+                ds_dash_attention_prefill(ctx, l, x, Q, seq_len, attn_out);
+            } else if (ctx->kv_bf16) {
+                /* BF16 KV: 整层 K/V 展开到 F32 scratch（每层每 prefill 一次），
+                 * 元素值 = 存储的 bf16 精确展开，批量注意力数学不变 */
+                if (!ctx->kv_pf_scratch_k) {
+                    size_t region = (size_t)ctx->kv_cache_max * kv_stride;
+                    ctx->kv_pf_scratch_k = malloc(region * sizeof(float));
+                    ctx->kv_pf_scratch_v = malloc(region * sizeof(float));
+                    if (!ctx->kv_pf_scratch_k || !ctx->kv_pf_scratch_v) return -1;
+                }
+                ds_bf16_to_f32_batch(ctx->kv_pf_scratch_k, (const uint16_t *)k_base,
+                                     (size_t)total_kv_len * kv_stride);
+                ds_bf16_to_f32_batch(ctx->kv_pf_scratch_v, (const uint16_t *)v_base,
+                                     (size_t)total_kv_len * kv_stride);
+                ds_causal_attention_aligned(attn_out, Q, ctx->kv_pf_scratch_k, ctx->kv_pf_scratch_v,
+                                    seq_len, total_kv_len,
+                                    n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
+            } else {
+                ds_causal_attention_aligned(attn_out, Q, k_base, v_base,
+                                    seq_len, total_kv_len,
+                                    n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
+            }
 
             /* Output projection + residual */
             float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
@@ -1163,6 +1205,11 @@ int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     }
 
     free(x); free(x_norm); free(Q); free(K); free(V);
+    /* BF16 KV 的整层展开 scratch 用完即释（−84MB 驻留，r2 任务2/3） */
+    free(ctx->kv_pf_scratch_k);
+    free(ctx->kv_pf_scratch_v);
+    ctx->kv_pf_scratch_k = NULL;
+    ctx->kv_pf_scratch_v = NULL;
     return 0;
 }
 
@@ -1420,6 +1467,11 @@ full_logits_path:
                 if (ds_verbose >= 1)
                     fprintf(stderr, "LM head: converted %zu BF16→F32 weights for sgemm (%.1f MB)\n",
                             n, n * sizeof(float) / 1048576.0);
+                /* F32 副本就绪后丢弃 bf16 源页（−0.66GB；回退路径触碰时重入） */
+                {
+                    extern void ds_drop_source_pages(const void *p, size_t bytes);
+                    ds_drop_source_pages(dec->lm_head_bf16, n * sizeof(uint16_t));
+                }
             }
             if (ctx->lm_head_f32) {
                 ds_f32_matvec_sgemm(logits, x, ctx->lm_head_f32, hidden, vocab);
@@ -1447,6 +1499,10 @@ full_logits_path:
                 size_t n = (size_t)vocab * hidden;
                 ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
                 ctx->lm_head_f32_ready = 1;
+                {
+                    extern void ds_drop_source_pages(const void *p, size_t bytes);
+                    ds_drop_source_pages(dec->lm_head_bf16, n * sizeof(uint16_t));
+                }
             }
             if (ctx->lm_head_f32) {
                 ds_f32_matvec_sgemm(logits, x, ctx->lm_head_f32, hidden, vocab);
@@ -1669,8 +1725,8 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
         /* Store K, V in F32 cache */
         for (int s = 0; s < n_tokens; s++) {
             int pos = cache_offset + s;
-            ds_kv_store_f32(ds_kv_k_row(ctx, l, pos), K + s * kv_dim, kv_dim);
-            ds_kv_store_f32(ds_kv_v_row(ctx, l, pos), V + s * kv_dim, kv_dim);
+            ds_kv_store_row(ctx, ds_kv_k_row(ctx, l, pos), K + s * kv_dim, kv_dim);
+            ds_kv_store_row(ctx, ds_kv_v_row(ctx, l, pos), V + s * kv_dim, kv_dim);
         }
 
         /* Causal attention — batched, with aligned stride */
@@ -1746,6 +1802,10 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
                     size_t n = (size_t)cfg->vocab_size * hidden;
                     ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
                     ctx->lm_head_f32_ready = 1;
+                    {
+                        extern void ds_drop_source_pages(const void *p, size_t bytes);
+                        ds_drop_source_pages(dec->lm_head_bf16, n * sizeof(uint16_t));
+                    }
                 }
                 ds_f32_matvec_sgemm(ctx->dec_logits, norm_buf, ctx->lm_head_f32, hidden, cfg->vocab_size);
             } else {

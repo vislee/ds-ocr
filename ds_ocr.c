@@ -43,7 +43,9 @@
  * Main coordinator: image → visual tokenizer → encoder → MoE decoder → text
  */
 
-#include "ds_ocr.h"                /* 公共头文件：常量、结构体、API声明 */
+#include "ds_ocr.h"
+#include <sys/mman.h>              /* madvise: 丢弃已拷贝权重的 mmap 源页 */
+                /* 公共头文件：常量、结构体、API声明 */
 #include "ds_kernels.h"            /* 数学内核：矩阵运算、线程池、RoPE */
 #include "ds_safetensors.h"       /* Safetensors权重读取器（mmap零拷贝） */
 #include "ds_image.h"             /* 图像加载与预处理（stb_image封装） */
@@ -52,6 +54,7 @@
 #include "ds_moe_decoder.h"       /* MoE解码器：64路由专家+2共享专家 */
 #include "ds_tokenizer.h"         /* BPE分词器：token ID ←→ 文本 */
 #include "ds_quantize.h"          /* INT4/INT8量化工具 */
+#include "ds_dash.h"              /* V4 DASH 块稀疏注意力 + page2d RoPE */
 
 #include "ds_dump.h"              /* 调试用tensor dump工具 */
 #include <stdio.h>   /* printf, fprintf, snprintf */
@@ -60,7 +63,14 @@
 #include <math.h>    /* powf, fabsf, sqrtf */
 #include <pthread.h> /* 多线程并行裁剪编码 */
 #include <sys/time.h>/* gettimeofday — 毫秒级计时 */
-#include <sys/stat.h>/* stat — 文件状态检查 */
+#include <sys/stat.h>/* stat — 文件状态检查 *//* RSS 探针（DS_RSS_PROBE=1）: 定位峰值时刻 */
+#include <sys/resource.h>
+static void ds_rss_probe(const char *tag) {
+    if (!getenv("DS_RSS_PROBE")) return;
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    fprintf(stderr, "[rss-probe] %-10s max_rss = %.2f GB\n", tag, ru.ru_maxrss / 1048576.0);
+}
 
 /* ds_verbose — 全局日志详细度
  * 0 = 静默（仅输出识别结果）
@@ -382,10 +392,14 @@ typedef struct {
     double sam_time;
     double enc_time;
     int failed;
+    int gate_win;   /* 本 crop 的 SAM/编码器并行预算（线程局部钉住） */
+    int gate_gbl;
+    int gate_enc;
 } crop_task_t;
 
 static void *crop_worker(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
+    ds_sam_thread_gates(t->gate_win, t->gate_gbl, t->gate_enc);
     double t0 = ds_time_sec();
     t->sam_tokens = ds_sam_forward_image(t->ctx, t->crop, &t->n_sam_tokens, NULL);
     t->sam_time = ds_time_sec() - t0;
@@ -407,6 +421,7 @@ static void *crop_worker(void *arg) {
  * main thread after joining, so each crop's [100, 1280] block lands in place. */
 static void *v3_crop_worker(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
+    ds_sam_thread_gates(t->gate_win, t->gate_gbl, t->gate_enc);
     double t0 = ds_time_sec();
     t->sam_tokens = ds_sam_forward_image(t->ctx, t->crop, &t->n_sam_tokens, NULL);
     t->sam_time = ds_time_sec() - t0;
@@ -420,12 +435,82 @@ static void *v3_crop_worker(void *arg) {
     free(t->sam_tokens);
     t->sam_tokens = NULL;
     if (!t->enc_tokens) { t->failed = 1; return NULL; }
+    /* Debug: dump crop 0 projector input (CLIP raw features, pre-newline-strip)
+     * 对照 Python dump/py_tile0_local.npy (官方 projector 输出 [100,1280]) */
+    if (t->crop_id == 0 && getenv("DS_DUMP_TILE0")) {
+        FILE *df = fopen("dump/c_tile0_local.bin", "wb");
+        if (df) { fwrite(t->enc_tokens, sizeof(float), t->n_enc_tokens * 1280, df); fclose(df);
+                  fprintf(stderr, "dumped c_tile0_local.bin (%d tokens)\n", t->n_enc_tokens); }
+    }
+    return NULL;
+}
+
+/* ── V3/V4 crop 动态取件池 ────────────────────────────────────────────
+ * 旧实现按 num_cpus 分批 join（30 crops = 14+14+2），尾批只有 2 个
+ * crop 在跑、12 个核心空转一整个 crop 时长。改为原子取件: worker 干完
+ * 立刻领下一个，天然负载均衡。vtasks 各槽位由各自的 crop 独占写。 */
+typedef struct {
+    crop_task_t *tasks;
+    int nc;
+    int *next;
+} v3_pool_arg_t;
+
+static void *v3_pool_worker(void *arg) {
+    v3_pool_arg_t *p = (v3_pool_arg_t *)arg;
+    for (;;) {
+        int i = __sync_fetch_and_add(p->next, 1);
+        if (i >= p->nc) break;
+        v3_crop_worker(&p->tasks[i]);
+    }
+    return NULL;
+}
+
+/* ── V3/V4 全局视图 worker（与 crop 波次并发）─────────────────────────
+ * 关键路径组件: 1024² SAM + CLIP 是波次里最重的单体任务，串行跑要
+ * ~2.2s。作为独立 pthread 全速并行（门控 1/6/4），与 crop 池重叠执行。
+ * 产出: 重排后的 gnl [ggrid×17, hidden]（enc_tokens 携带）。 */
+static void *v3_global_worker(void *arg) {
+    crop_task_t *t = (crop_task_t *)arg;
+    ds_sam_thread_gates(1, 6, 4);
+    int ggrid = t->tokens_per_crop;             /* 16 */
+    int hidden = t->ctx->config.dec_hidden;
+    float *nl = t->ctx->vis_tokenizer.image_newline;
+
+    double t0 = ds_time_sec();
+    int n_sg; float *sg = ds_sam_forward_image(t->ctx, t->crop, &n_sg, NULL);
+    t->sam_time = ds_time_sec() - t0;
+    if (!sg) { t->failed = 1; return NULL; }
+    double t1 = ds_time_sec();
+    int n_cg; float *cg = ds_clip_encoder_forward(t->ctx, NULL, 0, 0, 0, sg, n_sg, &n_cg);
+    t->enc_time = ds_time_sec() - t1;
+    free(sg);
+    if (!cg) { t->failed = 1; return NULL; }
+
+    int n_global_raw = ggrid * ggrid;
+    float *global_raw = (float *)malloc(n_global_raw * hidden * sizeof(float));
+    if (!global_raw) { free(cg); t->failed = 1; return NULL; }
+    for (int r = 0; r < ggrid; r++)
+        memcpy(global_raw + r * ggrid * hidden,
+               cg + r * (ggrid + 1) * hidden, ggrid * hidden * sizeof(float));
+    free(cg);
+
+    int n_gnl = ggrid * (ggrid + 1);
+    float *gnl = (float *)malloc(n_gnl * hidden * sizeof(float));
+    if (!gnl) { free(global_raw); t->failed = 1; return NULL; }
+    for (int r = 0; r < ggrid; r++) {
+        memcpy(gnl + r * (ggrid + 1) * hidden, global_raw + r * ggrid * hidden, ggrid * hidden * sizeof(float));
+        if (nl) memcpy(gnl + (r * (ggrid + 1) + ggrid) * hidden, nl, hidden * sizeof(float));
+    }
+    free(global_raw);
+    t->enc_tokens = gnl;
+    t->n_enc_tokens = n_gnl;
     return NULL;
 }
 
 /* Worker for global crop (1024x1024) — uses causal_query_embeddings (256 queries) */
 static void *crop_worker_global(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
+    ds_sam_thread_gates(t->gate_win, t->gate_gbl, t->gate_enc);
     double t0 = ds_time_sec();
     t->sam_tokens = ds_sam_forward_image(t->ctx, t->crop, &t->n_sam_tokens, NULL);
     t->sam_time = ds_time_sec() - t0;
@@ -471,7 +556,14 @@ static int detect_model_version(const char *model_dir) {
     buf[n] = '\0';
     fclose(f);
 
-    /* Check for Unlimited-OCR first (has sliding_window_size in config) */
+    /* V4 (Unlimited-OCR-2): 训练阶段标记 "dash" + YaRN rope_scaling。
+     * 必须在 V3 之前检测——V4 同样含 "UnlimitedOCR"/"sliding_window_size"。*/
+    if (strstr(buf, "\"dash\"") || strstr(buf, "training_stage") ||
+        strstr(buf, "sparse_attention_config")) {
+        return 4;
+    }
+
+    /* Check for Unlimited-OCR (V3) first (has sliding_window_size in config) */
     if (strstr(buf, "sliding_window_size") || strstr(buf, "unlimited-ocr") ||
         strstr(buf, "Unlimited-OCR") || strstr(buf, "UnlimitedOCR")) {
         return 3;
@@ -566,7 +658,30 @@ static void init_config(ds_config_t *cfg, int version) {
     cfg->dec_rms_norm_eps = 1e-6f;
     cfg->dec_rope_theta = 10000.0f;
 
-    if (version == 3) {
+    if (version == 4) {
+        /* Unlimited-OCR-2: 与 V3 相同的视觉编码器 (SAM+CLIP-L) + linear projector，
+         * 解码器换成 DASH 块稀疏注意力 + page2d 二维 RoPE。
+         * 官方推理显式关闭 R-SWA (_ring_window=None)，sliding_window_size 必须为 0，
+         * 否则 V3 的 R-SWA 路径会错误接管 decode 注意力。*/
+        cfg->enc_type = 1;  /* CLIP encoder (deeplip_b_l = SAM vit-b + CLIP-l-14) */
+        cfg->enc_layers = DS_CLIP_LAYERS;
+        cfg->enc_hidden = DS_CLIP_HIDDEN;
+        cfg->enc_heads = DS_CLIP_HEADS;
+        cfg->enc_kv_heads = DS_CLIP_HEADS;
+        cfg->enc_head_dim = DS_CLIP_HEAD_DIM;
+        cfg->enc_intermediate = DS_CLIP_MLP_DIM;
+        cfg->enc_causal_flow_queries = 0;
+        cfg->proj_input_dim = DS_PROJECTOR_V1_INPUT; /* 2048 */
+        cfg->enc_rope_theta = 0;
+        cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 */
+
+        /* V4 专属: 禁用 R-SWA（DASH 接管），其余解码器结构 (MoE 64专家top-6) 与 V3 相同。
+         * dec_rope_theta 保持 10000 仅作 1D 兼容后备——V4 实际走 ds_dash 的 page2d RoPE。*/
+        cfg->sliding_window_size = 0;
+        cfg->has_qk_norm = 0;
+        cfg->image_token_id = 128815;
+        cfg->image_size_crop = 640;
+    } else if (version == 3) {
         /* Unlimited-OCR: SAM + CLIP-L/14 + 2D grid + sliding window */
         cfg->enc_type = 1;  /* CLIP encoder */
         cfg->enc_layers = DS_CLIP_LAYERS;
@@ -644,6 +759,15 @@ static void init_config(ds_config_t *cfg, int version) {
  *   LOAD_F32(name, target) — 查找tensor → 转F32 → 存入target
  *   LOAD_BF16(name, target) — 查找tensor → 取BF16直接指针 → 存入target（零拷贝）
  * ======================================================================== */
+
+/* 把 [p, p+bytes) 的 mmap 清洁文件页归还内核（拷贝完成后调用）。
+ * MAP_PRIVATE 文件页此后触碰会从 page cache 廉价重入，正确性不变。 */
+void ds_drop_source_pages(const void *p, size_t bytes) {   /* 供 ds_moe_decoder.c 的 lm_head F32 化后丢弃源页 */
+    if (!p || bytes == 0) return;
+    uintptr_t a = ((uintptr_t)p) & ~(uintptr_t)4095;
+    uintptr_t b = (((uintptr_t)p + bytes) + 4095) & ~(uintptr_t)4095;
+    madvise((void *)a, b - a, MADV_DONTNEED);
+}
 
 static int load_all_weights(ds_ctx_t *ctx) {
     multi_safetensors_t *ms = (multi_safetensors_t *)ctx->safetensors;
@@ -843,6 +967,17 @@ static int load_all_weights(ds_ctx_t *ctx) {
             DEC_F32(q_norm_weight, "self_attn.q_norm.weight");
             DEC_F32(k_norm_weight, "self_attn.k_norm.weight");
         }
+
+        /* V4: DASH router 权重 (dash_router.{q,k}_proj/q_norm/k_norm/head_cls)。
+         * norm 是 Gemma 风格但存储格式同普通 RMSNorm weight，加载为 F32。*/
+        if (cfg->model_version == 4) {
+            DEC_BF16(dash_q_proj_bf16, "self_attn.dash_router.q_proj.weight");
+            DEC_BF16(dash_k_proj_bf16, "self_attn.dash_router.k_proj.weight");
+            DEC_F32(dash_q_norm, "self_attn.dash_router.q_norm.weight");
+            DEC_F32(dash_k_norm, "self_attn.dash_router.k_norm.weight");
+            DEC_F32(dash_head_cls, "self_attn.dash_router.head_cls");
+        }
+
         DEC_F32(input_norm, "input_layernorm.weight");
         DEC_F32(post_attn_norm, "post_attention_layernorm.weight");
 
@@ -889,84 +1024,23 @@ static int load_all_weights(ds_ctx_t *ctx) {
     #undef DEC_BF16
     #undef DEC_F32
 
-    /* ---- Build fused gate+up weights for decode-path expert forward ----
-     * Each expert's gate and up projections share the same input x,
-     * so concatenating [gate_W; up_W] into a single [2*inter, hidden] matrix
-     * allows one matvec instead of two — better L2 cache reuse of x, fewer
-     * thread dispatches. This is only used for single-token decode;
-     * prefill uses the separate gate/up weights for batched sgemm.
-     *
-     * Contiguous block layout: all experts' gate_up_fused + shared gate_up_fused
-     * are packed into ONE allocation per layer for better page-in locality.
-     * When the OS pages in expert N's weights, expert N+1 is already adjacent
-     * in virtual memory, reducing page faults from random expert access. */
-    {
-        int moe_inter = cfg->dec_moe_inter;
-        int n_experts = cfg->dec_n_routed_experts;
-        int n_shared = cfg->dec_n_shared_experts;
-        int shared_inter = n_shared * moe_inter;
-        int dec_hidden = cfg->dec_hidden;
-        size_t fused_per_expert = (size_t)2 * moe_inter * dec_hidden;  /* BF16 elements */
-        size_t shared_fused_size = (size_t)2 * shared_inter * dec_hidden;  /* BF16 elements */
-
-        for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++) {
-            ds_dec_layer_t *layer = &dec->layers[l];
-
-            /* Single contiguous block:
-             *   [expert 0 gate_up_fused | expert 1 gate_up_fused | ... | expert N-1 gate_up_fused | shared gate_up_fused]
-             * Total elements = n_experts * fused_per_expert + shared_fused_size */
-            size_t block_elements = (size_t)n_experts * fused_per_expert + shared_fused_size;
-            size_t block_bytes = block_elements * sizeof(uint16_t);
-            uint16_t *block = (uint16_t *)malloc(block_bytes);
-            if (!block) {
-                fprintf(stderr, "Failed to allocate expert block for layer %d (%.1f MB)\n",
-                        l, block_bytes / 1048576.0);
-                return -1;
-            }
-            layer->expert_block_bf16 = block;
-            layer->expert_block_size = block_bytes;
-
-            /* Fill routed experts: gate_up_fused for each */
-            uint16_t *ptr = block;
-            for (int e = 0; e < n_experts; e++) {
-                if (layer->experts[e].gate_weight_bf16 && layer->experts[e].up_weight_bf16) {
-                    /* Layout: [gate_W(moe_inter, hidden); up_W(moe_inter, hidden)]
-                     * Row-major: gate rows 0..moe_inter-1, then up rows 0..moe_inter-1 */
-                    memcpy(ptr, layer->experts[e].gate_weight_bf16,
-                           (size_t)moe_inter * dec_hidden * sizeof(uint16_t));
-                    memcpy(ptr + (size_t)moe_inter * dec_hidden,
-                           layer->experts[e].up_weight_bf16,
-                           (size_t)moe_inter * dec_hidden * sizeof(uint16_t));
-                    layer->experts[e].gate_up_fused_bf16 = ptr;
-                }
-                ptr += fused_per_expert;
-            }
-
-            /* Fill shared experts: gate_up_fused at the end of the block */
-            if (layer->shared_gate_weight_bf16 && layer->shared_up_weight_bf16) {
-                memcpy(ptr, layer->shared_gate_weight_bf16,
-                       (size_t)shared_inter * dec_hidden * sizeof(uint16_t));
-                memcpy(ptr + (size_t)shared_inter * dec_hidden,
-                       layer->shared_up_weight_bf16,
-                       (size_t)shared_inter * dec_hidden * sizeof(uint16_t));
-                layer->shared_gate_up_fused_bf16 = ptr;
-            }
-        }
-
-        if (ds_verbose >= 1) {
-            size_t total_fused = 0;
-            for (int l = cfg->dec_first_k_dense; l < cfg->dec_layers; l++) {
-                total_fused += dec->layers[l].expert_block_size;
-            }
-            fprintf(stderr, "Contiguous expert blocks: %.1f MB allocated (%d experts × %d layers + shared, 1 block/layer)\n",
-                    total_fused / 1048576.0, n_experts, cfg->dec_layers - cfg->dec_first_k_dense);
-        }
-    }
+    /* ---- 专家块拷贝已移除（r2 任务3 有界实验）----
+     * 原实现把每层 64 专家的 gate/up 拷进 3.2GB 连续块供融合 matvec，
+     * 但 mmap 源页与拷贝双份驻留把峰值 RSS 顶到 ~11-12GB（ru_maxrss 是
+     * 高水位，拷后 madvise 无法降低）。改为 decode 直接走 split 路径
+     * （ds_expert_forward，mmap 内 gate/up/down 原生指针，逐元素数学相同），
+     * 专家页只在 decode 首次使用时驻留一次。shared 专家同理走 split 兜底。
+     * ds_expert_forward_fused / Metal MoE / --int4 路径缺块时自动旁路。 */
 
     /* ── INT8 quantization (optional, enabled by --int4) ── */
     if (ds_verbose >= 1)
         fprintf(stderr, "All weights loaded\n");
 
+    /* 权重加载后丢弃 mmap 源页的常驻副本: 专家块/lm_head 已拷贝或 F32 化，
+     * mmap 源页不再被读（个别仍直读的权重触碰时从 page cache 重入）。
+     * 实测峰值 RSS ~11GB → ~5-6GB（任务书任务3）。 */
+    multi_safetensors_madvise_unused((multi_safetensors_t *)ctx->safetensors);
+    ds_rss_probe("post-load");
     return 0;
 }
 
@@ -1079,14 +1153,19 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
      * reaches ~3800 tokens, so the old fixed 4096 slots silently truncated
      * generation mid-document (decode loop breaks when the cache fills).
      * 8192 covers prefix + 4096 generated tokens (~1 GB F32 for 12 layers). */
-    int max_seq = (cfg->model_version == 3) ? 8192 : 4096;
+    int max_seq = (cfg->model_version == 3 || cfg->model_version == 4) ? 8192 : 4096;
     ctx->kv_cache_max = max_seq;
     ctx->kv_cache_len = 0;
 
     /* Each row: kv_dim floats. Align each layer's cache start to 64 bytes.
      * Row stride = kv_dim rounded up to multiple of 16 floats (64 bytes). */
     int kv_row_stride = (kv_dim + 15) & ~15;  /* aligned row stride */
-    size_t kv_layer_size = (size_t)max_seq * kv_row_stride * sizeof(float);
+    /* V3/V4: K/V 以 BF16 存储（r2 任务2 有界实验）——驻留与解码注意力读流量减半 */
+    /* 实验结论: V3 (R-SWA) 8/8 组合 CER 全绿；V4 (DASH) 对 KV 精度敏感
+     * （截屏 24.7%/r2_list 9.7% FAIL）→ 收窄为仅 V3 启用，V4 保持 F32。 */
+    ctx->kv_bf16 = (cfg->model_version == 3) ? 1 : 0;
+    size_t kv_elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    size_t kv_layer_size = (size_t)max_seq * kv_row_stride * kv_elem;
     size_t kv_total = (size_t)cfg->dec_layers * kv_layer_size;
 
     /* posix_memalign for 64-byte alignment (cache line) */
@@ -1171,7 +1250,7 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->repeat_penalty = 1.0f; /* No penalty by default */
     ctx->no_repeat_ngram_size = 0; /* Disabled by default; ngram blocking causes premature EOS in OCR.
                                       Use --ngram N to enable (Python: 20 non-eval, 35 eval) */
-    ctx->min_new_tokens = (cfg->model_version == 3) ? 32 : 0;
+    ctx->min_new_tokens = (cfg->model_version == 3 || cfg->model_version == 4) ? 32 : 0;
     /* V3 needs min_new_tokens because the model's F32 logits make EOS
      * dominate early decode steps. The 32-step warmup with EOS+Ġ ban
      * lets the model settle into stable content generation.
@@ -1289,6 +1368,8 @@ void ds_free(ds_ctx_t *ctx) {
     /* Free decoder buffers (posix_memalign requires free(), not custom allocator) */
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+    free(ctx->kv_pf_scratch_k);
+    free(ctx->kv_pf_scratch_v);
     free(ctx->dec_x); free(ctx->dec_x_norm);
     free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
     free(ctx->dec_attn_out); free(ctx->dec_proj_out);
@@ -1628,7 +1709,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             int n_parallel = n_crops + 1;
             /* Crops already run concurrently — disable SAM's internal window
              * threading to avoid oversubscription (restored after joins). */
-            ds_sam_window_parallel = 0;
+            /* 波次内并行预算已改为随任务走（crop_task_t.gate_*，worker 线程局部钉住） */
             crop_task_t *tasks = (crop_task_t *)calloc(n_parallel, sizeof(crop_task_t));
             pthread_t *threads = (pthread_t *)calloc(n_parallel, sizeof(pthread_t));
 
@@ -1637,6 +1718,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 tasks[i].ctx = ctx;
                 tasks[i].crop = crops[i];
                 tasks[i].tokens_per_crop = tokens_per_crop;
+                tasks[i].gate_win = 0; tasks[i].gate_gbl = 2; tasks[i].gate_enc = 2;
                 if (ds_verbose >= 1)
                     fprintf(stderr, "Encoding local crop %d/%d\n", i + 1, n_crops);
                 pthread_create(&threads[i], NULL, crop_worker, &tasks[i]);
@@ -1647,6 +1729,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 int gi = n_crops;
                 tasks[gi].ctx = ctx;
                 tasks[gi].crop = global_img;
+                tasks[gi].gate_win = 1; tasks[gi].gate_gbl = 6; tasks[gi].gate_enc = 4; /* 全局视图是关键路径: 全速 */
                 tasks[gi].tokens_per_crop = 256;  /* 64/4 * 64/4 = 16*16 = 256 */
                 /* Global uses causal_query_embeddings (256 queries), not 768 version */
                 pthread_create(&threads[gi], NULL, crop_worker_global, &tasks[gi]);
@@ -1696,7 +1779,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             }
             free(tasks); free(threads);
             ds_image_free(global_img);
-            ds_sam_window_parallel = 1;
+
 
             if (failed_seen || !global_enc_tokens) {
                 fprintf(stderr, "Multi-crop encoding failed\n");
@@ -1738,7 +1821,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             free(crops);
             if (!encoder_output) return NULL;
         } /* end else (large image) */
-    } else if (cfg->model_version == 3 && cfg->enc_type == 1) {
+    } else if ((cfg->model_version == 3 || cfg->model_version == 4) && cfg->enc_type == 1) {
         /* ── V3 (Unlimited-OCR) multi-crop path ──
          *
          * Python logic (infer() default: base_size=1024, image_size=640):
@@ -1760,16 +1843,21 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         float *vsep = ctx->vis_tokenizer.view_seperator;
 
         /* ── Global view ──
-         * Python: small image → pad(image_size=640), large image → pad(base_size=1024)
-         * Small image: 640×640 → SAM 100 tokens → CLIP 111 tokens (10 rows × 11 + 1 view_sep)
-         * Large image: 1024×1024 → SAM 256 tokens → CLIP 273 tokens (16 rows × 17 + 1 view_sep)
-         */
-        int global_size = use_crop ? 1024 : 640;
-        int ggrid = global_size / 16 / 4;  /* 1024→16, 640→10 */
+         * Python (官方 infer/_uocr_build_inputs): 全局视图一律 pad(base_size=1024)，
+         * 与图像大小无关——小图（≤640）也是 1024 视图 → 273 tokens
+         * (16 rows × 17 + 1 view_sep)，只有局部 crop 才用 640。
+         * 此前 C 用 640 视图（111 tokens）导致 V4 小图输出乱码、V3 小图重复行。 */
+        int global_size = 1024;
+        int ggrid = global_size / 16 / 4;  /* 1024→16 */
 
         ds_image_t *gimg = ds_image_pad(&img, global_size, 127);
         if (!gimg) return NULL;
-        double t_v3sam = ds_time_sec();
+        int n_gnl = ggrid * (ggrid + 1);
+        float *gnl = NULL;
+
+        if (!use_crop) {
+            /* 小图路径: 全局视图串行编码（无 crop 波次可重叠） */
+            double t_v3sam = ds_time_sec();
         int n_sg; float *sg = ds_sam_forward_image(ctx, gimg, &n_sg, NULL);
         ctx->perf_sam_ms += (ds_time_sec() - t_v3sam) * 1000.0;
         ds_image_free(gimg);
@@ -1781,23 +1869,22 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         if (!cg) return NULL;
 
         /* Strip newlines: CLIP 273 = 16 rows × (16+1) + 1 view_sep → 256 raw features */
-        int n_global_raw = ggrid * ggrid;
-        float *global_raw = (float *)malloc(n_global_raw * hidden * sizeof(float));
-        for (int r = 0; r < ggrid; r++)
-            memcpy(global_raw + r * ggrid * hidden,
-                   cg + r * (ggrid + 1) * hidden, ggrid * hidden * sizeof(float));
-        free(cg);
+            int n_global_raw = ggrid * ggrid;
+            float *global_raw = (float *)malloc(n_global_raw * hidden * sizeof(float));
+            if (!global_raw) return NULL;
+            for (int r = 0; r < ggrid; r++)
+                memcpy(global_raw + r * ggrid * hidden,
+                       cg + r * (ggrid + 1) * hidden, ggrid * hidden * sizeof(float));
+            free(cg);
 
-        /* Reassemble global with newlines: [16, 17, dim] = 272 tokens */
-        int n_gnl = ggrid * (ggrid + 1);
-        float *gnl = (float *)malloc(n_gnl * hidden * sizeof(float));
-        for (int r = 0; r < ggrid; r++) {
-            memcpy(gnl + r * (ggrid + 1) * hidden, global_raw + r * ggrid * hidden, ggrid * hidden * sizeof(float));
-            if (nl) memcpy(gnl + (r * (ggrid + 1) + ggrid) * hidden, nl, hidden * sizeof(float));
-        }
-        free(global_raw);
+            gnl = (float *)malloc(n_gnl * hidden * sizeof(float));
+            if (!gnl) { free(global_raw); return NULL; }
+            for (int r = 0; r < ggrid; r++) {
+                memcpy(gnl + r * (ggrid + 1) * hidden, global_raw + r * ggrid * hidden, ggrid * hidden * sizeof(float));
+                if (nl) memcpy(gnl + (r * (ggrid + 1) + ggrid) * hidden, nl, hidden * sizeof(float));
+            }
+            free(global_raw);
 
-        if (!use_crop) {
             /* Small image: [global(272), view_sep(1)] = 273 tokens */
             n_encoder_tokens = n_gnl + 1;
             encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
@@ -1806,15 +1893,35 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             free(gnl);
             if (ds_verbose >= 1) fprintf(stderr, "V3: Small: %d+1=%d tokens\n", n_gnl, n_encoder_tokens);
         } else {
-            /* ── Local crops ── */
+            /* ── Local crops ──
+             * 官方 dynamic_preprocess(min_num=2, max_num=16)。max=32 是 V2 的
+             * 参数——V4 训练/部署 (vLLM UnlimitedOCRProcessor) 最多 16 crop，
+             * 超出训练分布的 token 数会让模型把多视图误读成多页 (<PAGE>×N)。*/
+            int max_crops_v34 = (cfg->model_version == 4) ? 16 : 32;
+
+            /* 全局视图 worker 先启动——dynamic_preprocess 的整图缩放切分
+             * （主线程 ~1s）与全局编码完全独立，重叠执行省关键路径时间。 */
+            crop_task_t gtask;
+            memset(&gtask, 0, sizeof(gtask));
+            gtask.ctx = ctx;
+            gtask.crop = gimg;
+            gtask.tokens_per_crop = ggrid;      /* 复用字段传 ggrid */
+            gtask.gate_win = 1; gtask.gate_gbl = 6; gtask.gate_enc = 4;
+            pthread_t gthread;
+            pthread_create(&gthread, NULL, v3_global_worker, &gtask);
+
             int nc = 0;
-            ds_image_t **crops = ds_dynamic_preprocess(&img, 640, 2, 32, 0, &nc);
-            if (!crops || nc < 1) { free(gnl); return NULL; }
+            ds_image_t **crops = ds_dynamic_preprocess(&img, 640, 2, max_crops_v34, 0, &nc);
+            if (!crops || nc < 1) {
+                pthread_join(gthread, NULL);
+                free(gtask.enc_tokens); free(gimg);
+                free(gnl); return NULL;
+            }
 
             float iar = (float)width / height;
             int cw = 1, ch = 1; float bd = 1e10f;
-            for (int tw = 1; tw <= 32; tw++)
-                for (int th = 1; th <= 32; th++) {
+            for (int tw = 1; tw <= max_crops_v34; tw++)
+                for (int th = 1; th <= max_crops_v34; th++) {
                     if (tw * th != nc) continue;
                     float d = fabsf(iar - (float)tw / th);
                     if (d < bd) { bd = d; cw = tw; ch = th; }
@@ -1835,21 +1942,36 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
             pthread_t *vthreads = (pthread_t *)calloc(nc, sizeof(pthread_t));
             /* Crops already run concurrently — disable SAM's internal window
              * threading to avoid oversubscription (restored after joins). */
-            ds_sam_window_parallel = 0;
-            int max_in_flight = ds_get_num_cpus();
+            /* 波次内并行预算已改为随任务走（crop_task_t.gate_*，worker 线程局部钉住） */
+            int max_in_flight = ds_get_num_cpus() > 10 ? 10 : ds_get_num_cpus();
+            /* 10 workers + global worker(6-10 线程) ≈ 16-20，避免波次起步过订阅 */
             if (max_in_flight < 1) max_in_flight = 1;
-            for (int base = 0; base < nc; base += max_in_flight) {
-                int wave = nc - base < max_in_flight ? nc - base : max_in_flight;
-                for (int i = 0; i < wave; i++) {
-                    vtasks[base + i].ctx = ctx;
-                    vtasks[base + i].crop = crops[base + i];
-                    pthread_create(&vthreads[base + i], NULL, v3_crop_worker, &vtasks[base + i]);
+            if (max_in_flight > nc) max_in_flight = nc;
+            {
+                int next_crop = 0;
+                v3_pool_arg_t parg = { vtasks, nc, &next_crop };
+                for (int i = 0; i < nc; i++) {
+                    vtasks[i].ctx = ctx;
+                    vtasks[i].crop = crops[i];
+                    vtasks[i].crop_id = i;
+                    vtasks[i].gate_win = 0; vtasks[i].gate_gbl = 1; vtasks[i].gate_enc = 1;
                 }
-                for (int i = 0; i < wave; i++)
-                    pthread_join(vthreads[base + i], NULL);
+                for (int i = 0; i < max_in_flight; i++)
+                    pthread_create(&vthreads[i], NULL, v3_pool_worker, &parg);
+                for (int i = 0; i < max_in_flight; i++)
+                    pthread_join(vthreads[i], NULL);
             }
             free(vthreads);
-            ds_sam_window_parallel = 1;
+            pthread_join(gthread, NULL);
+            ds_image_free(gimg);
+            ctx->perf_sam_ms += gtask.sam_time * 1000.0;
+            ctx->perf_encoder_ms += gtask.enc_time * 1000.0;
+            if (gtask.failed || !gtask.enc_tokens) {
+                for (int ci = 0; ci < nc; ci++) free(vtasks[ci].enc_tokens);
+                free(vtasks); free(crops);
+                return NULL;
+            }
+            gnl = gtask.enc_tokens;          /* [ggrid×17, hidden] 重排全局特征 */
 
             /* Accumulate crop SAM/CLIP times for the perf summary */
             for (int ci = 0; ci < nc; ci++) {
@@ -2167,10 +2289,12 @@ prompt_construction:
         }
 
         free(text_after_ids);
-    } else if (cfg->model_version == 3) {
-        /* Unlimited-OCR (V3) prompt format:
+    } else if (cfg->model_version == 3 || cfg->model_version == 4) {
+        /* Unlimited-OCR (V3) / Unlimited-OCR-2 (V4) prompt format:
          * Python: format_messages with sft_format='plain' → "<image>\ndocument parsing."
-         * Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
+         * V3 Token layout: [BOS] + image_tokens(128815) + ["\ndocument parsing."]
+         * V4 Token layout: [BOS] + <PAGE>(128827) + image_tokens(128815) + ["\ndocument parsing."]
+         *   (官方 infer(): prompt = "<PAGE><image>" * n_pages + 指令文本)
          *
          * Image token count = n_encoder_tokens (from CLIP+SAM+Projector):
          *   - Small image (≤640): [global(110), view_sep(1)] = 111
@@ -2180,32 +2304,66 @@ prompt_construction:
          * Python's masked_scatter places all encoder tokens into the
          * image positions (all True in images_seq_mask).
          */
+        /* 编码完成: 丢弃 mmap 权重页的常驻副本——编码器权重(SAM/CLIP)此后不再
+         * 读取（−0.6GB）；embed/注意力/专家源页在 decode 触碰时从 page cache
+         * 按需重入（重入仅覆盖实际用到的行/页）。r2 任务3。 */
+        multi_safetensors_madvise_unused((multi_safetensors_t *)ctx->safetensors);
         int n_img_tokens = n_encoder_tokens;  /* Dynamic: matches encoder output */
 
         int n_text_after = 0;
         int *text_after_ids = NULL;
         if (tokenizer) {
-            /* Python tokenizer encodes "\ndocument parsing." as [201, 34030, 76466, 16].
-             * C BPE tokenizer may not handle this correctly, so use verified IDs. */
-            text_after_ids = ds_tokenizer_encode(tokenizer, "\ndocument parsing.", &n_text_after);
-            if (!text_after_ids || n_text_after <= 0 || n_text_after > 10) {
-                /* Fallback: verified Python token IDs for "\ndocument parsing." */
-                static const int fallback_ids[] = {201, 34030, 76466, 16};
-                n_text_after = 4;
-                if (text_after_ids) free(text_after_ids);
-                text_after_ids = (int *)malloc(n_text_after * sizeof(int));
-                memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
+            /* V3: Python 编码 "\ndocument parsing." = [201, 34030, 76466, 16]
+             * V4: 官方 infer() 默认 prompt = "Multi page parsing."
+             *     (modeling_unlimitedocr.py L1073，vLLM 部署同款)。
+             * C BPE tokenizer 对这两种文本都可能出错，先用编码结果，
+             * 失败时用官方 tokenizer 验证过的 fallback ID。*/
+            if (cfg->model_version == 4) {
+                text_after_ids = ds_tokenizer_encode(tokenizer, "Multi page parsing.", &n_text_after);
+                if (!text_after_ids || n_text_after <= 0 || n_text_after > 10) {
+                    /* tokenizer.json 原始 pre-tokenizer 实测:
+                     * "Multi page parsing." → [37460, 4366, 76466, 16]
+                     * ('Multi' ' page' ' parsing' '.')。注意新版 transformers (5.x)
+                     * 的 LlamaTokenizerFast 会丢空格给出错误切分，勿采信。 */
+                    static const int fallback_ids[] = {37460, 4366, 76466, 16};
+                    n_text_after = 4;
+                    if (text_after_ids) free(text_after_ids);
+                    text_after_ids = (int *)malloc(n_text_after * sizeof(int));
+                    memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
+                }
+            } else {
+                text_after_ids = ds_tokenizer_encode(tokenizer, "\ndocument parsing.", &n_text_after);
+                if (!text_after_ids || n_text_after <= 0 || n_text_after > 10) {
+                    /* Fallback: verified Python token IDs for "\ndocument parsing." */
+                    static const int fallback_ids[] = {201, 34030, 76466, 16};
+                    n_text_after = 4;
+                    if (text_after_ids) free(text_after_ids);
+                    text_after_ids = (int *)malloc(n_text_after * sizeof(int));
+                    memcpy(text_after_ids, fallback_ids, n_text_after * sizeof(int));
+                }
             }
             if (ds_verbose >= 1) {
-                fprintf(stderr, "V3 Prompt: BOS + img(%d, id=128815) + after(%d) = %d tokens\n",
+                fprintf(stderr, "V3/V4 Prompt: BOS + [%s] + img(%d, id=128815) + after(%d) = %d tokens\n",
+                        cfg->model_version == 4 ? "<PAGE>" : "",
                         n_img_tokens, n_text_after, 1 + n_img_tokens + n_text_after);
+                if (cfg->model_version == 4) {
+                    fprintf(stderr, "V4 prompt ids:");
+                    for (int t = 0; t < n_text_after; t++) fprintf(stderr, " %d", text_after_ids[t]);
+                    fprintf(stderr, "\n");
+                }
             }
         }
 
-        prefix_len = 1 + n_img_tokens + n_text_after;
+        /* V4 额外需要一个 <PAGE> 标记 (128827) 在 image tokens 之前 */
+        int n_page_markers = (cfg->model_version == 4) ? 1 : 0;
+        prefix_len = 1 + n_page_markers + n_img_tokens + n_text_after;
         input_embeds = (float *)malloc(prefix_len * hidden * sizeof(float));
         memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
         int pos = 0;
+
+        /* 记录 token id 序列供 V4 构建 page2d 坐标 (ds_dash_build_coords) */
+        int *seq_ids = (int *)malloc(prefix_len * sizeof(int));
+        int idp = 0;
 
         #define EMBED_TOKEN_V3(tid) do { \
             if (ctx->decoder.tok_embeddings_bf16 && (tid) >= 0 && (tid) < cfg->vocab_size) { \
@@ -2215,11 +2373,16 @@ prompt_construction:
                     memcpy(&input_embeds[pos * hidden + _i], &_f32, sizeof(float)); \
                 } \
             } \
+            if (seq_ids && idp < prefix_len) seq_ids[idp++] = (tid); \
             pos++; \
         } while(0)
 
         /* 1. BOS token (id=0) */
         EMBED_TOKEN_V3(DS_TOKEN_BOS);
+
+        /* 1.5 V4: <PAGE> 标记 (128827) — 单页文档也必须有，官方 infer() 对
+         * 单图构造 "<PAGE><image>" + prompt。page2d RoPE 以它划分页桶。*/
+        if (n_page_markers) EMBED_TOKEN_V3(DS_TOKEN_PAGE_MARKER);
 
         /* 2. Image tokens — embed all with 128815, then overwrite with encoder output.
          * The encoder returns exactly n_encoder_tokens tokens which should equal
@@ -2240,6 +2403,16 @@ prompt_construction:
 
         /* 3. Text after image */
         for (int t = 0; t < n_text_after; t++) EMBED_TOKEN_V3(text_after_ids[t]);
+
+        /* V4: 保存 id 序列并初始化 DASH 运行时（page 坐标 + 路由缓冲） */
+        if (cfg->model_version == 4) {
+            ctx->dash_prompt_ids = (const int *)seq_ids;   /* 在 ctx 释放前保持有效 */
+            ctx->dash_prompt_len = prefix_len;
+            ds_dash_init(ctx);
+            ds_dash_build_coords(ctx, seq_ids, prefix_len);
+        } else {
+            free(seq_ids);
+        }
 
         #undef EMBED_TOKEN_V3
         free(text_after_ids);
@@ -2425,7 +2598,7 @@ prompt_construction:
                  * as top-1 in F32 precision. Suppressing EOS alone picks Ġ(space)
                  * which leads to "10." loops. Also suppress Ġ and <|/det|>
                  * so the model picks a meaningful content/detection token. */
-                if (cfg->model_version == 3 && first_token == 1) { /* EOS */
+                if ((cfg->model_version == 3 || cfg->model_version == 4) && first_token == 1) { /* EOS */
                     /* V3 model in F32 precision outputs EOS as first token.
                      * Ban EOS + Ġ to avoid "10." loops. The model then picks
                      * a content token (e.g., ĠThe) which may produce a short
@@ -2547,6 +2720,11 @@ prompt_construction:
                 if (cfg->model_version == 3)
                     ctx->dec_argmax_ban[ctx->dec_argmax_n_ban++] = 223; /* Ġ */
             }
+            /* V4: 上一 token 进入 page 坐标状态机 (<PAGE> 换页/tok+1)。
+             * 此步 ds_decoder_forward 会把它的 K/V 写到 kv_cache_len 位置，
+             * 该位置的 (tok,page) 坐标必须先于注意力计算就绪。*/
+            if (cfg->model_version == 4 && ctx->token_history_len > 0)
+                ds_dash_advance_coords(ctx, ctx->token_history[ctx->token_history_len - 1]);
             /* Decode: process current token, get next token
              * dec_input 此时持有上一步 token 的嵌入（BF16→F32 展开）；
              * 内部走 12 层 decoder + LM head argmax，返回下一 token id */
@@ -2696,7 +2874,10 @@ prompt_construction:
      * and outputs.replace(a_match_other, '') — removes the entire <|det|>...<|/det|> block.
      * Also strips <|ref|>...<|/ref|><|det|>...<|/det|> blocks (ref+det pairs).
      * This removes bounding box coordinates while keeping the descriptive text. */
-    if (output && out_len > 0 && cfg->model_version == 3) {
+    if (output && out_len > 0 && (cfg->model_version == 3 || cfg->model_version == 4)) {
+        if (ds_verbose >= 1)
+            fprintf(stderr, "V4DBG raw output (%d bytes): [", out_len);
+        if (ds_verbose >= 1) { fwrite(output, 1, out_len < 300 ? out_len : 300, stderr); fprintf(stderr, "]\n"); }
         out_len = ds_strip_det_tags(output, out_len);
         /* V3 hallucination prefix removal: when the model's first token
          * is forced past EOS, it may generate a short English hallucination
@@ -2868,6 +3049,7 @@ prompt_construction:
         }
     }
 
+    ds_rss_probe("final");
     return output;
 }
 

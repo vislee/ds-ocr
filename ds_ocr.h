@@ -131,7 +131,8 @@
  * ======================================================================== */
 
 typedef struct {
-    int model_version;          /* 1 = DeepSeek-OCR, 2 = DeepSeek-OCR-2, 3 = Unlimited-OCR */
+    int model_version;          /* 1 = DeepSeek-OCR, 2 = DeepSeek-OCR-2,
+                                   3 = Unlimited-OCR, 4 = Unlimited-OCR-2 (DASH) */
     int sliding_window_size;    /* R-SWA window (0=disabled, 128=Unlimited-OCR) */
 
     /* Vision tokenizer (SAM ViT-B) */
@@ -331,6 +332,13 @@ typedef struct {
     float *q_norm_weight;              /* [head_dim] = [128] */
     float *k_norm_weight;              /* [head_dim] = [128] */
 
+    /* DASH router (V4 only): head_cls 块分数路由 + entmax top-K */
+    uint16_t *dash_q_proj_bf16;        /* [128, hidden] 索引 Q 投影 */
+    uint16_t *dash_k_proj_bf16;        /* [128, hidden] 索引 K 投影 */
+    float *dash_q_norm;                /* [128] Gemma 风格 (scale=1+w) */
+    float *dash_k_norm;                /* [128] */
+    float *dash_head_cls;              /* [128] 块聚合查询向量 */
+
     /* RMSNorm (no bias) */
     float *input_norm;                 /* [hidden] */
     float *post_attn_norm;             /* [hidden] */
@@ -425,8 +433,11 @@ typedef struct {
      * conversion, but that reconverted the ENTIRE cache every decode step
      * (O(seq_len) BF16→F32 work per layer), which dominated attention time.
      * F32 storage doubles memory but eliminates all per-step conversion. */
-    float *kv_cache_k;       /* [layers, max_seq, kv_dim] aligned F32 */
-    float *kv_cache_v;       /* [layers, max_seq, kv_dim] aligned F32 */
+    void *kv_cache_k;        /* [layers, max_seq, kv_dim] F32 或（V3/V4）BF16 存储 */
+    void *kv_cache_v;        /* BF16 模式省一半驻留与一半解码注意力读流量（r2 任务2） */
+    int kv_bf16;             /* 1 = K/V 以 BF16 存储（仅 V3/V4） */
+    float *kv_pf_scratch_k;  /* V3/V4 prefill 批量注意力的整层 F32 展开（懒分配） */
+    float *kv_pf_scratch_v;
     int kv_cache_len;
     int kv_cache_max;
     int _kv_row_stride;      /* kv_dim rounded up to 16-float alignment for cache line access */
@@ -526,6 +537,11 @@ typedef struct {
     int metal_enabled;              /* 1 = use Metal for MoE/LM head, 0 = CPU only */
     int metal_moe_env;              /* DS_METAL_MOE present at load time (hoisted getenv) */
     int metal_lm_env;               /* DS_METAL_LM present at load time (hoisted getenv) */
+
+    /* V4 DASH 块稀疏注意力运行时状态 (ds_dash_state_t*, model_version==4 时使用) */
+    void *dash_state;
+    const int *dash_prompt_ids;     /* prefill 的 token id 序列（构建 page 坐标用） */
+    int dash_prompt_len;            /* 上面序列长度 */
 } ds_ctx_t;
 
 /* ========================================================================
@@ -598,6 +614,9 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed);
  * This amortizes KV cache reads across all tokens in the batch. */
 void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
                                 int n_tokens, int *tokens_out);
+
+/* mmap 清洁源页归还内核（拷贝后调用）；ds_moe_decoder.c 的 lm_head F32 化后也用 */
+void ds_drop_source_pages(const void *p, size_t bytes);
 
 /* Global verbose flag */
 extern int ds_verbose;

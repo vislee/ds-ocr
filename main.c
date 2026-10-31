@@ -222,16 +222,18 @@ int main(int argc, char **argv) {
 
     /* Unlimited-OCR (V3) 默认开启 ngram=35 重复抑制
      * Python使用 SlidingWindowNoRepeatNgramProcessor(ngram_size=35, window=128)
-     * 这防止V3在长文档解析时产生重复的n-gram */
+     * 这防止V3在长文档解析时产生重复的n-gram。
+     * V4 (Unlimited-OCR-2) 官方 infer() 默认 no_repeat_ngram_size=0（纯贪心，
+     * ngram 是可选项），保持一致避免干扰 DASH 路由下的正常生成。*/
     if (ctx->config.model_version == 3 && no_repeat_ngram_size == 0) {
         ctx->no_repeat_ngram_size = 35;
     }
 
     /* ── 设置流式输出回调 ──
-     * V3 禁用流式输出: 因为V3可能产生幻觉前缀（如"[No text detected]"），
+     * V3/V4 禁用流式输出: 因为可能产生幻觉前缀（如"[No text detected]"），
      * 需要后处理删除，这无法逐token完成——必须等全部生成完毕后再处理。
      * V1/V2: 启用流式输出，边生成边打印 */
-    if (verbosity > 0 && ctx->config.model_version != 3) {
+    if (verbosity > 0 && ctx->config.model_version != 3 && ctx->config.model_version != 4) {
         ds_set_token_callback(ctx, stream_token, NULL);
     }
 
@@ -245,7 +247,7 @@ int main(int argc, char **argv) {
     if (text) {
         /* V3 或静默模式: 一次性打印完整结果
          * V1/V2 非静默: 结果已通过stream_token逐token打印，此处只打换行 */
-        if (verbosity == 0 || ctx->config.model_version == 3) {
+        if (verbosity == 0 || ctx->config.model_version == 3 || ctx->config.model_version == 4) {
             printf("%s\n", text);
         } else {
             printf("\n");
