@@ -375,8 +375,80 @@ RLHF 中最常用的强化学习算法，用**价值网络（critic）**估计�
 - 相关章节：11
 
 ### AdamW / Warmup（优化器与预热）
-**去权重衰减的 Adam 变体** 与 **学习率先升后降的预热策略**，现代 LLM 训练标配。
-- 相关章节：11
+**去权重衰减的 Adam 变体** 与 **学习率先升后降的预热策略**，现代 LLM 训练标配。<Warmup 的必要性来自 Adam 二阶矩 $v$ 的冷启动：第 1 步 $\sqrt{\hat v}$ 极小，更新量被放大到 lr 量级，必须从 0 升 lr 才不炸。>
+- 相关章节：11 §6.1
+
+### 交叉熵 / 困惑度（Cross-Entropy / Perplexity）
+**CE = $-\log p_y$，即"正确 token 的负对数概率"**；**PPL = exp(CE)**，单位回到"等效候选词数"。<CE 最小化等价于最小化模型分布与 one-hot 真值的 KL 散度；PPL=10 表示模型平均在 10 个等概率候选间犹豫。>PPL 是训练期指标，**与 OCR 的 CER 不直接挂钩**——PPL 低不等于转写准。
+- 相关章节：11 §5.1 · 08 §9.3
+
+### logsumexp（对数-求和-指数）
+**$\log\sum_j e^{z_j}$ 的数值稳定算法**：先减最大值 $m$ 再取指数，$m$ 在 log 外加回。<直接算会溢出（$e^{1000}=\infty$）；减 max 后指数项都 ≤1。>训练 CE 与推理 softmax 共用同一技巧（`ds_moe_decoder.c` 的 `expf((logits[i]-max_logit)/temp)`）。
+- 相关章节：11 §5.1 · 08 §1.2
+
+### Tied embeddings（权重共享）
+**词嵌入矩阵 $E$ 与输出投影 $W_{\text{lm\_head}}$ 共享同一份权重**。<省一半参数（本工程 129280×1280 ≈ 1.66 亿）+ 正则化嵌入空间。>运行时形态：`dec->lm_head_bf16 ? dec->lm_head_bf16 : dec->tok_embeddings_bf16`——无独立 lm_head 时回退到词嵌入。
+- 相关章节：11 §5.2 · 07 §5
+
+### 梯度检查点（Gradient Checkpointing）
+**前向不存中间激活、反向重算**，用 ~33% 额外计算换 O(√L) 激活显存。<与推理端 KV cache 同属"用算力换显存"的权衡。>
+- 相关章节：11 §5.3
+
+### Loss scaling（损失缩放）
+**FP16 训练时把 loss 乘大常数再反向，防小梯度下溢成 0**。<BF16 指数位与 FP32 相同（8 位），动态范围足够，**通常不需要**——这是 BF16 相对 FP16 的核心优势。>
+- 相关章节：11 §5.3 · 09 §2.1
+
+### 权重初始化（Weight Initialization / Xavier / Kaiming）
+**让每层输出方差守恒的初始化策略**：Xavier $\sigma_w=\sqrt{2/(n_{in}+n_{out})}$（tanh/sigmoid）、Kaiming $\sigma_w=\sqrt{2/n_{in}}$（ReLU）。<LLM 因残差流结构改用固定 `std=0.02`（GPT-2 论文第 2.3 节）+ 残差分支 $1/\sqrt{2N}$ 缩放。>本工程 `config.json` 的 `initializer_range: 0.02` 就是这个决定的化石。
+- 相关章节：11 §3.1
+
+### 梯度噪声尺度 / Critical batch size（梯度噪声 / 临界批大小）
+**$\mathcal{B}=\operatorname{tr}(\Sigma)/\|g\|^2$，即"梯度信号与噪声相等"的 batch 大小**。<$B\ll\mathcal{B}$ 时增大 batch 线性省步数；$B\gg\mathcal{B}$ 时纯浪费算力。>解释了"lr 随 batch 线性缩放"规则。
+- 相关章节：11 §6.2
+
+### Bradley-Terry 模型（BT 模型）
+**成对比较转标量奖励的统计模型**：$P(y_w\succ y_l)=\sigma(r(y_w)-r(y_l))$。<只约束分数**差**，不约束绝对值——RM 分数只有排序意义，不能当"质量百分比"。>
+- 相关章节：12 §4.1
+
+### KL 散度（Kullback-Leibler Divergence）
+**$D_{KL}(p\|q)=\sum_i p_i\log(p_i/q_i)$，衡量两分布的方向性差异**。<非负、不对称（不是"距离"）。>RLHF 里作"防跑偏锚"：$-\beta D_{KL}(\pi_\theta\|\pi_{\text{ref}})$ 拴住策略防 reward hacking；DPO 把它吸收进隐式奖励。
+- 相关章节：12 §4.2 · 11 §5.1
+
+### 校准 / 温度缩放（Calibration / Temperature Scaling）
+**修正模型"过度自信"的后处理**：在验证集拟合标量 $T>1$，推理用 $p_i\propto\exp(z_i/T)$ 压平分布。<**不改变 argmax**，故对贪心输出无影响，只影响"报告给用户的置信度"。>注意与**采样温度**（`--temp`，改变输出）数学同形、用途完全不同。
+- 相关章节：08 §5.5
+
+### 熵 / Margin（Entropy / Logit Margin）
+**$H(p)=-\sum p_i\log p_i$** 与 **$z_{(1)}-z_{(2)}$**，都是"模型有多确信"的度量。<熵低/margin 大 = 确信；margin 小 = 近并列易翻转（幻觉的数值根源）。>本工程流式 argmax 只留 top-1，**算不出熵**；顺带记 top-2 得 margin 是零成本折中。
+- 相关章节：08 §5.5 · 08 §9
+
+### 约束解码 / Logits Processor（Constrained Decoding）
+**在 softmax 前把非法 token 压到 $-\infty$**：$z'_i=z_i$ if $i\in\mathcal{A}(x_{<t})$ else $-\infty$。<三代做法：①后处理修补 ②黑名单（本工程 `banned[48]`）③语法约束（Outlines/llama.cpp GBNF 用 FSM 驱动）。>第 ③ 代保证"结构必然合法"，代价是 FSM 编译成本 + token 边界问题。
+- 相关章节：08 §3.5
+
+### 投机解码（Speculative Decoding）
+**小模型草稿 K 个 token → 大模型一次前向验证 → 按 $\min(1,p_{\text{target}}/p_{\text{draft}})$ 接受**。<rejection sampling 保证最终分布**严格等于**大模型分布——无损加速，区别于量化等近似手段。>加速比 $\frac{1-\alpha^{K+1}}{1-\alpha}$；本工程 `ds_decoder_forward_batch` 是验证器原语，缺草稿模型。
+- 相关章节：13 §6.6
+
+### PagedAttention（分页注意力）
+**把 KV 切成固定 block、用页表（逻辑块→物理块）管理**（vLLM 核心，SOSP 2023）。<消除内部碎片 + 前缀共享（引用计数）。>代价是注意力 kernel 要按页表 gather。与本工程 R-SWA/DASH 的"减长度"路线正交，可叠加。
+- 相关章节：13 §6.7 · 09 §7
+
+### KV cache 量化（KV Cache Quantization）
+**对 KV 做 per-token per-head 的 INT8/FP8 量化**，显存减半。<误差可接受的原因：softmax 权重高度集中，被污染的是权重很小的 $j$，影响被二次压制。>本工程 V3/V4 已用 BF16 KV（省一半），INT8/FP8 未实现——先减长度（R-SWA/DASH）再减位宽是更划算的顺序。
+- 相关章节：09 §4.4 · 03 §5.5
+
+### 算子融合 / CUDA Graph（Kernel Fusion / CUDA Graph）
+**合并多个小 kernel 省中间结果写回** 与 **录制整条 kernel 序列一次提交省启动开销**。<CUDA kernel 启动 ~5-10 μs，decode 每步上百个 kernel 累计 0.5-1 ms，在 GPU 单步 10-30 ms 里占 2-10%。>本工程是 CPU 引擎，对应物是"流式 argmax"（融合掉 argmax 算子）与 Metal 单 command buffer。
+- 相关章节：09 §7.1
+
+### Fertility / 压缩率（Fertility / Compression Ratio）
+**fertility = #tokens/#words**（平均每词切几个 token）；**压缩率 = #chars/#tokens**。<fertility 越高序列越长，直接放大注意力 O(S²) 与 KV O(S) 成本。>中文常见 1.5-2.5；本工程 129280 大词表 fertility 低但 LM head 331 MB 是 decode 最大单块权重。
+- 相关章节：07 §5.1
+
+### CER / WER / 编辑距离（Character/Word Error Rate）
+**CER = 编辑距离/真值字符数**，**WER** 按词计。<编辑距离 = 最少插入/删除/替换操作数，DP 求解。>OCR 的**任务指标**，与 PPL（训练指标）分工不同——PPL 低但 CER 高完全可能。本仓库 `tools/regress.sh` 用它做回归门控，但**实际用的是 `difflib.SequenceMatcher` 相似度而非严格编辑距离**（近似 CER，不可跨工具比较）；GRPO 可直接用 $-\text{CER}$ 当可验证奖励。
+- 相关章节：08 §9.3 · 12 §6
 
 ---
 
