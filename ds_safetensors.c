@@ -238,6 +238,11 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
  * @param sf  [输出] 解析结果写入sf->tensors[]数组，sf->num_tensors为解析数量
  * @return   成功返回0，失败返回-1
  */
+/* parse_header - 解析 header JSON → tensors[] 数组
+ * header 是 {"tensor_name": {dtype,shape,data_offsets}, ...} 的扁平对象。
+ * 【__metadata__ 特殊键】部分导出工具会带一个字符串值的元数据对象，
+ * 对本工程无用——用括号深度计数整段跳过（里面可能有嵌套结构）。
+ * 张量条目由 parse_tensor_entry 解析（dtype/shape/data_offsets 三键）。 */
 static int parse_header(safetensors_file_t *sf) {
     const char *p = sf->header_json;
     skip_whitespace(&p);
@@ -283,6 +288,7 @@ static int parse_header(safetensors_file_t *sf) {
  * ======================================================================== */
 
 /* safetensors_open — 打开单个safetensors文件（mmap映射 + JSON解析）
+ * (docs/03 §2.1-2.2；docs/09 §5.1-5.2)
  *
  * 处理流程：
  *   1. open() 打开文件 → 获取文件描述符 fd
@@ -291,6 +297,15 @@ static int parse_header(safetensors_file_t *sf) {
  *   4. 读取前8字节 → 得到 header_size（little-endian uint64）
  *   5. 从 data+8 提取 header_size 字节的JSON字符串
  *   6. parse_header() 解析JSON → 填充 tensors[] 数组
+ *
+ * 【文件布局】(docs/03 §2.1)
+ *   [8B header长度][header JSON][数据区: tensor1 | tensor2 | ...]
+ *   data_offsets 是相对数据区起点（即文件偏移 8+header_size）的。
+ *
+ * 【为什么 mmap 而非 read】(docs/03 §2.2)
+ *   零拷贝（不经过内核→用户缓冲复制）+ 惰性加载（只访问的页才读盘）。
+ *   3B 参数模型 BF16 ≈6GB，MoE 稀疏激活意味着大量专家页永远不会被碰。
+ *   header JSON 单独拷到堆：解析器要 '\0' 结尾，且 header 只读一次。
  *
  * @param path  safetensors文件路径
  * @return      成功返回safetensors_file_t指针（调用者需safetensors_close释放），失败返回NULL
@@ -363,6 +378,11 @@ static float bf16_to_f32(uint16_t bf16) {
 }
 
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
+    /* F32 预转换路径 (docs/03 §2.4)：分配新内存 + 逐元素转换 O(n)。
+     * 【选型策略】解码器权重（95%+）走 bf16_direct 零拷贝——解码是
+     * 逐 token 推理，matvec 里 BF16→F32 在寄存器内 on-the-fly 做，
+     * 权重不翻倍；编码器权重较小（SAM/CLIP ≈ 0.5GB），批量计算
+     * （prefill 的 sgemm 需要 F32 输入），加载时一次预转换更划算。 */
     int64_t n = safetensor_numel(t);
     if (n <= 0) return NULL;
 
@@ -391,6 +411,12 @@ int safetensor_is_bf16(const safetensor_t *t) {
     return t && t->dtype == DTYPE_BF16;
 }
 
+/* safetensors_get_bf16_direct - BF16 权重的零拷贝访问 (docs/03 §2.4)
+ * 返回 mmap 区域内的原始 uint16 指针：O(1)、不复制、不转换。
+ * 指针生命周期与 sf 相同——调用方绝不能 free 或写这个区域
+ * （MAP_PRIVATE 只读映射，写会 SIGSEGV）。
+ * matvec 内核按需把 uint16 左移 16 位还原成 F32（寄存器内完成），
+ * 3GB 级解码器权重不翻倍——这是整个引擎内存效率的基石。 */
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t) {
     if (!sf || !t || t->dtype != DTYPE_BF16) return NULL;
     return (uint16_t *)safetensors_data(sf, t);
@@ -417,6 +443,9 @@ void safetensors_print_all(const safetensors_file_t *sf) {
  * ======================================================================== */
 
 multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
+    /* 多分片打开 (docs/03 §2.3)：优先单文件 model.safetensors；
+     * 否则扫目录收集 model-*.safetensors 分片名（sorted 后逐个 open）。
+     * 分片对调用方透明：multi_safetensors_find 在所有分片中统一找。 */
     multi_safetensors_t *ms = calloc(1, sizeof(multi_safetensors_t));
     if (!ms) return NULL;
 
@@ -491,6 +520,10 @@ void multi_safetensors_close(multi_safetensors_t *ms) {
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
                                             const char *name,
                                             safetensors_file_t **out_sf) {
+    /* 线性扫所有分片的所有 tensor。调用方每次权重访问都会经过这里
+     * （ds_ocr.c 的 LOAD_* 宏），O(张量数) 的 strcmp 在加载期一次性
+     * 场景下足够——不做索引表，直白优先。out_sf 告诉调用方 tensor
+     * 属于哪个分片（取 bf16 直指针需要 sf->data + header_size）。 */
     for (int s = 0; s < ms->num_shards; s++) {
         safetensors_file_t *sf = ms->shards[s];
         for (int i = 0; i < sf->num_tensors; i++) {
@@ -510,7 +543,9 @@ const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
  * mmap 里的源页此后不再被读。对这些页做 MADV_DONTNEED 可立即归还物理页
  * （~4-5GB）：它们是 MAP_PRIVATE 文件映射的干净页，此后任何指针触碰都会
  * 从 page cache 廉价重入（无磁盘 I/O），正确性不受影响。
- * DS_NO_MADVISE=1 可关闭（调试对照用）。 */
+ * DS_NO_MADVISE=1 可关闭（调试对照用）。
+ * 【与 docs/09 §5.5 冷/热态的关系】madvise 只影响 RSS 常驻，不影响跑分——
+ * 热态基准测的是内存带宽，被访问的页会自然回到常驻集。 */
 void multi_safetensors_madvise_unused(multi_safetensors_t *ms) {
     if (!ms) return;
     if (getenv("DS_NO_MADVISE")) return;
