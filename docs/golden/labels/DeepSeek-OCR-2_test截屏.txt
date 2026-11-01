@@ -1,0 +1,26 @@
+# source: engine-baseline 2026-10-30（人工对照原图核对通过）
+# Description
+
+云WAF系统，支持黑白名单和CC的防护。
+
+系统分为以下阶段：
+
+- **skip**: 实现了白名单功能。
+- **deny**: 实现了黑名单功能。
+- **cc**:
+  - **离线分析策略**
+  - **自定义策略**
+- **waf**: 转到wafcore，实现了waf功能。
+- **ratelimit 限速**
+
+- **filter** 过滤，实现了请求头的增删改，请求cookie的增删改，响应头信息过滤等。
+
+---
+
+# Back to TOC
+
+---
+
+支持的封禁动作，配置的时候注意配置正确。适用于jfe的配置，和wafcore的配置。
+
+- **wafcore** 只需返回200或403。200表示通过，403表示命中规则。命中规则时，wafcore要使用 X-WAF-ACTION 头返回对应的action。通过 X-WAF-Reason 头指定封禁的原因，格式为 waf:id，ratelimit:item。通过 X-WAF-Payload 头返回匹配规则的负载。
