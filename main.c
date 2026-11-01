@@ -581,7 +581,7 @@ static void warn_loopy_output(const ds_ctx_t *ctx, const char *text, const char 
          * page_count_guard 护栏）。文档类批量场景建议用 V2。 */
         if (ctx->config.model_version == 4)
             fprintf(stderr,
-                    "  建议: V4 对文档类页面退化率高（实测召回 38.8% vs V2 68.2%），"
+                    "  建议: V4 对文档类页面退化率高（实测召回 38.8%% vs V2 68.2%%），"
                     "建议改用 -d models/DeepSeek-OCR-2（V2）重跑本文档。\n");
     }
 }
