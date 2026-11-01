@@ -349,14 +349,57 @@ make blas CC=clang CFLAGS="-Wall -O3 -arch x86_64 -DUSE_BLAS -DACCELERATE_NEW_LA
 # macOS Vision OCR (no model weights needed)
 ./ds_ocr -i doc.png --vision --silent
 ./ds_ocr -i doc.png --vision-fast --silent
+
+# Interactive stream mode: model loads once, OCR many files
+# Type @<file> + Enter to recognize images/PDFs, q to quit
+./ds_ocr -d ./models/DeepSeek-OCR-2 --stream
 ```
+
+Stream mode session example (`ds_ocr>` prompt on stderr, results on stdout):
+
+```text
+ds_ocr> @receipt.png
+...recognition output...
+ds_ocr> @report.pdf        ← PDFs are recognized page by page
+...page 1 text...
+...page 2 text...
+ds_ocr> q
+```
+
+While a large image is being recognized (can take tens of seconds), stderr
+shows live progress — a `·N` mark every 32 generated tokens (throttled to every
+128 beyond 512; token count only, never text content) — and a `✓ N tok, X.Xs`
+completion line per file/page. With `--silent`, prompts/progress stay on stderr
+and only the per-file performance stats are dropped; stdout still carries
+recognition text only.
+
+PDFs are recognized page by page (`@file.pdf` in stream mode, or `-i file.pdf`
+in single-shot mode). Multi-page output is cleaned automatically: running
+headers/footers (a line repeated as the first/last line on ≥3 pages) are
+treated as page chrome and removed document-wide (`DS_KEEP_PAGE_HEADERS=1`
+keeps them), and repetition-loop remnants are folded per page with a
+layered policy (conservative ≥3-period folding for unflagged pages,
+aggressive ≥2-period + duplicate-line folding for pages already flagged as
+loops). Formula/table-heavy pages can still trigger model repetition loops —
+detected mid-decode via byte-level periodicity and stopped early. Verified
+ineffective: `--ngram` / mild `--rp`.
+
+**Model choice** (31-page standards document, all four models A/B'd with
+8-char shingle recall against the PDF text layer): for multi-page
+document/table batches prefer **DeepSeek-OCR-2 (V2)** — 68.2% average recall,
+and it is *strongest* (76.5%) in the appendix-B table section where the other
+models collapse, with zero degenerate retries (405s). Unlimited-OCR (V3):
+59.4% (tables 49.6%), 544s. Unlimited-OCR-2 (V4/DASH): fastest (327s) but
+57% of document pages degenerate, 38.8% average recall — fine for
+screenshots.
 
 ### CLI Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-d <dir>` | Model directory | Required |
-| `-i <file>` | Input image | Required |
+| `-i <file>` | Input image (not required with `--stream`) | Required |
+| `--stream` | Interactive mode: `@<file>` + Enter to OCR images/PDFs, `q` quits | Off |
 | `-t <n>` | Thread count | All CPUs |
 | `-n <n>` | Max generated tokens | 4096 |
 | `--temp <f>` | Sampling temperature | 0 (greedy) |
