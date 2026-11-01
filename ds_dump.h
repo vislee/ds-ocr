@@ -12,7 +12,7 @@
  *
  * 【使用模式】
  *   DS_DUMP_TENSORS=1 ./ds_ocr -d models/... -i img.png  → stderr 统计
- *                                                        + dump/*.bin
+ *                                                        + dump 目录下的 .bin
  *   tools/regress.sh / dump_tensors.py 消费 .bin 做精确比较
  *   g_dump_crop_id：多裁剪时给 dump 文件名加 crop 前缀，避免互踩
  */
