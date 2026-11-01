@@ -216,7 +216,7 @@ float ds_int4_quant_error_rms(const ds_int4_block_t *block,
  * 每个输出行独立计算 dot(sum((qweight+128)*x)) + offset*sum(x)
  * 适用于无 SIMD 的平台（x86 无 AVX2 时）
  */
-static void int8_matvec_generic(float *y, const float *x,
+static void __attribute__((unused)) int8_matvec_generic(float *y, const float *x,
                                   const ds_int4_block_t *block,
                                   int row_start, int nrows) {
     const int in_dim = block->in_dim;

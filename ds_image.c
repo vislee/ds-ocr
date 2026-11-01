@@ -42,6 +42,44 @@
 #include <ImageIO/ImageIO.h>
 #endif
 
+#if defined(__APPLE__) && defined(USE_APPLE_VISION)
+/* Apply an EXIF orientation (kCGImagePropertyOrientation values 2-8) to an
+ * RGBA buffer by pixel remapping; returns a newly allocated buffer and
+ * updates *w and *h (dims swap for orientations 5-8). Matches PIL's
+ * ImageOps.exif_transpose, which the Python reference applies at load:
+ *   2: flip H      3: rotate 180    4: flip V
+ *   5: transpose   6: rotate 90 CW  7: transverse   8: rotate 90 CCW
+ * Mappings verified against a labelled 3x2 source for all 7 values. */
+static unsigned char *ds_exif_transform_rgba(const unsigned char *src, int *w, int *h,
+                                             int orientation) {
+    int sw = *w, sh = *h;
+    int dw = (orientation >= 5) ? sh : sw;
+    int dh = (orientation >= 5) ? sw : sh;
+    unsigned char *dst = (unsigned char *)malloc((size_t)dw * dh * 4);
+    if (!dst) return NULL;
+
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            int sx, sy;
+            switch (orientation) {
+                case 2: sx = sw - 1 - x; sy = y;          break;
+                case 3: sx = sw - 1 - x; sy = sh - 1 - y; break;
+                case 4: sx = x;          sy = sh - 1 - y; break;
+                case 5: sx = y;          sy = x;          break;
+                case 6: sx = y;          sy = sh - 1 - x; break;
+                case 7: sx = sw - 1 - y; sy = sh - 1 - x; break;
+                case 8: sx = sw - 1 - y; sy = x;          break;
+                default: sx = x;         sy = y;          break;
+            }
+            memcpy(dst + ((size_t)y * dw + x) * 4, src + ((size_t)sy * sw + sx) * 4, 4);
+        }
+    }
+    *w = dw;
+    *h = dh;
+    return dst;
+}
+#endif
+
 ds_image_t *ds_image_load(const char *path) {
 #if defined(__APPLE__) && defined(USE_APPLE_VISION)
     /* Use CoreGraphics for image loading — matches PIL's JPEG/PNG decoder */
@@ -50,6 +88,20 @@ ds_image_t *ds_image_load(const char *path) {
     CGImageSourceRef source = CGImageSourceCreateWithURL(url, NULL);
     CFRelease(url);
     if (!source) goto fallback_stb;
+
+    /* EXIF orientation must be read from the source BEFORE it is released */
+    int exif_orientation = 1;
+    {
+        CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(source, 0, NULL);
+        if (props) {
+            CFNumberRef o = (CFNumberRef)CFDictionaryGetValue(props, kCGImagePropertyOrientation);
+            int v = 0;
+            if (o && CFNumberGetValue(o, kCFNumberIntType, &v) && v >= 1 && v <= 8)
+                exif_orientation = v;
+            CFRelease(props);
+        }
+    }
+
     CGImageRef cg_img = CGImageSourceCreateImageAtIndex(source, 0, NULL);
     CFRelease(source);
     if (!cg_img) goto fallback_stb;
@@ -68,15 +120,32 @@ ds_image_t *ds_image_load(const char *path) {
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg_img);
     unsigned char *rgba = (unsigned char *)CGBitmapContextGetData(ctx);
 
+    /* Apply EXIF orientation (no-op for 1); rotated buffer replaces rgba */
+    unsigned char *rotated = NULL;
+    if (exif_orientation > 1) {
+        rotated = ds_exif_transform_rgba(rgba, &w, &h, exif_orientation);
+        if (rotated) {
+            rgba = rotated;
+            if (ds_verbose >= 2)
+                fprintf(stderr, "Applied EXIF orientation %d (%dx%d)\n", exif_orientation, w, h);
+        }
+    }
+
     /* Convert RGBA → RGB */
-    unsigned char *rgb = (unsigned char *)malloc(w * h * 3);
-    if (!rgb) { CGContextRelease(ctx); CGImageRelease(cg_img); return NULL; }
+    unsigned char *rgb = (unsigned char *)malloc((size_t)w * h * 3);
+    if (!rgb) {
+        free(rotated); /* NULL when no transform happened */
+        CGContextRelease(ctx);
+        CGImageRelease(cg_img);
+        return NULL;
+    }
     for (int i = 0; i < w * h; i++) {
         rgb[i*3+0] = rgba[i*4+0];
         rgb[i*3+1] = rgba[i*4+1];
         rgb[i*3+2] = rgba[i*4+2];
     }
-    CGContextRelease(ctx);
+    free(rotated); /* heap-owned transformed buffer, distinct from ctx-owned rgba */
+    CGContextRelease(ctx);   /* frees the original rgba */
     CGImageRelease(cg_img);
 
     ds_image_t *img = (ds_image_t *)calloc(1, sizeof(ds_image_t));

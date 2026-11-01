@@ -68,6 +68,7 @@
  */
 
 #include "ds_moe_decoder.h"
+#include "ds_dash.h"              /* V4 DASH 块稀疏注意力 */
 #include "ds_kernels.h"
 #include "ds_safetensors.h"
 #include "ds_metal.h"
@@ -121,7 +122,7 @@
  * 处理64个路由专家(top-6) + 2个共享专家的完整计算流程。
  * 所有buffer由调用者提供（复用ctx中的预分配内存），避免反复malloc/free。*/
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
+                         ds_config_t *cfg, ds_ctx_t *ctx,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
@@ -162,34 +163,29 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
 
 /* ========================================================================
  * KV Cache Access Helpers — F32 direct storage (no BF16 conversion)
+ * 实现移至 ds_dash.h (ds_kv_k_row/ds_kv_v_row static inline)，供 V4 DASH 模块共用
  * ======================================================================== */
 
-/* Get pointer to K cache row for a given layer and position.
- * 布局: cache[layers][max_seq][kv_row_stride], kv_row_stride >= kv_dim. */
-static inline float *ds_kv_k_row(ds_ctx_t *ctx, int layer, int pos) {
-    int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
-}
-
-static inline float *ds_kv_v_row(ds_ctx_t *ctx, int layer, int pos) {
-    int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride + pos * stride;
-}
-
 /* Get pointer to start of K/V cache for a layer (row 0) */
-static inline float *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
+static inline void *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
     int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride;
+    size_t elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    return (char *)ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride * elem;
 }
 
-static inline float *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
+static inline void *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
     int stride = ctx->_kv_row_stride;
-    return ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride;
+    size_t elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    return (char *)ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * stride * elem;
 }
 
 /* Store F32 K/V directly into the aligned F32 KV cache */
-static inline void ds_kv_store_f32(float *dst, const float *src, int n) {
-    memcpy(dst, src, (size_t)n * sizeof(float));
+static inline void ds_kv_store_row(ds_ctx_t *ctx, void *dst, const float *src, int n) {
+    if (ctx->kv_bf16) {
+        ds_f32_to_bf16_batch((uint16_t *)dst, src, n);
+    } else {
+        memcpy(dst, src, (size_t)n * sizeof(float));
+    }
 }
 
 /* ========================================================================
@@ -228,14 +224,35 @@ static void dense_ffn_forward(float *output, const float *x,
     ds_linear_nobias_bf16(gate_buf, x, layer->dense_gate_weight_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, layer->dense_up_weight_bf16, 1, hidden, intermediate);
 
+    /* BF16 truncation — matches the prefill dense path (and Python autocast).
+     * The decode path previously skipped these, so layer-0 outputs drifted
+     * from the prefill-truncated distribution that produced the first token. */
+    {
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) {
+            ds_bf16_truncate_array(gate_buf, intermediate);
+            ds_bf16_truncate_array(up_buf, intermediate);
+        }
+    }
+
     /* SwiGLU: SiLU(gate) * up — direct computation without interleaving.
      * Previously: gate_up[2*i]=gate[i], gate_up[2*i+1]=up[i], then ds_swiglu_multiply.
      * That interleaving caused non-sequential writes (cache-unfriendly).
      * ds_swiglu_direct computes SiLU(gate[i]) * up[i] directly. */
     ds_swiglu_direct(swiglu_buf, gate_buf, up_buf, 1, intermediate);
 
+    {
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) ds_bf16_truncate_array(swiglu_buf, intermediate);
+    }
+
     /* Down projection */
     ds_linear_nobias_bf16(output, swiglu_buf, layer->dense_down_weight_bf16, 1, intermediate, hidden);
+
+    {
+        extern int ds_bf16_simulate_python;
+        if (ds_bf16_simulate_python) ds_bf16_truncate_array(output, hidden);
+    }
 
     if (own_gate) free(gate_buf);
     if (own_up) free(up_buf);
@@ -251,7 +268,7 @@ static void dense_ffn_forward(float *output, const float *x,
  * 所有 buffer 由调用者传入（decode 时复用 ctx 中的预分配内存），
  * 避免每步 malloc/free 的开销。*/
 static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx, int layer_idx,
+                         ds_config_t *cfg, ds_ctx_t *ctx, int layer_idx,
                          float *dense_gate_buf, float *dense_up_buf, float *dense_swiglu_buf,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
@@ -264,7 +281,7 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
         dense_ffn_forward(output, x, layer, cfg, dense_gate_buf, dense_up_buf, dense_swiglu_buf);
     } else {
         /* MoE */
-        moe_forward(output, x, layer, cfg, metal_ctx,
+        moe_forward(output, x, layer, cfg, ctx,
                     expert_gate_buf, expert_up_buf,
                     expert_gate_up_buf, expert_hidden_buf,
                     shared_gate_buf, shared_up_buf,
@@ -275,7 +292,7 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
 }
 
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
-                         ds_config_t *cfg, ds_metal_ctx_t *metal_ctx,
+                         ds_config_t *cfg, ds_ctx_t *ctx,
                          float *expert_gate_buf, float *expert_up_buf,
                          float *expert_gate_up_buf, float *expert_hidden_buf,
                          float *shared_gate_buf, float *shared_up_buf,
@@ -340,7 +357,8 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
 
-    if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE")) {
+    if (ctx->metal_ctx && ctx->metal_moe_env && ds_metal_is_available(ctx->metal_ctx) &&
+        layer->experts[top_indices[0]].gate_up_fused_bf16) {   /* 无连续块（r2 任务3）→ CPU split 路径 */
         /* ── Metal GPU path: MoE expert forward ── */
         const uint16_t *gate_up_ptrs[DS_MAX_EXPERTS];
         const uint16_t *down_ptrs[DS_MAX_EXPERTS];
@@ -349,24 +367,117 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
             down_ptrs[k] = layer->experts[top_indices[k]].down_weight_bf16;
         }
         /* GPU computes combined expert output directly into 'output' */
-        ds_metal_moe_experts(metal_ctx, x, gate_up_ptrs, down_ptrs,
+        ds_metal_moe_experts(ctx->metal_ctx, x, gate_up_ptrs, down_ptrs,
                               top_weights, top_k, hidden, moe_inter, output);
         /* Skip CPU combine since GPU already combines */
         if (!expert_outputs_buf) free(expert_outputs);
         goto shared_experts;
     }
 
-    /* ── CPU path: 逐expert matvec ──
-     * 【为什么不用 sgemm 批量计算？】
-     * Decode 路径每次只有1个token，matvec (BF16×F32) 是最优选择。
-     * sgemm (F32×F32) 虽然计算吞吐更高，但需要预转换 BF16→F32 权重，
-     * 内存开销 ~265MB (64 experts × 896×1280×2×4bytes)，不值得。
-     *
-     * 【madvise 预取策略】
-     * mmap 加载的 BF16 权重在第一次访问时触发 page fault（~60μs/page）。
-     * 通过提前 madvise(WILLNEED) 触发内核异步预读，减少 stall 时间。
-     * 策略: 一次预取所有 top-6 专家的 gate_up_fused 范围（在连续块内），
-     *       然后在循环中提前预取下一个专家的 down 权重。*/
+    /* ── CPU path: 分组行并行（r4 优化）──
+     * 旧实现: 每个选中 expert 独立调用 2-3 次 matvec（split 布局 gate/up/down
+     * 共 3 次），每层 ~19 个微小型并行区——barrier 同步开销大于矩阵本身，
+     * 实测 t1 与 t14 解码耗时相同（MoE 7.7s vs 8.4s，多线程反而 +10% 纯开销）。
+     * 现在: 同类投影的行合并为 1 个并行区——
+     *   split 布局 (V4): gate / up / down 各 1 个并行区，共 3 个；
+     *   fused 布局:      gate_up 1 个 + down 1 个。
+     * 行对（2r, 2r+1）永不跨线程拆分，每行仍由同一 NEON 内核按成对路径累加
+     * → 输出与逐专家串行版本逐位一致（md5 已验证）。 */
+    int all_fused = (top_k > 1) && !layer->int4_enabled;
+    int all_split = (top_k > 1) && !layer->int4_enabled;
+    for (int k = 0; (all_fused || all_split) && k < top_k; k++) {
+        const uint16_t *fused = layer->experts[top_indices[k]].gate_up_fused_bf16;
+        const uint16_t *gw = layer->experts[top_indices[k]].gate_weight_bf16;
+        const uint16_t *uw = layer->experts[top_indices[k]].up_weight_bf16;
+        if (!layer->experts[top_indices[k]].down_weight_bf16) {
+            all_fused = all_split = 0;
+        } else if (fused) {
+            all_split = 0;      /* 该专家 fused → 混合布局走旧路径 */
+        } else if (gw && uw) {
+            all_fused = 0;      /* 该专家 split */
+        } else {
+            all_fused = all_split = 0;
+        }
+    }
+
+    if (all_fused || all_split) {
+        const uint16_t *w_a[DS_MAX_EXPERTS];   /* fused: gate_up / split: gate */
+        const uint16_t *w_b[DS_MAX_EXPERTS];   /* split: up */
+        const uint16_t *w_down[DS_MAX_EXPERTS];
+        const float *x_shared[DS_MAX_EXPERTS]; /* gate/up: 各单元共享同一 x */
+        const float *x_hidden[DS_MAX_EXPERTS]; /* down: 各专家的 SwiGLU 输出 */
+        for (int k = 0; k < top_k; k++) {
+            int expert_id = top_indices[k];
+            if (all_fused) {
+                w_a[k] = layer->experts[expert_id].gate_up_fused_bf16;
+            } else {
+                w_a[k] = layer->experts[expert_id].gate_weight_bf16;
+                w_b[k] = layer->experts[expert_id].up_weight_bf16;
+            }
+            w_down[k] = layer->experts[expert_id].down_weight_bf16;
+            x_shared[k] = x;
+            /* 预取本专家全部权重（原实现为循环内预取下一个专家） */
+            size_t inter_bytes = (size_t)hidden * moe_inter * 2;
+            madvise((void *)w_down[k], inter_bytes, MADV_WILLNEED);
+            if (all_fused) {
+                madvise((void *)w_a[k], 2 * inter_bytes, MADV_WILLNEED);
+            } else {
+                madvise((void *)w_a[k], inter_bytes, MADV_WILLNEED);
+                madvise((void *)w_b[k], inter_bytes, MADV_WILLNEED);
+            }
+        }
+
+        /* gate_up_all 复用为 split 布局的 gate_all + up_all 两段 */
+        float *gate_up_all = ctx->moe_grouped_gate_up_buf;   /* [top_k × 2*inter] */
+        float *hidden_all = ctx->moe_grouped_hidden_buf;     /* [top_k × inter] */
+        if (gate_up_all && hidden_all) {
+            extern int ds_bf16_simulate_python;
+            float *up_all = gate_up_all + (size_t)top_k * moe_inter;
+            for (int k = 0; k < top_k; k++)
+                x_hidden[k] = hidden_all + (size_t)k * moe_inter;
+
+            if (all_fused) {
+                /* Phase 1: 全部专家的 gate_up 投影（一个并行区） */
+                ds_grouped_matvec_bf16(gate_up_all, x_shared, w_a, top_k,
+                                        2 * moe_inter, hidden);
+            } else {
+                ds_grouped_matvec_bf16(gate_up_all, x_shared, w_a, top_k,
+                                        moe_inter, hidden);
+                ds_grouped_matvec_bf16(up_all, x_shared, w_b, top_k,
+                                        moe_inter, hidden);
+            }
+
+            /* 逐专家: 截断 gate/up → SwiGLU → 截断（与旧路径相同的函数与顺序，
+             * 元素级操作，串行 ~20μs） */
+            for (int k = 0; k < top_k; k++) {
+                float *gu, *uu;
+                float *hbuf = hidden_all + (size_t)k * moe_inter;
+                if (all_fused) {
+                    gu = gate_up_all + (size_t)k * 2 * moe_inter;
+                    uu = gu + moe_inter;
+                } else {
+                    gu = gate_up_all + (size_t)k * moe_inter;
+                    uu = up_all + (size_t)k * moe_inter;
+                }
+                if (ds_bf16_simulate_python) {
+                    ds_bf16_truncate_array(gu, moe_inter);
+                    ds_bf16_truncate_array(uu, moe_inter);
+                }
+                ds_swiglu_direct(hbuf, gu, uu, 1, moe_inter);
+                if (ds_bf16_simulate_python)
+                    ds_bf16_truncate_array(hbuf, moe_inter);
+            }
+
+            /* Phase 2: 全部专家的 down 投影（一个并行区）→ 截断 → 加权合并 */
+            ds_grouped_matvec_bf16(expert_outputs, x_hidden, w_down, top_k,
+                                    hidden, moe_inter);
+            if (ds_bf16_simulate_python)
+                ds_bf16_truncate_array(expert_outputs, top_k * hidden);
+            goto moe_combine;
+        }
+        /* scratch 分配失败 → 落回逐专家路径 */
+    }
+
     if (layer->expert_block_bf16 && top_k > 1) {
         /* Find min/max offset of selected experts within the block */
         size_t fused_per_expert = (size_t)2 * moe_inter * hidden * sizeof(uint16_t);
@@ -383,11 +494,13 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     }
     for (int k = 0; k < top_k; k++) {
         int expert_id = top_indices[k];   /* 依路由概率降序访问：概率高的专家权重更可能已驻留缓存 */
-        /* Prefetch next expert's down weight (in mmap'd region, not in block) */
+        /* Prefetch next expert's weights (mmap'd region; r2 任务3 后 gate/up 也走 mmap) */
         if (k + 1 < top_k) {
             int next_id = top_indices[k + 1];
-            size_t down_bytes = (size_t)hidden * moe_inter * 2;   /* 下一个专家 down 权重 [1280,896]≈2.2MB */
-            madvise((void *)layer->experts[next_id].down_weight_bf16, down_bytes, MADV_WILLNEED);
+            size_t inter_bytes = (size_t)hidden * moe_inter * 2;
+            madvise((void *)layer->experts[next_id].gate_weight_bf16, inter_bytes, MADV_WILLNEED);
+            madvise((void *)layer->experts[next_id].up_weight_bf16, inter_bytes, MADV_WILLNEED);
+            madvise((void *)layer->experts[next_id].down_weight_bf16, inter_bytes, MADV_WILLNEED);
         }
         /* Use INT4 path if quantized weights available, otherwise BF16 */
         if (layer->int4_enabled && layer->experts_int4[expert_id].gate_up_fused.qweight) {
@@ -418,7 +531,9 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     /* Step 4: 加权合并路由专家的输出
      * ds_expert_combine 对每个 expert 的输出乘以路由权重并累加:
      *   output[h] = Σ_{k=0..5} top_weights[k] * expert_outputs[k*hidden + h]
-     * 这是 CPU 路径的合并（GPU 路径在 Metal 内核中直接合并）。*/
+     * 这是 CPU 路径的合并（GPU 路径在 Metal 内核中直接合并）。
+     * 分组快路径（上方 all_experts_fused 分支）也汇合到这里。 */
+moe_combine:
     ds_expert_combine(output, expert_outputs, top_indices, top_weights, top_k, hidden);
     if (!expert_outputs_buf) free(expert_outputs);
     else memset(expert_outputs_buf, 0, top_k * hidden * sizeof(float));
@@ -446,11 +561,11 @@ shared_experts:
                                       shared_gate_up_buf, shared_gate_buf,
                                       shared_up_buf, shared_swiglu_buf);
         ds_vec_add(output, output, shared_out_buf, hidden);  /* 共享专家输出直接累加进残差 */
-    } else if (metal_ctx && ds_metal_is_available(metal_ctx) && getenv("DS_METAL_MOE") &&
+    } else if (ctx->metal_ctx && ctx->metal_moe_env && ds_metal_is_available(ctx->metal_ctx) &&
         layer->shared_gate_up_fused_bf16 && layer->shared_down_weight_bf16) {
         /* ── Metal GPU path: shared experts ── */
         int shared_inter = n_shared * moe_inter;
-        ds_metal_shared_experts(metal_ctx, x,
+        ds_metal_shared_experts(ctx->metal_ctx, x,
                                  layer->shared_gate_up_fused_bf16,
                                  layer->shared_down_weight_bf16,
                                  hidden, shared_inter, output);
@@ -557,9 +672,20 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      *
      * 预计算的 cos/sin 值存储在 ctx->rope_cache_cos/sin 中，
      * 预先计算好所有位置（直到 max_seq_len）的三角函数值，
-     * 避免每步重复计算 sin/cos。*/
-    float *cos_vals = ctx->rope_cache_cos + pos * head_dim;  /* 第 pos 个位置的 cos 表项 [64] */
-    float *sin_vals = ctx->rope_cache_sin + pos * head_dim;  /* sin 表项 [64]；两表启动时一次算好 */
+     * 避免每步重复计算 sin/cos。
+     *
+     * V4 (DASH): 换用 page2d 二维 RoPE 表 (ds_dash 维护)——
+     * tok 轴页内计数 + page 轴页号 mod 2，是官方 sparse_main_rope_mode="page2d"。*/
+    float *cos_vals, *sin_vals;
+    if (cfg->model_version == 4) {
+        extern void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which); /* 0=cos,1=sin */
+        int pos_v4 = ctx->kv_cache_len;
+        cos_vals = (float *)ds_dash_rope_row(ctx, pos_v4, 0);
+        sin_vals = (float *)ds_dash_rope_row(ctx, pos_v4, 1);
+    } else {
+        cos_vals = ctx->rope_cache_cos + pos * head_dim;  /* 第 pos 个位置的 cos 表项 [64] */
+        sin_vals = ctx->rope_cache_sin + pos * head_dim;  /* sin 表项 [64]；两表启动时一次算好 */
+    }
     ds_apply_rope_neox(q, cos_vals, sin_vals, 1, n_heads, head_dim);   /* Q: 10 个 head 一起旋转 */
     ds_apply_rope_neox(k, cos_vals, sin_vals, 1, n_kv_heads, head_dim);/* K: 同一位置旋转，保证 Q·K 相对相位正确 */
 
@@ -569,11 +695,10 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      * This eliminates the per-step batch BF16→F32 conversion that previously
      * dominated attention time (O(seq_len) conversion per decode step). */
     int cache_offset = ctx->kv_cache_len;                        /* 当前 token 写入的缓存槽位 */
-    float *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);  /* K 行地址 = base + (layer*max_seq+pos)*stride */
-    float *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);  /* V 行地址，K/V 分开两块缓存 */
-    ds_kv_store_f32(cache_k_row, k, kv_dim);   /* 写 K [1280 float=5KB]；F32 直存是 v0.7 优化，
-                                                    免去旧方案每步 O(seq_len) 的 BF16→F32 重转换 */
-    ds_kv_store_f32(cache_v_row, v, kv_dim);   /* 写 V [5KB]；此后每个未来 token 的注意力都会读它 */
+    void *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);  /* K 行地址 = base + (layer*max_seq+pos)*stride */
+    void *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);
+    ds_kv_store_row(ctx, cache_k_row, k, kv_dim);   /* F32 直存（V1/V2）；BF16 存储（V3/V4，r2 任务2） */
+    ds_kv_store_row(ctx, cache_v_row, v, kv_dim);
 
     /* Causal attention — read directly from F32 KV cache (zero conversion).
      * The cache is aligned and contiguous for optimal sequential read.
@@ -592,7 +717,20 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     int kv_seq_len = cache_offset + 1;              /* 可见长度 = 历史缓存 + 当前 token（因果掩码） */
     int kv_stride = ctx->_kv_row_stride;            /* 行跨度 ≥ kv_dim，64B 对齐利 SIMD 读取 */
 
-    if (cfg->sliding_window_size > 0 && cache_offset >= ctx->prefill_token_count) {
+    if (cfg->model_version == 4) {
+        /* V4: DASH 块稀疏注意力（官方 _dash_decode_forward）。
+         * DS_V4_FULLATTN=1: 诊断开关——decode 走全量因果注意力（无路由/偏置），
+         * 用于区分“路由选块问题”与“坐标/数值问题”。 */
+        static int _full_attn = -1;
+        if (_full_attn < 0) _full_attn = getenv("DS_V4_FULLATTN") ? 1 : 0;
+        if (_full_attn) {
+            ds_causal_attention_aligned(attn_out, q, k_base, v_base,
+                                        1, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                                        scale, cache_offset, kv_stride);
+        } else {
+            ds_dash_attention_decode(ctx, layer_idx, x, attn_out);
+        }
+    } else if (cfg->sliding_window_size > 0 && cache_offset >= ctx->prefill_token_count) {
         /* R-SWA decode path: attend only to reference + sliding window */
         int prefill_len = ctx->prefill_token_count;   /* 参考集长度：视觉+prompt token（如 908） */
         int W = cfg->sliding_window_size;             /* 滑窗 W=128：只看最近 128 个已生成 token */
@@ -602,20 +740,14 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
          * For efficiency, we compute attention manually with these two ranges.
          * If window_start <= prefill_len, the ranges overlap and we just use
          * [0..kv_seq_len-1] (which happens during warmup when kv_seq_len < prefill_len + W). */
-        if (window_start <= prefill_len) {
-            /* Warmup phase: no gap between reference and window, use full attention */
-            ds_causal_attention_aligned(attn_out, q, k_base, v_base,
-                                        1, kv_seq_len, n_heads, n_kv_heads, head_dim,
-                                        scale, cache_offset, kv_stride);
-        } else {
-            /* Steady state: gap between reference and window.
-             * Compute Q@K^T for reference range and window range separately,
-             * then combine into a single softmax. */
-            ds_rswa_attention_aligned(attn_out, q, k_base, v_base,
+        /* 统一走 RSWA worker: warmup（window_start==prefill_len）时两段连续
+         * 覆盖 [0,kv_seq_len)，j 顺序与全量因果一致 → 逐位一致；
+         * BF16 时 worker 内用 bf16×f32 点积/axpy（r2 任务2）。 */
+        ds_rswa_attention_aligned_bf16(attn_out, q, k_base, v_base,
                                        1, n_heads, n_kv_heads, head_dim,
                                        scale, kv_stride,
-                                       prefill_len, window_start, kv_seq_len);
-        }
+                                       prefill_len, window_start, kv_seq_len,
+                                       ctx->kv_bf16);
     } else {
         /* Standard causal attention (prefill or no R-SWA) */
         ds_causal_attention_aligned(attn_out, q, k_base, v_base,
@@ -639,7 +771,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
     if (ctx->profile_enabled) t0 = ds_time_sec();
     float *mlp_out = ctx->dec_expert_out;  /* reuse preallocated buffer */
-    mlp_forward(mlp_out, x_norm, layer, cfg, ctx->metal_ctx, layer_idx,
+    mlp_forward(mlp_out, x_norm, layer, cfg, ctx, layer_idx,
                 ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                 ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                 ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
@@ -661,7 +793,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
  * Decoder Prefill (multiple tokens)
  * ======================================================================== */
 
-void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
+int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     ds_moe_decoder_t *dec = &ctx->decoder;
     ds_config_t *cfg = &ctx->config;
     int hidden = cfg->dec_hidden;
@@ -671,6 +803,14 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
     float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* KV cache bounds: a prefix larger than the cache would write past the
+     * end of this layer's slab into the next layer's (silent corruption). */
+    if (ctx->kv_cache_len + seq_len > ctx->kv_cache_max) {
+        fprintf(stderr, "ds_decoder_prefill: prefix %d + cached %d exceeds KV cache %d\n",
+                seq_len, ctx->kv_cache_len, ctx->kv_cache_max);
+        return -1;
+    }
 
     /* Allocate prefill buffers */
     float *x = (float *)malloc(seq_len * hidden * sizeof(float));
@@ -768,27 +908,33 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             fprintf(stderr, "Dumped layer 0 Q/K/V/x_norm for Python comparison\n");
         }
 
-        /* Apply RoPE using precomputed cache */
+        /* Apply RoPE using precomputed cache (V4: page2d 表) */
         {
             int base = ctx->kv_cache_len;
-            ds_apply_rope_neox(Q, ctx->rope_cache_cos + base * head_dim,
-                               ctx->rope_cache_sin + base * head_dim,
-                               seq_len, n_heads, head_dim);
-            ds_apply_rope_neox(K, ctx->rope_cache_cos + base * head_dim,
-                               ctx->rope_cache_sin + base * head_dim,
-                               seq_len, n_kv_heads, head_dim);
+            float *cos_p, *sin_p;
+            if (cfg->model_version == 4) {
+                extern void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which);
+                cos_p = (float *)ds_dash_rope_row(ctx, base, 0);
+                sin_p = (float *)ds_dash_rope_row(ctx, base, 1);
+            } else {
+                cos_p = ctx->rope_cache_cos + base * head_dim;
+                sin_p = ctx->rope_cache_sin + base * head_dim;
+            }
+            ds_apply_rope_neox(Q, cos_p, sin_p, seq_len, n_heads, head_dim);
+            ds_apply_rope_neox(K, cos_p, sin_p, seq_len, n_kv_heads, head_dim);
         }
 
         /* Store K, V directly into F32 KV cache (no BF16 conversion) */
         for (int s = 0; s < seq_len; s++) {
             int pos = ctx->kv_cache_len + s;
-            float *cache_k_row = ds_kv_k_row(ctx, l, pos);
-            float *cache_v_row = ds_kv_v_row(ctx, l, pos);
-            ds_kv_store_f32(cache_k_row, K + s * kv_dim, kv_dim);
-            ds_kv_store_f32(cache_v_row, V + s * kv_dim, kv_dim);
+            void *cache_k_row = ds_kv_k_row(ctx, l, pos);
+            void *cache_v_row = ds_kv_v_row(ctx, l, pos);
+            ds_kv_store_row(ctx, cache_k_row, K + s * kv_dim, kv_dim);
+            ds_kv_store_row(ctx, cache_v_row, V + s * kv_dim, kv_dim);
         }
 
-        /* Causal attention (prefill all tokens) — read directly from F32 KV cache */
+        /* Causal attention (prefill all tokens) — read directly from F32 KV cache.
+         * V4: DASH 路由注意力（官方 _infer_prefill_attend + _forward_dense）*/
         {
             int total_kv_len = ctx->kv_cache_len + seq_len;
             float *k_base = ds_kv_k_layer(ctx, l);
@@ -796,9 +942,29 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             int kv_stride = ctx->_kv_row_stride;
 
             float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
-            ds_causal_attention_aligned(attn_out, Q, k_base, v_base,
-                                seq_len, total_kv_len,
-                                n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
+            if (cfg->model_version == 4) {
+                ds_dash_attention_prefill(ctx, l, x, Q, seq_len, attn_out);
+            } else if (ctx->kv_bf16) {
+                /* BF16 KV: 整层 K/V 展开到 F32 scratch（每层每 prefill 一次），
+                 * 元素值 = 存储的 bf16 精确展开，批量注意力数学不变 */
+                if (!ctx->kv_pf_scratch_k) {
+                    size_t region = (size_t)ctx->kv_cache_max * kv_stride;
+                    ctx->kv_pf_scratch_k = malloc(region * sizeof(float));
+                    ctx->kv_pf_scratch_v = malloc(region * sizeof(float));
+                    if (!ctx->kv_pf_scratch_k || !ctx->kv_pf_scratch_v) return -1;
+                }
+                ds_bf16_to_f32_batch(ctx->kv_pf_scratch_k, (const uint16_t *)k_base,
+                                     (size_t)total_kv_len * kv_stride);
+                ds_bf16_to_f32_batch(ctx->kv_pf_scratch_v, (const uint16_t *)v_base,
+                                     (size_t)total_kv_len * kv_stride);
+                ds_causal_attention_aligned(attn_out, Q, ctx->kv_pf_scratch_k, ctx->kv_pf_scratch_v,
+                                    seq_len, total_kv_len,
+                                    n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
+            } else {
+                ds_causal_attention_aligned(attn_out, Q, k_base, v_base,
+                                    seq_len, total_kv_len,
+                                    n_heads, n_kv_heads, head_dim, scale, ctx->kv_cache_len, kv_stride);
+            }
 
             /* Output projection + residual */
             float *proj_out = (float *)malloc(seq_len * hidden * sizeof(float));
@@ -1134,6 +1300,12 @@ void ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
     }
 
     free(x); free(x_norm); free(Q); free(K); free(V);
+    /* BF16 KV 的整层展开 scratch 用完即释（−84MB 驻留，r2 任务2/3） */
+    free(ctx->kv_pf_scratch_k);
+    free(ctx->kv_pf_scratch_v);
+    ctx->kv_pf_scratch_k = NULL;
+    ctx->kv_pf_scratch_v = NULL;
+    return 0;
 }
 
 /* ========================================================================
@@ -1240,13 +1412,13 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     }
 
     /* BF16 intermediate truncation: match Python's autocast("cuda", dtype=bfloat16).
-     * Python computes the entire decoder in BF16, including attention Q/K/V,
-     * attention scores, and the final RMSNorm output before LM head.
-     * C's F32 path produces higher-precision logits where EOS tends to dominate.
-     * Truncating the final hidden state to BF16 before LM head makes logits
-     * closer to Python's distribution, reducing the EOS-vs-content logit gap. */
+     * Applied for ALL versions and unconditionally, aligning the decode path
+     * with ds_decoder_prefill (which always truncates the final hidden state
+     * before the LM head). Previously only V3 truncated here, so V1/V2 decode
+     * steps ran at a different precision than the prefill that produced the
+     * first token. */
     extern int ds_bf16_simulate_python;
-    if (ds_bf16_simulate_python && cfg->model_version == 3) {
+    if (ds_bf16_simulate_python) {
         ds_bf16_truncate_array(x, hidden);
     }
 
@@ -1285,8 +1457,14 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
          * one exclusion-argmax pass (~8ms) replaces the old fallback that
          * computed full 129280-way logits via sgemm (60ms+ plus a one-time
          * 631MB BF16→F32 LM head conversion). */
-        int banned[32];              /* 本步被 n-gram 规则禁止的 token（贪心解码专用） */
+        int banned[48];              /* 本步被禁的 token：warmup ban + n-gram 规则 */
         int n_banned = 0;
+        /* Warmup ban (min_new_tokens): EOS（V3 另加 Ġ）直接进入排除表，
+         * 让流式 argmax 从"当前步"的分布里选出真正的次优 token。
+         * 旧实现是在调用方用"陈旧的 prefill logits"做事后抑制，
+         * 会选到与当前步无关甚至连续重复的 token。 */
+        for (int b = 0; b < ctx->dec_argmax_n_ban && b < 8; b++)
+            banned[n_banned++] = ctx->dec_argmax_ban[b];
         int ngram_n = ctx->no_repeat_ngram_size;
         if (ngram_n > 0 && ctx->token_history_len >= ngram_n - 1) {
             /* n-gram 阻断理论（HuggingFace no_repeat_ngram_size）：
@@ -1309,7 +1487,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
                         if (banned[b] == banned_tok) { dup = 1; break; }
                     }
                     if (!dup) {
-                        if (n_banned >= 32) goto full_logits_path;  /* pathological */
+                        if (n_banned >= 40) goto full_logits_path;  /* pathological */
                         banned[n_banned++] = banned_tok;
                     }
                 }
@@ -1318,7 +1496,7 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
 
         /* Step 1: Argmax over all rows — GPU path if DS_METAL_LM env var set */
         int best_token;
-        if (ctx->metal_ctx && ds_metal_is_available(ctx->metal_ctx) && getenv("DS_METAL_LM") && n_banned == 0) {
+        if (ctx->metal_ctx && ctx->metal_lm_env && ds_metal_is_available(ctx->metal_ctx) && n_banned == 0) {
             best_token = ds_metal_lm_head_argmax(ctx->metal_ctx, x, lm_w, hidden, vocab);
         } else if (n_banned > 0) {
             /* 有禁用 token：单次排除式 argmax（~8ms），跳过 sgemm 全量回退 */
@@ -1384,6 +1562,11 @@ full_logits_path:
                 if (ds_verbose >= 1)
                     fprintf(stderr, "LM head: converted %zu BF16→F32 weights for sgemm (%.1f MB)\n",
                             n, n * sizeof(float) / 1048576.0);
+                /* F32 副本就绪后丢弃 bf16 源页（−0.66GB；回退路径触碰时重入） */
+                {
+                    extern void ds_drop_source_pages(const void *p, size_t bytes);
+                    ds_drop_source_pages(dec->lm_head_bf16, n * sizeof(uint16_t));
+                }
             }
             if (ctx->lm_head_f32) {
                 ds_f32_matvec_sgemm(logits, x, ctx->lm_head_f32, hidden, vocab);
@@ -1411,6 +1594,10 @@ full_logits_path:
                 size_t n = (size_t)vocab * hidden;
                 ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
                 ctx->lm_head_f32_ready = 1;
+                {
+                    extern void ds_drop_source_pages(const void *p, size_t bytes);
+                    ds_drop_source_pages(dec->lm_head_bf16, n * sizeof(uint16_t));
+                }
             }
             if (ctx->lm_head_f32) {
                 ds_f32_matvec_sgemm(logits, x, ctx->lm_head_f32, hidden, vocab);
@@ -1506,6 +1693,12 @@ full_logits_path:
         }
     }
 
+    /* Warmup ban tokens (min_new_tokens) — same semantics as the fast path */
+    for (int b = 0; b < ctx->dec_argmax_n_ban; b++) {
+        int t = ctx->dec_argmax_ban[b];
+        if (t >= 0 && t < vocab) logits[t] = -1e30f;
+    }
+
     /* Find argmax from logits */
     int token = 0;
     float best = logits[0];
@@ -1580,6 +1773,12 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
     float scale = 1.0f / sqrtf((float)head_dim);
     int kv_stride = ctx->_kv_row_stride;
 
+    if (ctx->kv_cache_len + n_tokens > ctx->kv_cache_max) {
+        fprintf(stderr, "ds_decoder_forward_batch: %d + cached %d exceeds KV cache %d\n",
+                n_tokens, ctx->kv_cache_len, ctx->kv_cache_max);
+        return;
+    }
+
     /* Allocate batch buffers */
     float *x = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
     float *x_norm = (float *)malloc((size_t)n_tokens * hidden * sizeof(float));
@@ -1621,8 +1820,8 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
         /* Store K, V in F32 cache */
         for (int s = 0; s < n_tokens; s++) {
             int pos = cache_offset + s;
-            ds_kv_store_f32(ds_kv_k_row(ctx, l, pos), K + s * kv_dim, kv_dim);
-            ds_kv_store_f32(ds_kv_v_row(ctx, l, pos), V + s * kv_dim, kv_dim);
+            ds_kv_store_row(ctx, ds_kv_k_row(ctx, l, pos), K + s * kv_dim, kv_dim);
+            ds_kv_store_row(ctx, ds_kv_v_row(ctx, l, pos), V + s * kv_dim, kv_dim);
         }
 
         /* Causal attention — batched, with aligned stride */
@@ -1670,7 +1869,7 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
             /* MoE — per-token (same as decode path, no batch benefit for MoE routing) */
             for (int s = 0; s < n_tokens; s++) {
                 float *mlp_out = ctx->dec_expert_out;
-                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, ctx->metal_ctx, l,
+                mlp_forward(mlp_out, x_norm + s * hidden, layer, cfg, ctx, l,
                             ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                             ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
                             ctx->moe_expert_gate_up_buf, ctx->moe_expert_hidden_buf,
@@ -1698,6 +1897,10 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
                     size_t n = (size_t)cfg->vocab_size * hidden;
                     ctx->lm_head_f32 = ds_bf16_to_f32_alloc(dec->lm_head_bf16, n);
                     ctx->lm_head_f32_ready = 1;
+                    {
+                        extern void ds_drop_source_pages(const void *p, size_t bytes);
+                        ds_drop_source_pages(dec->lm_head_bf16, n * sizeof(uint16_t));
+                    }
                 }
                 ds_f32_matvec_sgemm(ctx->dec_logits, norm_buf, ctx->lm_head_f32, hidden, cfg->vocab_size);
             } else {
@@ -1756,5 +1959,6 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
 
 int ds_decoder_load(ds_ctx_t *ctx) {
     /* Weight loading is done in ds_ocr.c during ds_load() */
+    (void)ctx;
     return 0;
 }

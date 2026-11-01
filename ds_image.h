@@ -105,7 +105,7 @@ ds_image_t *ds_image_pad(const ds_image_t *img, int target_size, unsigned char p
 
 /* ds_image_to_float_chw — 图像转F32张量（NCHW格式）
  *
- * 将 uint8 RGB像素 [0,255] 归一化为 float32 [0,1]
+ * 将 uint8 RGB像素 [0,255] 归一化到 [-1,1]（mean=0.5, std=0.5）
  * 输出格式: NCHW（通道在前）= [3, height, width]
  *
  * 输出布局:
@@ -117,8 +117,8 @@ ds_image_t *ds_image_pad(const ds_image_t *img, int target_size, unsigned char p
  *   - ds_conv2d() 内核期望 NCHW 输入
  *   - 这与 PyTorch/CUDA 的默认布局一致
  *
- * 归一化: pixel_f32 = pixel_uint8 / 255.0
- * 注意: SAM 不做 ImageNet 标准化(mean/std)，只做 [0,1] 归一化
+ * 归一化: pixel_f32 = pixel_uint8 / 255.0 * 2 - 1
+ * 注意: 与 Python 的 BasicImageTransform(mean=0.5, std=0.5) 一致，归一化到 [-1,1]
  */
 float *ds_image_to_float_chw(const ds_image_t *img);
 

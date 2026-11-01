@@ -180,6 +180,13 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
                                 float scale, int kv_stride,
                                 int prefill_len, int window_start, int kv_seq_len);
 
+/* BF16 KV 感知的 R-SWA 入口（r2 任务2）: K/V 为 void*（bf16 时按 uint16 行读，
+ * 元素 = bf16 精确展开；warmup（window_start==prefill_len）与 F32 全量因果逐位一致） */
+void ds_rswa_attention_aligned_bf16(float *out, const float *Q, const void *K_base, const void *V_base,
+                                    int seq_q, int n_heads, int n_kv_heads, int head_dim,
+                                    float scale, int kv_stride,
+                                    int prefill_len, int window_start, int kv_seq_len, int bf16);
+
 /*
  * Mixed attention for DeepEncoder V2: visual tokens use bidirectional,
  * causal flow queries use causal attention.
@@ -279,6 +286,18 @@ float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
 void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
                          const float *b, int in_dim, int out_dim);
 
+/* Grouped row-parallel matvec (decode MoE fast path, r4):
+ * out[u * rows_per_unit + r] = W[u][r] · X[u]  for all u in [0,n_units), r in [0,rows_per_unit)
+ *
+ * 所有单元的输出行合并为一个线程池并行区——旧实现每专家 2-3 次独立 matvec，
+ * 每层 ~19 个微小型并行区，barrier 同步开销大于矩阵本身（t1 与 t14 解码同速）。
+ * 输入按单元给出（X[u]）: gate/up 共享同一 x，down 用各自专家的 SwiGLU 输出。
+ * 行对（2r, 2r+1）永不跨线程拆分，每行仍由同一 NEON 内核按成对路径累加
+ * ——落单行会走不同的求和顺序（2 组累加器 vs 8 组），故必须以行对为切分粒度
+ * 才能保证与逐专家串行版本逐位一致。rows_per_unit 必须为偶数。 */
+void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *const *W,
+                             int n_units, int rows_per_unit, int in_dim);
+
 /* ========================================================================
  * Threading
  * ======================================================================== */
@@ -325,6 +344,12 @@ static inline float ds_fast_expf(float x) {
     u.i = (uint32_t)(12102203.0f * x + 1064866805.0f);
     return u.f;
 }
+
+/* ── BF16 存储的 K/V 行 × F32 Q 点积（V3/V4 BF16 KV 缓存读取路径）──────
+ * bf16→f32 展开是精确的（左移 16 位），点积顺序与 F32 存储一致；
+ * 数值差异仅来自存入时的 bf16 舍入（任务书 r2 任务 2 授权的有界实验）。 */
+float ds_dot_bf16xf32(const uint16_t *k, const float *q, int n);
+void ds_axpy_bf16xf32(float *o, const uint16_t *v, float w, int n);
 
 /* ========================================================================
  * BF16 → F32 Weight Conversion (for sgemm cache)

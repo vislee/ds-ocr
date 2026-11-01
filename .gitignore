@@ -4,6 +4,8 @@ build/
 *.dSYM/
 ds_ocr
 ds_ocr_asan
+test_ds_ocr
+test_int4
 *.metallib
 
 # Debug dumps
@@ -43,3 +45,11 @@ CLAUDE.md
 *.jpg
 unlimited-ocr/
 ME1782374049768.png
+
+# Coverage artifacts
+*.gcda
+*.gcno
+*.gcov
+# Local scratch
+1
+docs/intert/

@@ -61,6 +61,7 @@
  */
 
 #include "ds_deep_encoder.h"
+#include <pthread.h>
 #include "ds_kernels.h"
 #include "ds_safetensors.h"
 #include "ds_dump.h"
@@ -218,6 +219,8 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
                                 const unsigned char *rgb_pixels, int width, int height, int channels,
                                 const float *sam_features, int n_sam_tokens,
                                 int *out_seq_len) {
+    /* CLIP 直接消费 SAM 特征，原始像素参数仅为保持公共 API 兼容 */
+    (void)rgb_pixels; (void)width; (void)height; (void)channels;
     ds_clip_encoder_t *clip = &ctx->clip_encoder;
     ds_config_t *cfg = &ctx->config;
     int clip_dim = DS_CLIP_HIDDEN; /* 1024 */
@@ -378,8 +381,9 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
     int concat_len = 0;
     int proj_in_dim = 0;
 
-    if ((cfg->model_version == 1 || cfg->model_version == 3) && clip_output_len == n_sam_tokens) {
-        /* V1/V3: CLIP and SAM have same token count (256 each for 1024×1024 input)
+    if ((cfg->model_version == 1 || cfg->model_version == 3 || cfg->model_version == 4)
+        && clip_output_len == n_sam_tokens) {
+        /* V1/V3/V4: CLIP and SAM have same token count (256 each for 1024×1024 input)
          * Concat: [256, 1024] + [256, 1024] → [256, 2048] along feature dim */
         concat_len = clip_output_len;
         proj_in_dim = clip_dim + cfg->sam_ds2_dim; /* 1024 + 1024 = 2048 */
@@ -417,11 +421,10 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
     }
     free(concat_features);
 
-    if (cfg->model_version == 1 || cfg->model_version == 3) {
+    if (cfg->model_version == 1 || cfg->model_version == 3 || cfg->model_version == 4) {
         /* =====================================================================
          * Insert image_newline between grid rows + append view_seperator
-         * =====================================================================
-         * Both V1 and V3 need this layout:
+         * Both V1/V3/V4 need this layout:
          * Python code:
          *   global_features = proj_output.view(h, w, n_dim)
          *   global_features = cat([global_features, image_newline[None,None,:].expand(h,1,n_dim)], dim=1)
@@ -503,7 +506,7 @@ static void enc_linear_f64acc(float *y, const float *x, const float *W, const fl
     }
 }
 
-static void enc_linear_nobias_f64acc(float *y, const float *x, const float *W,
+static void __attribute__((unused)) enc_linear_nobias_f64acc(float *y, const float *x, const float *W,
                                        int seq_len, int in_dim, int out_dim) {
     enc_linear_f64acc(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
@@ -552,73 +555,129 @@ static void enc_apply_rope(float *q, float *k, int seq_len, int n_q_heads,
     }
 }
 
+/* ── DeepEncoder 注意力 head 并行门控 ─────────────────────────────────
+ * enc_gqa_mixed_attention 按 head 切分：每个 (head, query) 输出元素
+ * 独立计算、写区间不相交 → 逐位一致（回归 CER 保持 0.00）。
+ * 线程数 DS_ENC_ATTN_THREADS（默认 4）。 */
+int ds_enc_attn_parallel = 4;   /* 线程预算: 0=关，N=注意力用 N 线程 */
+
+/* 线程局部影子（ds_sam_thread_gates 钉住）；未钉住时用全局默认 */
+static __thread int tl_enc_budget;
+static __thread int tl_enc_pinned;
+void ds_enc_thread_gate(int budget) { tl_enc_budget = budget; tl_enc_pinned = 1; }
+int ds_enc_gate_budget(void) { return tl_enc_pinned ? tl_enc_budget : ds_enc_attn_parallel; }
+
 /* GQA attention with mixed mask (bidirectional for visual, causal for flow)
  * Uses float64 for QK^T dot product, softmax, and V accumulation to mitigate
  * precision drift in the 24-layer DeepEncoder pipeline. */
+/* 处理单个 head（与串行逐位一致：每个 (h,qi) 的计算顺序不变） */
+typedef struct {
+    const float *Q, *K, *V;
+    float *out;
+    int visual_len, total_len, n_q_heads, n_kv_heads, head_dim;
+    int tid, nthreads;
+} enc_attn_task_t;
+
+static void enc_attn_process_head(const enc_attn_task_t *t, int h) {
+    const int total_len = t->total_len, visual_len = t->visual_len;
+    const int n_q_heads = t->n_q_heads, n_kv_heads = t->n_kv_heads, head_dim = t->head_dim;
+    const int kv_group_size = n_q_heads / n_kv_heads;
+    const float *Q = t->Q, *K = t->K, *V = t->V;
+    float *out = t->out;
+    double scale = 1.0 / sqrt((double)head_dim);
+    int kv_h = h / kv_group_size;
+    double *o_row_d = (double *)malloc(head_dim * sizeof(double));
+    for (int qi = 0; qi < total_len; qi++) {
+        const float *q_vec = Q + qi * n_q_heads * head_dim + h * head_dim;
+
+        int vis_end;
+        if (qi < visual_len) {
+            vis_end = visual_len;
+        } else {
+            vis_end = qi + 1;
+        }
+
+        /* Float64 online softmax with QK^T and V accumulation */
+        double max_score = -1e30;
+        double sum_exp = 0.0;
+        for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
+
+        for (int ki = 0; ki < vis_end; ki++) {
+            const float *k_vec = K + ki * n_kv_heads * head_dim + kv_h * head_dim;
+            const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
+
+            /* Float64 QK dot product */
+            double s = 0.0;
+            for (int d = 0; d < head_dim; d++)
+                s += (double)q_vec[d] * (double)k_vec[d];
+            s *= scale;
+
+            if (s > max_score) {
+                double correction = exp(max_score - s);
+                sum_exp = sum_exp * correction + 1.0;
+                for (int d = 0; d < head_dim; d++)
+                    o_row_d[d] = o_row_d[d] * correction + (double)v_vec[d];
+                max_score = s;
+            } else {
+                double wt = exp(s - max_score);
+                sum_exp += wt;
+                for (int d = 0; d < head_dim; d++)
+                    o_row_d[d] += wt * (double)v_vec[d];
+            }
+        }
+
+        float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
+        if (sum_exp > 0.0) {
+            double inv = 1.0 / sum_exp;
+            for (int d = 0; d < head_dim; d++)
+                out_vec[d] = (float)(o_row_d[d] * inv);
+        } else {
+            for (int d = 0; d < head_dim; d++) out_vec[d] = 0.0f;
+        }
+    }
+    free(o_row_d);
+}
+
+static void *enc_attn_worker(void *arg) {
+    enc_attn_task_t *t = (enc_attn_task_t *)arg;
+    for (int h = t->tid; h < t->n_q_heads; h += t->nthreads)
+        enc_attn_process_head(t, h);
+    return NULL;
+}
 static void enc_gqa_mixed_attention(float *out, const float *Q, const float *K,
                                      const float *V, int visual_len, int total_len,
                                      int n_q_heads, int n_kv_heads, int head_dim) {
-    double scale = 1.0 / sqrt((double)head_dim);
-    int kv_group_size = n_q_heads / n_kv_heads;
-
-    /* Allocate double buffer for V accumulation */
-    double *o_row_d = (double *)malloc(head_dim * sizeof(double));
-
-    for (int h = 0; h < n_q_heads; h++) {
-        int kv_h = h / kv_group_size;
-
-        for (int qi = 0; qi < total_len; qi++) {
-            const float *q_vec = Q + qi * n_q_heads * head_dim + h * head_dim;
-
-            int vis_end;
-            if (qi < visual_len) {
-                vis_end = visual_len;
-            } else {
-                vis_end = qi + 1;
-            }
-
-            /* Float64 online softmax with QK^T and V accumulation */
-            double max_score = -1e30;
-            double sum_exp = 0.0;
-            for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
-
-            for (int ki = 0; ki < vis_end; ki++) {
-                const float *k_vec = K + ki * n_kv_heads * head_dim + kv_h * head_dim;
-                const float *v_vec = V + ki * n_kv_heads * head_dim + kv_h * head_dim;
-
-                /* Float64 QK dot product */
-                double s = 0.0;
-                for (int d = 0; d < head_dim; d++)
-                    s += (double)q_vec[d] * (double)k_vec[d];
-                s *= scale;
-
-                if (s > max_score) {
-                    double correction = exp(max_score - s);
-                    sum_exp = sum_exp * correction + 1.0;
-                    for (int d = 0; d < head_dim; d++)
-                        o_row_d[d] = o_row_d[d] * correction + (double)v_vec[d];
-                    max_score = s;
-                } else {
-                    double wt = exp(s - max_score);
-                    sum_exp += wt;
-                    for (int d = 0; d < head_dim; d++)
-                        o_row_d[d] += wt * (double)v_vec[d];
-                }
-            }
-
-            float *out_vec = out + qi * n_q_heads * head_dim + h * head_dim;
-            if (sum_exp > 0.0) {
-                double inv = 1.0 / sum_exp;
-                for (int d = 0; d < head_dim; d++)
-                    out_vec[d] = (float)(o_row_d[d] * inv);
-            } else {
-                for (int d = 0; d < head_dim; d++) out_vec[d] = 0.0f;
-            }
+    enc_attn_task_t task = {
+        .Q = Q, .K = K, .V = V, .out = out,
+        .visual_len = visual_len, .total_len = total_len,
+        .n_q_heads = n_q_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim,
+        .tid = 0, .nthreads = 1,
+    };
+    int nth = 1;
+    int budget = ds_enc_gate_budget();
+    if (budget > 0 && ds_get_threads() > 1 && n_q_heads >= 4) {
+        nth = budget;
+        const char *e = getenv("DS_ENC_ATTN_THREADS");
+        if (e && e[0]) { int v = atoi(e); if (v > 0) nth = v; }
+        if (nth > n_q_heads) nth = n_q_heads;
+    }
+    if (nth > 1) {
+        pthread_t *th = (pthread_t *)malloc((nth - 1) * sizeof(pthread_t));
+        enc_attn_task_t *dt = (enc_attn_task_t *)malloc(nth * sizeof(enc_attn_task_t));
+        for (int i = 1; i < nth; i++) {
+            dt[i] = task; dt[i].tid = i; dt[i].nthreads = nth;
+            pthread_create(&th[i - 1], NULL, enc_attn_worker, &dt[i]);
         }
+        task.nthreads = nth;
+        enc_attn_worker(&task);
+        for (int i = 1; i < nth; i++) pthread_join(th[i - 1], NULL);
+        free(th); free(dt);
+    } else {
+        for (int h = 0; h < n_q_heads; h++) enc_attn_process_head(&task, h);
     }
 
-    free(o_row_d);
 }
+
 
 static void enc_v2_layer_forward(float *out, const float *x,
                                   ds_ctx_t *ctx, int layer_idx,
@@ -843,5 +902,6 @@ float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
 
 /* Weight Loading (done in ds_ocr.c during ds_load()) */
 int ds_encoder_load(ds_ctx_t *ctx) {
+    (void)ctx;
     return 0;
 }
