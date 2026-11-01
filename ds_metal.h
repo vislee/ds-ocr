@@ -9,6 +9,13 @@
  * BF16 weights loaded via mmap are directly wrapped as Metal buffers
  * (MTLStorageModeShared), so CPU and GPU share the same physical memory
  * with no data transfer overhead.
+ *
+ * 【性能语境】(docs/09 §1 roofline) decode 每步只有 ~1.15 GFLOP 但要读
+ * 数 GB 权重——带宽受限负载。GPU 的价值在把 token 间串行等待的内存
+ * 延迟换成大带宽；零拷贝注册（register_* 不复制权重）保证 GPU 路径
+ * 不引入 H2D 传输，unified memory 下 CPU/GPU 读同一物理页。
+ * 【docs/09 §6 决策树的位置】Metal 是 CPU SIMD（bfdot/vshll/AVX）之上的
+ * 可选加速层：初始化失败或 --no-metal 时逐层回退 CPU 内核，语义不变。
  */
 
 #ifndef DS_METAL_H

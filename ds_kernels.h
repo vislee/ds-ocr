@@ -12,9 +12,13 @@
  *   第一级 (generic): 纯C99可移植实现，任何平台均可运行
  *   第二级 (NEON/AVX): SIMD加速，ARM NEON(Apple Silicon)或x86 AVX2+FMA
  *   第三级 (BLAS): cblas_sgemm加速大规模矩阵运算(macOS Accelerate/Linux OpenBLAS)
+ *   平台分发决策树见 docs/09 §6.1（bfdot/vshll 按指令集细分，运行时探测）；
+ *   本头文件是三级共享的公共接口，impl 细节在 ds_kernels_impl.h。
  *
- * 【BF16→F32 on-the-fly 转换】
- *   权重以BF16格式mmap加载(零拷贝)，matvec计算时即时转F32，节省50%存储
+ * 【BF16→F32 on-the-fly 转换】(docs/03 §3.2-3.3；docs/09 §2.2)
+ *   权重以BF16格式mmap加载(零拷贝)，matvec计算时即时转F32，节省50%存储。
+ *   BF16↔F32 只差一条左移：BF16 位模式 << 16 即 F32 位模式（指数位对齐），
+ *   转换发生在寄存器内，权重永远不落盘为 F32。
  *
  * 【关键函数对照表】(对应文档理论概念)
  *   ds_linear_nobias_bf16()     — BF16权重线性变换(解码器核心操作)
@@ -44,10 +48,11 @@
  * Basic Operations
  * ======================================================================== */
 
-void ds_add_inplace(float *a, const float *b, int n);
-void ds_mul_inplace(float *a, const float *b, int n);
-void ds_scale(float *x, float s, int n);
-void ds_copy(float *dst, const float *src, int n);
+/* 以下四个均为 O(n) 逐元素原地操作，线程安全（无共享状态），无同步开销 */
+void ds_add_inplace(float *a, const float *b, int n);  /* a[i] += b[i]（残差累加） */
+void ds_mul_inplace(float *a, const float *b, int n);  /* a[i] *= b[i] */
+void ds_scale(float *x, float s, int n);               /* x[i] *= s */
+void ds_copy(float *dst, const float *src, int n);     /* memcpy 语义 dst ← src */
 
 /* ========================================================================
  * Matrix Operations
@@ -60,10 +65,13 @@ void ds_matmul_t(float *C, const float *A, const float *B, int M, int K, int N);
 void ds_linear(float *y, const float *x, const float *W, const float *b,
                int seq_len, int in_dim, int out_dim);
 
+/* 同 ds_linear 但 b=NULL（Transformer 投影均无 bias）；F32 权重版 */
 void ds_linear_nobias(float *y, const float *x, const float *W,
                        int seq_len, int in_dim, int out_dim);
 
-/* bf16 weight variants */
+/* bf16 weight variants — BF16 权重线性层，内部按 seq_len 自动选路：
+ * seq_len==1 走平台 BF16 matvec（带宽优化），seq_len>1 转 F32 后走 BLAS
+ * sgemm（吞吐优化）。详见 ds_kernels.c 中同名函数的实现注释。 */
 void ds_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                     const float *b, int seq_len, int in_dim, int out_dim);
 
@@ -77,6 +85,8 @@ void ds_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                 const uint16_t *Wv_bf16,
                                 int in_dim, int q_dim, int kv_dim);
 
+/* ds_matmul_t 的 BF16 权重版：C[M,N] = A[M,K] @ B_bf16[N,K]^T；
+ * M==1 退化为 matvec，M>1 转 F32 视图后进 sgemm */
 void ds_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N);
 
@@ -84,6 +94,9 @@ void ds_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
  * 2D Convolution (for vision tokenizer SAM patch embed + conv compression)
  * ======================================================================== */
 
+/* im2col + sgemm 的标准卷积：in/out 均为 [C,H,W] 通道优先；
+ * h_out=(h_in+2*padding-kh)/stride+1（w_out 同理）；weight[c_out,c_in,kh,kw]。
+ * 实现细节见 ds_kernels.c。 */
 void ds_conv2d(float *out, const float *in, const float *weight, const float *bias,
                int c_in, int c_out, int h_in, int w_in,
                int kh, int kw, int stride, int padding);
@@ -96,7 +109,9 @@ void ds_conv2d(float *out, const float *in, const float *weight, const float *bi
 void ds_layer_norm(float *out, const float *x, const float *weight, const float *bias,
                    int seq_len, int hidden, float eps);
 
-/* RMS Normalization: out = x / rms(x) * weight */
+/* RMS Normalization: out = x / rms(x) * weight
+ * rms(x)=sqrt(mean(x^2))；out/x 均为 [seq_len,hidden]；weight=γ[hidden]；
+ * eps 防除零（解码器 1e-6 量级）。线程安全。 */
 void ds_rms_norm(float *out, const float *x, const float *weight,
                  int seq_len, int hidden, float eps);
 
@@ -110,7 +125,9 @@ void ds_residual_rms_norm(float *out, float *norm_out,
  * This replaces the scalar loops in decoder_layer_forward. */
 void ds_vec_add(float *dst, const float *a, const float *b, int n);
 
-/* Per-head RMS Normalization for Q/K norms in decoder */
+/* Per-head RMS Normalization for Q/K norms in decoder
+ * x: [seq_len, n_heads*head_dim] 原地修改——统计范围是单个 [head_dim] 段
+ * 而非整行（DeepSeek-V2 的 QK-Norm，稳定注意力 logit 量级） */
 void ds_rms_norm_per_head(float *x, const float *weight,
                            int seq_len, int n_heads, int head_dim, float eps);
 
@@ -118,8 +135,11 @@ void ds_rms_norm_per_head(float *x, const float *weight,
  * Activation Functions
  * ======================================================================== */
 
+/* 原地激活：silu(x)=x·σ(x)=x/(1+e^-x)；gelu 为精确 erf 版（0.5x(1+erf(x/√2))） */
 void ds_silu(float *x, int n);
 void ds_gelu(float *x, int n);
+
+/* 逐行 softmax（原地，x:[rows,cols]），内部 max-subtract 防上溢；线程安全 */
 void ds_softmax(float *x, int rows, int cols);
 
 /* out[seq,inter] = SiLU(gate_up[seq,2*inter][:,even]) * gate_up[:,odd] */
@@ -140,6 +160,7 @@ void ds_swiglu_direct(float *out, const float *gate_buf, const float *up_buf,
  * Bidirectional attention (encoder).
  * Q, K, V: [seq, n_heads * head_dim]
  * out: [seq, n_heads * head_dim]
+ * scale = 1/sqrt(head_dim)（调用方算好）；无掩码；online softmax O(1) 额外内存
  */
 void ds_bidirectional_attention(float *out, const float *Q, const float *K,
                                 const float *V, int seq, int n_heads,
@@ -223,7 +244,11 @@ void ds_moe_router(float *scores, const float *x, const float *gate_weight,
 void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weight_bf16,
                           int hidden, int n_experts);
 
-/* Select top-K experts from gate scores. Returns expert indices and weights. */
+/* Select top-K experts from gate scores. Returns expert indices and weights.
+ * 无放回选出得分最高的 top_k 个；top_weights 经选中子集上的 softmax
+ * 重归一化（Σ=1）。本模型典型 n_experts=64、top_k=6。
+ * 注意：解码器真实路径在 ds_moe_decoder.c 内联实现（全体 softmax 后取
+ * 概率、不 renorm，对齐 Python），本函数供测试/工具使用。 */
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
                   int n_experts, int top_k);
 
@@ -245,6 +270,8 @@ void ds_expert_forward_fused(float *out, const float *x,
                               float *gate_up_buf, float *gate_buf,
                               float *up_buf, float *hidden_buf);
 
+/* ds_expert_forward 的 F32 权重 + sgemm 实验路径（DS_USE_F32_EXPERTS）；
+ * 数值与 matvec 路径舍入序列不同，取不到 F32 视图时自动回退 */
 void ds_expert_forward_f32(float *out, const float *x,
                             const uint16_t *gate_bf16, const uint16_t *up_bf16,
                             const uint16_t *down_bf16,
@@ -258,7 +285,9 @@ void ds_expert_forward_legacy(float *out, const float *x,
                        const uint16_t *down_bf16,
                        int hidden, int intermediate);
 
-/* Combine expert outputs with router weights */
+/* Combine expert outputs with router weights
+ * output[hidden] = Σ_k top_weights[k]·expert_outputs[k,hidden]；
+ * expert_outputs 按 [top_k, hidden] 排布，未选中槽位权重应为 0 */
 void ds_expert_combine(float *output, const float *expert_outputs,
                        const int *top_indices, const float *top_weights,
                        int top_k, int hidden);
@@ -302,22 +331,29 @@ void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *c
  * Threading
  * ======================================================================== */
 
-/* Set number of threads for parallel operations (default: 1) */
+/* Set number of threads for parallel operations (default: 1)
+ * n∈[1,16]；非线程安全，须在推理开始前调用（内部会销毁重建线程池） */
 void ds_set_threads(int n);
 int  ds_get_threads(void);
 
-/* Get number of available CPU cores */
+/* Get number of available CPU cores (macOS sysctl / Linux sysconf，失败回退 1) */
 int ds_get_num_cpus(void);
 
-/* Global verbose flag */
+/* Global verbose flag
+ * ds_verbose: 日志级别（≥1 打印 dispatch 选择，≥2 打印线程池/缓存配置）；
+ * ds_bf16_simulate_python: 置 1 时在专家前向的关键中间量上做 BF16 截断，
+ *   逐位对齐 Python 的 BF16 中间精度（调试用，有性能代价） */
 extern int ds_verbose;
 extern int ds_bf16_simulate_python;
 
-/* Thread pool (public for use by ds_quantize.c etc.) */
+/* Thread pool (public for use by ds_quantize.c etc.)
+ * ds_parallel_fn_t: 并行区函数——tid∈[0,n_threads) 各领一个分片，分片写区间
+ *   必须互不相交；ds_parallel_for: fork-join 入口（n_threads≤1 时零开销直调，
+ *   实现细节见 ds_kernels.c 的 ds_worker_loop/ds_parallel_for 注释） */
 typedef void (*ds_parallel_fn_t)(int tid, int n_threads, void *arg);
 void ds_dispatch_ensure_init(void);
 void ds_parallel_for(ds_parallel_fn_t fn, void *arg);
-int ds_get_threads(void);
+int ds_get_threads(void);   /* 与上方重复声明（历史遗留），语义相同 */
 
 /* ========================================================================
  * Timing Utilities
@@ -336,7 +372,12 @@ static inline double ds_time_sec(void) {
 
 /* Fast exp approximation (Schraudolph 1999).
  * Relative error < 1.5%, ~5x faster than expf() on ARM NEON.
- * Available as inline for use across translation units. */
+ * Available as inline for use across translation units.
+ * 原理：利用 IEEE754 位布局，把"指数字段 = 127·2^23 + x·2^23/ln2"直接当成
+ * float 读出——指数域给出 e^x 的量级，尾数域线性近似 2^frac（分段线性逼近）。
+ * 12102203.0f ≈ 2^23/ln2，1064866805.0f 为 Schraudolph 调优的偏置校正常数
+ * （非纯 127<<23）。注意力在线 softmax 与 SwiGLU 使用；编码器精度红线场景
+ * 不用（docs/05 §10.2）。 */
 static inline float ds_fast_expf(float x) {
     if (x < -88.0f) return 0.0f;
     if (x > 88.0f) return 1e38f;
@@ -355,13 +396,16 @@ void ds_axpy_bf16xf32(float *o, const uint16_t *v, float w, int n);
  * BF16 → F32 Weight Conversion (for sgemm cache)
  * ======================================================================== */
 
-/* Convert BF16 weights to F32 buffer. Caller must free the result. */
+/* Convert BF16 weights to F32 buffer. Caller must free the result.
+ * 转换是精确的位展开（<<16），无舍入 */
 float *ds_bf16_to_f32_alloc(const uint16_t *src, size_t n);
 
-/* Batched BF16→F32 conversion into pre-allocated dst */
+/* Batched BF16→F32 conversion into pre-allocated dst
+ * 大缓冲（≥64K 元素）自动切线程池并行 */
 void ds_bf16_to_f32_convert(float *dst, const uint16_t *src, size_t n);
 
-/* NEON-optimized batch BF16↔F32 conversion (auto-dispatched) */
+/* NEON-optimized batch BF16↔F32 conversion (auto-dispatched)
+ * 反向（F32→BF16）走 +0x8000 进位舍入；NEON 平台用向量化实现 */
 void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n);
 void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n);
 

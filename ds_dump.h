@@ -3,6 +3,18 @@
  *
  * Enable with: DS_DUMP_TENSORS=1 environment variable
  * Dumps matching tensors that can be compared with Python dump_tensors.py output.
+ *
+ * 【设计动机】(docs/06 §6.3/6.4 两次位置编码事故的验证手段)
+ * C 实现与 Python 参考的分叉靠肉眼和日志根本看不出来——幻觉/孤儿标签
+ * 只是最末端的症状。本工具把 C 端关键中间量（patch_embed、QKV、neck、
+ * 位置表插值结果）dump 成统计行 + 二进制 .bin，与 Python 端同名 hook
+ * 的输出逐位对拍：mean/std/first20 一眼定差异在哪个层引入。
+ *
+ * 【使用模式】
+ *   DS_DUMP_TENSORS=1 ./ds_ocr -d models/... -i img.png  → stderr 统计
+ *                                                        + dump/*.bin
+ *   tools/regress.sh / dump_tensors.py 消费 .bin 做精确比较
+ *   g_dump_crop_id：多裁剪时给 dump 文件名加 crop 前缀，避免互踩
  */
 
 #ifndef DS_DUMP_H
@@ -31,6 +43,9 @@ static int ds_dump_enabled(void) {
  * n: total number of elements
  * shape_info: human-readable shape string e.g. "[256, 896]"
  */
+/* ds_dump_tensor - 统计 + first20 + 二进制三件套。
+ * name 必须与 Python hook 同名——对拍脚本靠名字配对。统计行放 stderr
+ * （不污染 stdout 的 OCR 结果），二进制放 dump/ 目录做逐位比较。 */
 static void ds_dump_tensor(const char *name, const float *data, int n,
                            const char *shape_info) {
     if (!ds_dump_enabled()) return;
