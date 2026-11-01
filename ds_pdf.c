@@ -1,6 +1,11 @@
 /*
  * ds_pdf.c - PDF rendering stub for non-macOS platforms.
  * ds_pdf.c — 非 macOS 平台的 PDF 渲染桩（保持零外部依赖，返回失败）
+ *
+ * 【设计意图】PDF 输入的真实实现在 ds_pdf.m（macOS 专属，CoreGraphics/
+ * PDFKit），使 main.c 的 -i file.pdf 在所有平台上都能编译通过——非
+ * macOS 平台链接本桩，运行时返回 NULL/-1 并提示。这是"平台能力下沉到
+ * 平台文件、公共 API 保持一致"的分层：调用方不需要 #ifdef。
  */
 
 #include "ds_pdf.h"

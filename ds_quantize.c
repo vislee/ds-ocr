@@ -8,24 +8,41 @@
  * MoE 解码器的专家权重占模型总参数的大头（64路由专家×2层=128组）
  * BF16 存储需要 ~2× 内存，INT8 压缩到 ~1×（50%节省），误差 < 0.01 RMS
  *
- * 【量化格式：逐行不对称 INT8】
+ * 【量化格式：逐行不对称 INT8】(docs/09 §3.1-3.2)
  *   对每个输出行 r：
  *     min_val = min(W[r, :])
  *     max_val = max(W[r, :])
  *     scale   = (max_val - min_val) / 255.0
  *     idx[j]  = clamp(round((W[r,j] - min_val) / scale), 0, 255)
- *   反量化: W[r,j] = scale[r] * idx[r,j] + offset[r]
+ *   反量化: W[r,j] = scale[r] * (idx[r,j] + 128) + offset[r]
+ *   offset 存 min 而非 zero-point，节省一次减法；scale 预计算倒数，
+ *   循环内只做乘法。手算算例见 docs/09 §3.2（最大误差 = scale/2）。
  *
- * 【优化技巧：分解计算】
+ * 【量化粒度：为什么 per-row】(docs/09 §3.4)
+ *   per-tensor 一个 scale 会被 outlier 行拉爆格距；per-group 是真 INT4
+ *   的必需品（本工程未做）。同一输出通道的连接强度分布相近，一个
+ *   scale 足够。元数据开销可忽略：gate_up_fused [1792,1280] 的
+ *   scale+offset 仅 14 KB，占 4.59 MB 权重的 0.31%。
+ *
+ * 【命名澄清："--int4" 里没有任何 INT4】(docs/09 §3.5)
+ *   Int4 是历史命名（flag 兼容性保留）。实际按 255 级量化（INT4 只有
+ *   15 级）；覆盖 11 层 MoE 的 64 路由专家 + 2 共享专家的 gate_up_fused
+ *   与 down_weight；Layer 0 稠密 FFN、注意力投影、路由 gate、LM head
+ *   保持 BF16。验收线 RMS<0.01（ds_quantize.h），实测 0.0043-0.0044
+ *   （test_int4 固定种子），真实权重口径 0.007-0.010（README）。
+ *   真 INT4 需要 per-group + GPTQ/AWQ 校准，超出教学引擎边界 (§3.6)。
+ *
+ * 【优化技巧：分解计算】(docs/09 §3.3)
  *   把 y[r] = scale[r] * dot(qrow+128, x) + offset[r] * sum(x)
- *   拆成两个独立的归约，分别用 SIMD 加速
+ *   拆成两个独立的归约（dot 与 x_sum），一遍扫描同时完成——
+ *   避免朴素做法"先逐元素反量化再乘加"的两遍内存流量。
  *
  * 【平台支持】
  *   Apple M2+ (NEON + FEAT_BF16): NEON 路径
  *   Apple M1 (NEON only): NEON 路径（无 dotprod, 手动 widen）
  *   x86 AVX2: generic C 路径
  *
- * 参考文档: 03-推理引擎实战篇.md — 量化与内核优化
+ * 参考文档: docs/09-量化与部署篇.md §3；docs/03-推理引擎实战篇.md
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -181,6 +198,10 @@ void ds_int4_dequantize_f32(float *out, const ds_int4_block_t *block) {
  * ds_int4_quant_error_rms() — 计算量化误差的 RMS（相对原始值）
  * 用于评估量化精度，通常 < 0.01（对比 INT4 的 0.13-0.21）
  */
+/* 误差度量 = sqrt(Σ(orig-deq)² / Σorig²)，即相对 RMS。
+ * docs/09 §2.3 的理论值：INT8 均匀格点 255 级 → 理想 0.39%，
+ * 实测固定种子 0.0043-0.0044、真实权重 0.007-0.010，全部落在
+ * 设计验收线 0.01 之内。test_int4 用固定种子合成权重钉住这条线。 */
 float ds_int4_quant_error_rms(const ds_int4_block_t *block,
                                 const uint16_t *W_bf16) {
     if (!block || !W_bf16) return -1.0f;
