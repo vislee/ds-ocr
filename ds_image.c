@@ -253,6 +253,10 @@ static inline float ds_bicuberp_aa(const unsigned char *src, int src_w, int src_
     return result;
 }
 
+/* ds_image_resize - 双线性插值缩放（拉伸模式，不改纵横比保护）
+ * 用于 dynamic_preprocess 第③步：整图 resize 到 (cols·size, rows·size)
+ * ——目标尺寸本来就是按原图比例选的，拉伸量可忽略。
+ * 权重按"源坐标 = 目标坐标 × 缩放比"映射，4 邻居加权。 */
 ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_height) {
     if (!img || !img->pixels) return NULL;
 
@@ -353,6 +357,11 @@ ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_
 
 /* Pad image to target size maintaining aspect ratio (like PIL ImageOps.pad).
  * Fills with pad_color (e.g. 128 for gray). Resizes largest dimension to fit. */
+/* ds_image_pad - 等比缩放 + 居中填充（PIL ImageOps.pad 的 C 对应物）
+ * (docs/06 §1) 三代模型全局图预处理的统一路径：长边缩到 target_size，
+ * 短边居中，四周填 pad_color=127（即 0.5·255，Python mean color）。
+ * 【为什么 127】预处理后像素会做 (x/255-0.5)/0.5 归一化，127≈0 恰是
+ * 归一化后的均值——填充区域对模型是"无信息的中性灰"，不是黑或白。 */
 ds_image_t *ds_image_pad(const ds_image_t *img, int target_size, unsigned char pad_color) {
     if (!img || !img->pixels) return NULL;
 
@@ -392,6 +401,10 @@ ds_image_t *ds_image_pad(const ds_image_t *img, int target_size, unsigned char p
     return padded;
 }
 
+/* ds_image_to_float_chw - uint8 HWC → float32 CHW + 归一化（SAM 输入格式）
+ * 归一化 (pixel/255 - 0.5)/0.5 = pixel/127.5 - 1，匹配 Python
+ * BasicImageTransform(mean=0.5, std=0.5)。CHW 平面布局是卷积核
+ * ds_conv2d 期望的输入；HWC→CHW 的转置在此一次完成。 */
 float *ds_image_to_float_chw(const ds_image_t *img) {
     if (!img || !img->pixels) return NULL;
 
@@ -442,6 +455,17 @@ ds_image_t *ds_image_crop_box(const ds_image_t *img, int left, int top, int righ
 }
 
 /* Find closest aspect ratio — matches Python find_closest_aspect_ratio() */
+/* find_closest_aspect_ratio - 在候选网格里选最接近原图比例的块组合
+ * (docs/06 §7)
+ *
+ * 候选集 = {(i,j) : min_num ≤ i·j ≤ max_num}，i=宽方向块数、j=高方向。
+ * V2 调用 (768, 2, 6)：最多 6 块；V3/V4 调用 (640, 2, 32/16)：大图最多 32/16 块。
+ *
+ * 【tie-break 护栏】(docs/06 §7 真实细节) 2/3 与 4/6 的浮点比例完全相等，
+ * 此时规则是"图够大才选块数更多的组合"：
+ *   area > 0.5·image_size²·i·j 才升级
+ * 1600×2264（面积 3.62M < 0.5·640²·24=4.92M）→ 不升级到 24 块。没有这条
+ * 护栏，中等图片会被切成远超必要的 tile 数，token 成本翻四倍。 */
 static int find_closest_aspect_ratio(float aspect_ratio, int width, int height,
                                        int image_size, int *out_rows, int *out_cols,
                                        int min_num, int max_num) {
@@ -480,6 +504,24 @@ static int find_closest_aspect_ratio(float aspect_ratio, int width, int height,
     return best_width_blocks * best_height_blocks;
 }
 
+/* ds_dynamic_preprocess - 动态多裁剪：NaViT"保比例+分块"的工程化
+ * (docs/06 §7，五步逐步算例见文档)
+ *
+ * 【流程】① 算原图纵横比 ② find_closest_aspect_ratio 选 i×j 组合
+ * ③ 整图 resize 到 (i·size, j·size)（双线性）④ 行主序等分成 i×j 个
+ * size² tile（先左到右、再上到下）⑤ thumbnail 由调用方生成
+ * （本函数 use_thumbnail=0，避免重复 pad 全局图）。
+ *
+ * 【1600×2264 对 V3 的完整算例】比例 0.7067 → 2:3 (差0.0400) 胜 3:4
+ * (差0.0433) → resize 1280×1920 → 6 个 640² tile → 每个 tile SAM 100 tok
+ * → CLIP 111 tok（含换行）→ 剥换行 100 tok → 6 块重排 30×20 网格
+ * → 插换行 630 tok。总 token = 630+272+1 = 903（不含全局图路径）。
+ *
+ * 【成本上限】V3 允许 32 块，极端长图 1:32 → 1×32 网格 → 3793 token；
+ * token 数随块数线性增长（V3 大图 43s 编码的来源）。V4 把上限收到 16：
+ * 官方 vLLM 最多 16 crop，超出训练分布的 token 数会让模型把多视图
+ * 误读成多页（<PAGE>×N）。
+ * 【小图捷径】≤image_size 的图直接 pad 成 1 块，不走分块路径。 */
 ds_image_t **ds_dynamic_preprocess(const ds_image_t *img, int image_size,
                                     int min_num, int max_num,
                                     int use_thumbnail, int *out_count) {

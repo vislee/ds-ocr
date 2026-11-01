@@ -12,8 +12,10 @@
  *   输出: [768, H/16, W/16] — 1024²输入时为 [768, 64, 64] = 4096个patch
  *
  * Step 2: 位置编码 — 为每个patch注入位置信息
- *   + sam_pos_embed [577, 768] — 1个CLS + 576个patch(24×24)
- *   如果输入尺寸不同(如768²→48×48=2304 patches)，需双三次插值
+ *   + sam_pos_embed — 实测形状 [1, 64, 64, 768] 的纯二维网格、无 CLS 行
+ *     （docs/06 §6.4"CLS 幻影"事故：误按 [577,768] 带 CLS 索引会让 4096 个
+ *     patch 整体错位一行 + 越界读 3KB，编码器与 Python 参考的余弦相似度
+ *     从 0.28 修复到 0.97）。输入网格 ≠64 时按 64→目标网格 bicubic 插值。
  *
  * Step 3: 12层 Transformer — 交替使用窗口/全局注意力
  *   层 [0,1,3,4,6,7,9,10]: 窗口注意力 (window_size=14) — 局部感受野
@@ -224,6 +226,17 @@ static void __attribute__((unused)) add_rel_pos_bias(float *attn_scores, int n_h
  * Returns: [n_windows, win_size*win_size, dim] (caller must free)
  * Also sets *n_windows_out and *pad_h_out, *pad_w_out
  */
+/* window_partition_pad - 窗口划分三步：pad → 切分 → 产出 n 个 win×win 窗口
+ * (docs/06 §3.2)
+ *
+ * 【为什么需要 pad】64 不能被窗口 14 整除：64×64 网格 → pad 6 → 70×70
+ * → 5×5 = 25 个 14×14 窗口（每窗 196 token）。768² 裁剪：48 pad 8 → 56
+ * → 16 窗口；640² 裁剪：40 pad 2 → 42 → 9 窗口。反划分由
+ * window_unpartition_pad 拼回并裁掉补的行列。
+ *
+ * 【复杂度收益】(docs/06 §3.1) 窗口注意力把每层 score 对数从
+ * 4096² = 16.8M 降到 25×196² = 0.96M（少 17.5 倍）；窗口层合计 ≈61 GFLOP
+ * vs 全局层 ≈109 GFLOP。8 窗口 + 4 全局 ≈ 0.9 TFLOP / 次 SAM 前向。 */
 static float *window_partition_pad(const float *x, int seq_h, int seq_w,
                                     int win_size, int dim, int *n_windows_out,
                                     int *padded_h, int *padded_w) {
@@ -318,6 +331,21 @@ static void window_unpartition_pad(float *x, int seq_h, int seq_w,
 }
 
 /* Forward attention within a single window (bidirectional, with rel pos) */
+/* window_attn_forward - 单个窗口内的多头注意力 + 解耦相对位置偏置
+ * (docs/06 §3.4)
+ *
+ * 【相对位置偏置的查表法】SAM 不用 RoPE，而是给 attention score 加
+ *   attn[i,j] += q_i·rel_pos_h[qy-ky+w-1] + q_i·rel_pos_w[qx-kx+w-1]
+ * 相对位移 ∈ [-(w-1), w-1] 共 2w-1 种，+w-1 平移到 [0,2w-2] 作下标——
+ * 每张表 2w-1 行：窗口层 [27,64]（2×14-1，与输入无关、永不插值），
+ * 全局层 [127,64]（1024²，w=64）。行/列两方向解耦相加。
+ *
+ * 【块结构加速】朴素查表 O(N²·head_dim)。bias_h 只依赖 (qy,ky)，
+ * 同一块内所有 kx 共享同一 bias → 按对角线扫一遍、整行 win_w 个
+ * 一次填充，把 head_dim 点积次数从 N² 降到 N×(2w-1)。
+ *
+ * 【流程】① BLAS sgemm 算 Q·Kᵀ·scale ② 加块结构 bias ③ 行 softmax
+ * ④ attn·V。Q/K/V 均为 [n_tokens, hidden] 行主序，按头偏移 head_dim。 */
 static void window_attn_forward(float *out, const float *Q, const float *K, const float *V,
                                  int n_tokens, int n_heads, int head_dim,
                                  const float *rel_pos_h, const float *rel_pos_w,
@@ -700,6 +728,25 @@ static void *sam_global_worker(void *arg) {
 }
 
 
+/* sam_layer_forward - SAM ViT-B 单层前向（窗口/全局二选一）
+ *
+ * 【全局层的分布】(docs/06 §3.3) config.json 的
+ * global_attn_indexes=[2,5,8,11] 训练时定死：每 3 层插一层全局。
+ * 窗口注意力便宜但信息不出窗——字符左右文跨窗即不可见；全局层让
+ * 所有 patch 互见补齐跨窗信息。与 Swin 的移位窗口异曲同工但更简单：
+ * 不做 shift，直接 1/3 的层做全局。
+ *
+ * 【pad 与 QKV 的顺序坑】(docs/06 §3.2 真实 bug) Python 顺序是
+ * norm1 → pad → window_partition → QKV：补零位置拿到的 K/V 是
+ * QKV(0)=qkv_bias（非零）。若先在未 pad 数据上算 QKV 再补零，
+ * 补的行是 K=V=0，边界真实 token 的注意力分数 diff 最大 0.209
+ * （第 0 层实测）——对齐 Python 必须先 pad 再投影。
+ *
+ * 【缓冲收益】全局层每头需要 seq²×4B ≈ 67 MB 的 score 缓冲
+ * （sam_global_process_head），窗口层只要 196²×4B ≈ 150 KB。
+ *
+ * 【层 11 dump】ds_dump_tensor 挂在 norm1 之后和 QKV 之后，
+ * 供 tools/regress 对拍 Python 参考中间量。 */
 static void sam_layer_forward(float *out, const float *x,
                                const ds_visual_tokenizer_t *vt,
                                int layer_idx, int seq_h, int seq_w) {
@@ -999,10 +1046,23 @@ static void sam_layer_forward(float *out, const float *x,
  * SAM Neck + Downsample
  * ======================================================================== */
 
-/* Apply SAM neck: 2×(Conv2d 1×1 + LayerNorm2d)
+/* Apply SAM neck: 2×(Conv2d + LayerNorm2d)
  * Input: [768, H, W] spatial feature map
  * Output: [256, H, W] spatial feature map
  */
+/* sam_neck_forward - SAM neck：通道压缩 768→256 (docs/06 §4)
+ * 结构 = Conv2d(768→256, k=1) + LayerNorm2d + Conv2d(256→256, k=3) + LayerNorm2d。
+ *
+ * 【LayerNorm2d 与普通 LN 的区别】普通 LN 对单个 token 的 D 维归一化；
+ * LN2d 对同一空间位置跨 C 个通道归一化——此时数据是 [C, H·W] 布局，
+ * "特征维"换位到通道轴。
+ *
+ * 【事故现场】(docs/06 §6.4) 第二个卷积曾被按 1×1 实现，而权重形状
+ * [256,256,3,3] 明示 3×3（git 4a45bc4 修复）。OCR 精度对这 4 个卷积
+ * 的正确性极其敏感——形状即契约，加载时必须校验。
+ *
+ * 【dump 开关】DS_DUMP_SAM_LAYERS 环境变量打开中间量 dump，
+ * 供与 Python 参考逐层对拍。 */
 static float *sam_neck_forward(const float *spatial, int h, int w,
                                 const ds_visual_tokenizer_t *vt) {
     int c_in = DS_SAM_EMBED_DIM; /* 768 */
@@ -1070,6 +1130,17 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
  * Input: [256, H, W] → net_2 → [512, H/2, W/2] → net_3 → [ds2_dim, H/4, W/4]
  * Each: Conv2d(k=3, s=2, p=1)
  */
+/* sam_downsample_forward - SAM 空间 4× 压缩：两个 stride=2 的 3×3 卷积
+ * (docs/06 §4)
+ *   net_2: 256→512, [256,40,40]→[512,20,20]
+ *   net_3: 512→1024(V1/V3/V4) 或 896(V2), [512,20,20]→[1024,10,10]
+ * 输出尺寸按 floor((h+2p-k)/s)+1：40→20→10。
+ *
+ * 【"÷16 再 ÷4"的完整答案】÷16 来自 patch embed 的 stride-16，
+ * ÷4 来自 net_2/net_3 两个 s=2 卷积连乘——64×64 网格收敛成
+ * 16×16 = 256 token，4096 个高分辨率 patch 有损压缩进 256 个向量。
+ * net_3 的输出通道是四代模型的分叉点（safetensors 实测：
+ * V1 net_3.weight=[1024,512,3,3]，V2=[896,512,3,3]）。 */
 static float *sam_downsample_forward(const float *spatial, int h, int w,
                                       const ds_visual_tokenizer_t *vt,
                                       int ds2_dim,
@@ -1110,6 +1181,13 @@ static float *sam_downsample_forward(const float *spatial, int h, int w,
  * This matches PIL/Pillow BICUBIC default behavior.
  * Previously we used a=-0.75 which was incorrect.
  */
+/* bicubic_weight - Keys 三次核 (docs/06 §6.2)
+ *   W(x) = (a+2)|x|³-(a+3)|x|²+1   |x|≤1；a|x|³-5a|x|²+8a|x|-4a  1<|x|<2
+ * 常数 a 控制曲线形状：PIL BICUBIC 用 a=-0.5，PyTorch 用 a=-0.75。
+ * 本函数取 a=-0.5（对齐 SAM 位置表的 PIL 风格参考）——CLIP 位置表的
+ * ds_cubic_kernel 在 ds_deep_encoder.c 取 A=-0.75（对齐 PyTorch）。
+ * 【纪律】两套重采样器各随其参考实现，对过数；不要凭"哪个才对"互相
+ * "统一"，参数跟参考走（git eae0424 审计曾把 -0.5 误改 -0.75）。 */
 static float bicubic_weight(float x) {
     const float a = -0.5f;
     float ax = fabsf(x);
@@ -1188,6 +1266,21 @@ static float *bicubic_interpolate_2d(const float *src, int src_h, int src_w,
  * If src_grid == tgt_grid, returns a copy of the original.
  * This matches Python's get_abs_pos_sam().
  */
+/* interpolate_pos_embed - SAM 位置网格重采样 64→目标网格 (docs/06 §6.4)
+ *
+ * SAM 的 pos_embed 是 [1,64,64,768] 纯二维网格（无 CLS）。非 1024² 输入
+ * （768²裁剪=48、640²裁剪=40）时必须把 64×64 网格重采样到目标尺寸，
+ * 走 bicubic_interpolate_2d（antialias + align_corners=False）。
+ * 网格相同也拷贝一份——调用方统一 free，不区分所有权。
+ *
+ * 【事故二"CLS 幻影"的最终形态】早期 C 代码按版本写了三套索引分支
+ * （V1 误按 [577,768] 带 CLS 偏移、V3 不插值且宽度寻址错误），症状是
+ * V3 输出幻觉文本 "The quick brown fox..."。git eae0424 统一成此单一路径：
+ * 二维网格索引 + 64→目标 bicubic（与 Python 平均误差 0.36%）。
+ * 优先加载 model_dir/pos_embed_NxN.bin 预计算文件（四目录均未附带，
+ * 实际走运行时插值）。
+ * 【教训】位置信息出错不炸不报错，只让模型"看哪儿都像看错了地方"，
+ * 最终以幻觉/重复行/孤儿标签烧到输出——位置相关实现必须单独对拍。 */
 static float *interpolate_pos_embed(const float *pos_embed, int src_grid,
                                      int tgt_grid, int embed_dim) {
     if (src_grid == tgt_grid) {
@@ -1206,6 +1299,16 @@ static float *interpolate_pos_embed(const float *pos_embed, int src_grid,
  * Patch Embedding
  * ======================================================================== */
 
+/* ========================================================================
+ * Patch Embedding
+ * ======================================================================== */
+
+/* sam_patch_embed - 把图像当句子读：Conv2d(3→768, k=16, s=16) (docs/06 §2)
+ * 每个 16×16 像素块投影成一个 768 维 token，等价于"视觉词元化"：
+ * 1024² 输入 → [768, 64, 64] = 4096 个 patch（这就是"÷16"的来源）。
+ * 卷积核=步长、无 padding → 每个 patch 恰好被看一次，无重叠。
+ * dump 分支做两件事：逐通道唯一值统计（检测权重是否加载正确）+
+ * 手工点积复算 patch(0,0)（验证 ds_conv2d 布局正确性）。 */
 static float *sam_patch_embed(const float *image_chw, int img_h, int img_w,
                                const float *weight, const float *bias,
                                int *out_h, int *out_w) {
@@ -1554,6 +1657,19 @@ float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
  * Takes raw pixels, preprocesses (resize/pad), then runs SAM.
  * For 1024x1024 global image (no interpolation needed).
  * ======================================================================== */
+/* ds_visual_tokenizer_forward - 视觉分词器总入口：预处理 → SAM 前向
+ *
+ * 【预处理三版本合一】(docs/06 §1) 三代模型都用 ImageOps.pad 语义：
+ * 灰色 (127) 填充保持纵横比，绝不拉伸（stretch 会扭曲文档比例，
+ * SAM 看到的字从源头就变形——V1 全局图曾用 stretch，后改 pad）。
+ * V1/V2/V3 代码路径相同，注释保留三段历史以说明"为什么都是 pad"。
+ *
+ * 【out_resized_pixels 的用途】CLIP-V1 路径需要原始 RGB 输入
+ * （ds_deep_encoder.c 的 clip 分支），所以把 pad 后的像素另存一份
+ * 交还调用方——SAM 和 CLIP 各自消费同一张预处理图。
+ *
+ * 【线程门控】ds_sam_thread_gates(win,gbl,enc) 控制窗口/全局/编码
+ * 三级并行度（调试用，默认全开）。 */
 float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int width, int height, int channels,
                                     int *out_n_tokens, float **out_patch_embeds,
@@ -1620,6 +1736,8 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
 }
 
 /* SAM forward pass (wrapper) */
+/* ds_sam_forward - 兼容入口：不关心 CLIP 像素的调用方用这个
+ * （out_resized_pixels 传 NULL，跳过像素另存）。 */
 float *ds_sam_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                        int width, int height, int channels,
                        int *out_n_tokens, float **out_patch_embeds) {
@@ -1628,7 +1746,9 @@ float *ds_sam_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                        NULL, NULL, NULL);
 }
 
-/* Weight Loading (done in ds_ocr.c during ds_load()) */
+/* ds_visual_tokenizer_load - 占位实现：SAM 权重实际由 ds_ocr.c 的
+ * ds_load() 统一 mmap 加载（零拷贝指针填进 vt 结构体），这里无事可做。
+ * 保留函数是为了 API 完整性（qwen-asr 同款分层）。 */
 int ds_visual_tokenizer_load(ds_ctx_t *ctx) {
     (void)ctx;
     return 0;
