@@ -217,6 +217,32 @@ int ds_dash_build_coords(ds_ctx_t *ctx, const int *token_ids, int seq_len) {
     return 0;
 }
 
+/* ── 跨识别重置 ───────────────────────────────────────────────────────────
+ * 【为什么必须重置 idx_k_hist】官方 vLLM 的 _dash_idx_k[layer] 追加语义
+ * 服务于「多页单次 decode」：一次 infer() 里 31 个 <PAGE> 共享一个 KV，
+ * 块分数读全量历史 = 本页 prompt 的历史，语义自洽。
+ * C 引擎是「每页独立 decode」：ds_recognize_image() 每次把 kv_cache_len
+ * 归零后重新 prefill。若不重置:
+ *   1) router_qk() 会把新页 idx_k 写到 [0..seq_len)，与上一页残留重叠;
+ *   2) block_scores_headcls() 的 k_bar[b] 按本页 total_kv 读 [0..total_kv)
+ *      ——读到的是"新页前缀 + 上一页残留"的混合，块路由随识别次数累积
+ *      失真。31页国标实测: 第14页起 6/6 页内容循环早停（111-1263 tok
+ *      截断），单独/序列首位识别同页则完全正常；重置后全部消除。
+ * 坐标表 (cos2d/sin2d/tok_pos/page_pos/cand_page) 由每次 prefill 的
+ * ds_dash_build_coords() 全量重建，无需在此清理。 */
+void ds_dash_reset_run(ds_ctx_t *ctx) {
+    ds_dash_state_t *st = (ds_dash_state_t *)ctx->dash_state;
+    if (!st) return;
+    for (int l = 0; l < st->n_layers; l++) {
+        memset(st->idx_k_hist[l], 0,
+               (size_t)ctx->kv_cache_max * DS_DASH_INDEX_DIM * sizeof(float));
+    }
+    st->nblk_prompt = 0;
+    st->pp = 0;
+    st->mcum = 0;
+    st->state_active = 0;   /* build_coords 会在本次 prefill 重建 */
+}
+
 /* decode 状态机推进 (官方 _main_rope_coords decode 分支 +
  * _uocr_dash_decode_allow 的 mcum/qp 维护):
  *   <PAGE> → mcum++, page=min(page+1, n_pg-1)，tok=pf_cnt[page]；否则 tok+=1

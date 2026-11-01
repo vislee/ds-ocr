@@ -286,6 +286,18 @@ float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
 void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
                          const float *b, int in_dim, int out_dim);
 
+/* Grouped row-parallel matvec (decode MoE fast path, r4):
+ * out[u * rows_per_unit + r] = W[u][r] · X[u]  for all u in [0,n_units), r in [0,rows_per_unit)
+ *
+ * 所有单元的输出行合并为一个线程池并行区——旧实现每专家 2-3 次独立 matvec，
+ * 每层 ~19 个微小型并行区，barrier 同步开销大于矩阵本身（t1 与 t14 解码同速）。
+ * 输入按单元给出（X[u]）: gate/up 共享同一 x，down 用各自专家的 SwiGLU 输出。
+ * 行对（2r, 2r+1）永不跨线程拆分，每行仍由同一 NEON 内核按成对路径累加
+ * ——落单行会走不同的求和顺序（2 组累加器 vs 8 组），故必须以行对为切分粒度
+ * 才能保证与逐专家串行版本逐位一致。rows_per_unit 必须为偶数。 */
+void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *const *W,
+                             int n_units, int rows_per_unit, int in_dim);
+
 /* ========================================================================
  * Threading
  * ======================================================================== */

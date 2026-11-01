@@ -107,6 +107,11 @@ static inline void *ds_kv_v_row(ds_ctx_t *ctx, int layer, int pos) {
 /* ── 生命周期 ─────────────────────────────────────────────────────────── */
 int  ds_dash_init(ds_ctx_t *ctx);                        /* 分配运行时缓冲 */
 void ds_dash_free(ds_ctx_t *ctx);
+/* 跨识别重置: 清 idx_k_hist 历史与 decode 状态机。
+ * C 引擎每页独立 decode（kv_cache_len 归零重 prefill），而块分数 k_bar
+ * 按全缓存长度读 idx_k_hist——不重置则上一页残留混入路由，随识别次数
+ * 累积失真（实测第14页起循环早停）。官方多页单次 decode 无此问题。 */
+void ds_dash_reset_run(ds_ctx_t *ctx);
 
 /* ── page2d 坐标构建 ────────────────────────────────────────────────────
  * 由 prefill 的 token id 序列构建 (tok_pos, page_pos) 坐标并预计算 cos/sin。

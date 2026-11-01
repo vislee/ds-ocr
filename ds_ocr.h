@@ -461,6 +461,11 @@ typedef struct {
     float *moe_shared_out_buf;
     float *moe_expert_outputs; /* top_k * hidden */
 
+    /* 分组行并行 scratch（解码 MoE 快路径）: 6 个路由专家的 gate_up/down 行
+     * 合并为一个并行区，替代每专家独立的 2 次 matvec（barrier 开销主导） */
+    float *moe_grouped_gate_up_buf;   /* [top_k × 2*moe_inter] */
+    float *moe_grouped_hidden_buf;    /* [top_k × moe_inter] */
+
     /* Cached RoPE tables for decoder positions */
     float *rope_cache_cos, *rope_cache_sin;
     float *rope_inv_freq;
@@ -488,8 +493,8 @@ typedef struct {
     /* Inference settings */
     int max_new_tokens;        /* Max tokens to generate (default: 4096) */
     int keep_raw_layout;
-    int last_output_degenerate;  /* V4: 最近一次识别检测到畸形标签行（退化翻转信号，供 CLI 重试） */       /* V4: 1 = 保留原生 <BLOCK>[坐标]<FORK> 结构化输出（--raw-layout）；
-                                  0 = 默认剥离布局标签、丢弃空内容块，输出干净文本 */
+    int last_output_degenerate;  /* V4: 最近一次识别检测到畸形标签行（退化翻转信号，供 CLI 重试） */
+    int last_output_loopy;       /* V3/V4: 解码中途检测到内容循环并提前终止（r4；DS_NO_EARLY_STOP=1 关闭） */
     float temperature;         /* Sampling temperature (default: 0.0 = greedy) */
     float repeat_penalty;      /* Repetition penalty (default: 1.0 = none, 1.1-1.5 typical) */
     int num_local_crops;       /* Number of local crop regions (0-6) */

@@ -40,10 +40,10 @@ SRCS = ds_ocr.c ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_a
        ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
        ds_tokenizer.c ds_safetensors.c ds_quantize.c ds_dash.c
 ifeq ($(UNAME_S),Darwin)
-SRCS += ds_platform_ocr.m ds_metal.m
+SRCS += ds_pdf.m ds_platform_ocr.m ds_metal.m
 METALLIB = ds_metal_shaders.metallib
 else
-SRCS += ds_platform_ocr.c
+SRCS += ds_pdf.c ds_platform_ocr.c
 METALLIB =
 endif
 OBJS = $(SRCS:.c=.o)
@@ -170,7 +170,7 @@ ds_metal.o: ds_metal.m ds_metal.h ds_metal_shaders.metal
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
 ifeq ($(UNAME_S),Darwin)
-debug: LDFLAGS = -lm -lpthread -framework Metal -framework Foundation -fsanitize=address
+debug: LDFLAGS = -lm -lpthread -framework Metal -framework Foundation -framework CoreGraphics -fsanitize=address
 else
 debug: LDFLAGS += -fsanitize=address
 endif
@@ -210,9 +210,13 @@ ds_tokenizer.o: ds_tokenizer.c ds_tokenizer.h
 ds_safetensors.o: ds_safetensors.c ds_safetensors.h
 main.o: main.c ds_ocr.h ds_kernels.h
 ifeq ($(UNAME_S),Darwin)
+ds_pdf.o: ds_pdf.m ds_pdf.h
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 ds_platform_ocr.o: ds_platform_ocr.m ds_platform_ocr.h
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 else
+ds_pdf.o: ds_pdf.c ds_pdf.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 ds_platform_ocr.o: ds_platform_ocr.c ds_platform_ocr.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 endif

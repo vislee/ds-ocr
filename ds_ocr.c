@@ -1218,6 +1218,10 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
         ctx->moe_expert_hidden_buf = (float *)malloc(moe_inter * sizeof(float));
         ctx->moe_expert_outputs = (float *)malloc(top_k * hidden * sizeof(float));
 
+        /* 分组行并行 scratch（解码 MoE 快路径） */
+        ctx->moe_grouped_gate_up_buf = (float *)malloc((size_t)top_k * 2 * moe_inter * sizeof(float));
+        ctx->moe_grouped_hidden_buf = (float *)malloc((size_t)top_k * moe_inter * sizeof(float));
+
         ctx->moe_shared_gate_buf = (float *)malloc(shared_inter * sizeof(float));
         ctx->moe_shared_up_buf = (float *)malloc(shared_inter * sizeof(float));
         ctx->moe_shared_gate_up_buf = (float *)malloc(2 * shared_inter * sizeof(float));
@@ -1385,6 +1389,8 @@ void ds_free(ds_ctx_t *ctx) {
     free(ctx->enc_output);
     free(ctx->lm_head_f32);
     free(ctx->tok_emb_f32);
+    free(ctx->moe_grouped_gate_up_buf);
+    free(ctx->moe_grouped_hidden_buf);
 
     /* Free contiguous expert blocks (malloc'd, not mmap'd).
      * All experts' gate_up_fused + shared gate_up_fused are in one block per layer. */
@@ -1431,6 +1437,62 @@ char *ds_recognize(ds_ctx_t *ctx, const char *image_path) {
     return result;
 }
 
+/* ── 内容循环早停（r4）─────────────────────────────────────────────
+ * 循环输出的原始形态多样: 单行内重复（World World…，无换行）、多行周期
+ * （附录/（资料库）×3 四行一循环）、坐标逐圈抖动的标签流（剥数字后文本
+ * 才重复）。统一用**字节级周期检测**: 尾部归一化（去数字/空白/[]/,/.）
+ * 后，若存在周期 p∈[4,512] 使全部字节满足 t[i]==t[i+p]（≥3 个完整周期）
+ * ⇒ 内容循环。**多尺度后缀**（3KB/1.5KB/768B/384B 依次检查）覆盖"真实
+ * 内容 + 循环"混合的窗口——循环只占尾部一小段时，小窗口仍全落入循环段。
+ * 全窗逐字节匹配是极强条件，正常文本不可能满足；黄金标签 32 份以同逻辑
+ * 模拟解码扫描（每 64 字节一检查点）零命中。 */
+#define DS_LOOP_WINDOW 3072    /* 最大检测窗口（输出尾部字节） */
+#define DS_LOOP_PMIN 4         /* 最短周期（避开 1-3 字节的分隔符行误伤） */
+#define DS_LOOP_PMAX 512
+
+static int ds_early_stop_loopy_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("DS_NO_EARLY_STOP") == NULL;
+    return enabled;
+}
+
+/* ds_output_tail_loopy — 检查输出尾部是否存在周期性内容循环（多尺度后缀） */
+static int ds_output_tail_loopy(const char *output, size_t out_len) {
+    static const size_t windows[] = { 3072, 1536, 768, 384 };
+    if (out_len < 256) return 0;
+
+    for (int w = 0; w < (int)(sizeof(windows) / sizeof(windows[0])); w++) {
+        size_t take = windows[w];
+        if (take > out_len) continue;
+
+        char norm[DS_LOOP_WINDOW];
+        size_t L = 0;
+        const char *tail = output + (out_len - take);
+        for (size_t j = 0; j < take; j++) {
+            char c = tail[j];
+            if ((c >= '0' && c <= '9') || c == ' ' || c == '\t' || c == '\n' ||
+                c == '\r' || c == '[' || c == ']' || c == ',' || c == '.')
+                continue;
+            norm[L++] = c;
+        }
+        if (L < 64) continue;
+
+        size_t pmax = DS_LOOP_PMAX < L / 3 ? DS_LOOP_PMAX : L / 3;
+        for (size_t p = DS_LOOP_PMIN; p <= pmax; p++) {
+            int ok = 1;
+            for (size_t i = 0; i + p < L; i++) {
+                if (norm[i] != norm[i + p]) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok) return 1;
+        }
+    }
+    return 0;
+}
+
 char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                           int width, int height, int channels) {
     if (!ctx || !pixels) return NULL;
@@ -1445,8 +1507,19 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
     ctx->_det_buf[0] = '\0';
     ctx->_v3_prefix_done = 0;
 
+    /* Reset per-run perf sub-counters: SAM/Encoder 在多 crop 路径用 += 累计，
+     * 不重置会跨 crop、跨识别（--stream）累加，显示值大于 Encoding 总耗时 */
+    ctx->perf_sam_ms = 0;
+    ctx->perf_encoder_ms = 0;
+    ctx->last_output_loopy = 0;
+
     /* Reset per-run argmax ban list (set per decode step below) */
     ctx->dec_argmax_n_ban = 0;
+
+    /* V4 DASH: 清上一页残留的块路由历史 (idx_k_hist)。
+     * 块分数按全缓存长度读历史，kv_cache_len 归零后残留会混入新页路由，
+     * 随识别次数累积失真 → 第14页起循环早停。必须每页重置。 */
+    if (cfg->model_version == 4) ds_dash_reset_run(ctx);
 
     /* Initialize dump directory if DS_DUMP_TENSORS is set */
     ds_dump_init();
@@ -2404,6 +2477,13 @@ prompt_construction:
                     n_encoder_tokens, n_img_tokens);
         }
 
+        /* 诊断: V4 编码器输出 dump（对比多次识别间编码是否逐位一致） */
+        if (cfg->model_version == 4 && getenv("DS_DUMP_V4ENC")) {
+            FILE *df = fopen("dump/c_v4_encoder_output.bin", "wb");
+            if (df) { fwrite(encoder_output, sizeof(float), n_copy * hidden, df); fclose(df);
+                fprintf(stderr, "Dumped V4 encoder output: %d x %d\n", n_copy, hidden); }
+        }
+
         /* 3. Text after image */
         for (int t = 0; t < n_text_after; t++) EMBED_TOKEN_V3(text_after_ids[t]);
 
@@ -2690,6 +2770,14 @@ prompt_construction:
     int n_generated = 0;
     int eos_token = DS_TOKEN_EOS;
 
+    /* 诊断: 跨识别累积状态基线 (DS_HIST_DIAG=1)
+     * token_history 跨识别不重置 — 若其写入量跨过 8704 上限，
+     * 2890 行停止追加 → advance_coords 读到冻结的旧页 token */
+    if (getenv("DS_HIST_DIAG"))
+        fprintf(stderr, "[diag] recognize start: history_len=%d hist[-1]=%d\n",
+                ctx->token_history_len,
+                ctx->token_history_len > 0 ? ctx->token_history[ctx->token_history_len - 1] : -1);
+
     /* ── Step 5: 自回归解码主循环 ──
      * 【理论】自回归生成：每步把上一步选出的 token 喂回模型取下一个，
      * 直到 EOS 或步数上限。KV cache 让每步只算 1 个新 token（O(1) 而非 O(L)）。
@@ -2831,6 +2919,21 @@ prompt_construction:
                 if (ctx->token_cb) {
                     ds_stream_filter_det(ctx, piece);
                 }
+
+                /* 内容循环早停（r4）: 公式/表格密集页模型可能陷入内容循环，
+                 * 反复生成同一片段直至 max_new_tokens（官方 generate 同样如此，
+                 * 每页浪费可达 60s）。每 16 步对输出尾部 3KB 做字节级周期
+                 * 检测（归一化，坐标抖动不敏感），命中即提前终止，已生成
+                 * 部分保留。DS_NO_EARLY_STOP=1 关闭。 */
+                if ((n_generated & 15) == 15 && n_generated >= 48 &&
+                    ds_early_stop_loopy_enabled() &&
+                    ds_output_tail_loopy(output, out_len)) {
+                    ctx->last_output_loopy = 1;
+                    if (ds_verbose >= 1)
+                        fprintf(stderr, "Loop detected at token %d — stopping early\n",
+                                n_generated + 1);
+                    break;
+                }
             }
         }
 
@@ -2863,6 +2966,17 @@ prompt_construction:
     if (ds_verbose >= 1)
         fprintf(stderr, "Recognition: %d tokens generated in %.0f ms\n",
                 n_generated, ctx->perf_total_ms);
+
+    /* token_history 归零（本次识别的历史已完结）。
+     * 【根因修复】此表跨识别累积且容量有限（max_seq+512=8704）：多页
+     * PDF 流水在累计生成 ~8.7k token 后写满冻结，hist[-1] 永久指向
+     * 中途 token，此后每页解码的 ds_dash_advance_coords 都收到同一
+     * 错误 token → page2d 坐标状态机 (cur_tok) 失真，页与页的内容
+     * 边界错乱，模型把新页当成"前页续写"陷入内容循环（31 页国标实测:
+     * 第 14 页起 13 页早停截断；累计 token 跨过 8704 后必现，逐字节
+     * 复现）。Python generate() 的 history 语义就是 per-call，必须
+     * 每次识别归零。 */
+    ctx->token_history_len = 0;
 
     /* Trim trailing whitespace (matching Python .strip()) */
     if (output && out_len > 0) {

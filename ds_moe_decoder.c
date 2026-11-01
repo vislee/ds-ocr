@@ -374,17 +374,110 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
         goto shared_experts;
     }
 
-    /* ── CPU path: 逐expert matvec ──
-     * 【为什么不用 sgemm 批量计算？】
-     * Decode 路径每次只有1个token，matvec (BF16×F32) 是最优选择。
-     * sgemm (F32×F32) 虽然计算吞吐更高，但需要预转换 BF16→F32 权重，
-     * 内存开销 ~265MB (64 experts × 896×1280×2×4bytes)，不值得。
-     *
-     * 【madvise 预取策略】
-     * mmap 加载的 BF16 权重在第一次访问时触发 page fault（~60μs/page）。
-     * 通过提前 madvise(WILLNEED) 触发内核异步预读，减少 stall 时间。
-     * 策略: 一次预取所有 top-6 专家的 gate_up_fused 范围（在连续块内），
-     *       然后在循环中提前预取下一个专家的 down 权重。*/
+    /* ── CPU path: 分组行并行（r4 优化）──
+     * 旧实现: 每个选中 expert 独立调用 2-3 次 matvec（split 布局 gate/up/down
+     * 共 3 次），每层 ~19 个微小型并行区——barrier 同步开销大于矩阵本身，
+     * 实测 t1 与 t14 解码耗时相同（MoE 7.7s vs 8.4s，多线程反而 +10% 纯开销）。
+     * 现在: 同类投影的行合并为 1 个并行区——
+     *   split 布局 (V4): gate / up / down 各 1 个并行区，共 3 个；
+     *   fused 布局:      gate_up 1 个 + down 1 个。
+     * 行对（2r, 2r+1）永不跨线程拆分，每行仍由同一 NEON 内核按成对路径累加
+     * → 输出与逐专家串行版本逐位一致（md5 已验证）。 */
+    int all_fused = (top_k > 1) && !layer->int4_enabled;
+    int all_split = (top_k > 1) && !layer->int4_enabled;
+    for (int k = 0; (all_fused || all_split) && k < top_k; k++) {
+        const uint16_t *fused = layer->experts[top_indices[k]].gate_up_fused_bf16;
+        const uint16_t *gw = layer->experts[top_indices[k]].gate_weight_bf16;
+        const uint16_t *uw = layer->experts[top_indices[k]].up_weight_bf16;
+        if (!layer->experts[top_indices[k]].down_weight_bf16) {
+            all_fused = all_split = 0;
+        } else if (fused) {
+            all_split = 0;      /* 该专家 fused → 混合布局走旧路径 */
+        } else if (gw && uw) {
+            all_fused = 0;      /* 该专家 split */
+        } else {
+            all_fused = all_split = 0;
+        }
+    }
+
+    if (all_fused || all_split) {
+        const uint16_t *w_a[DS_MAX_EXPERTS];   /* fused: gate_up / split: gate */
+        const uint16_t *w_b[DS_MAX_EXPERTS];   /* split: up */
+        const uint16_t *w_down[DS_MAX_EXPERTS];
+        const float *x_shared[DS_MAX_EXPERTS]; /* gate/up: 各单元共享同一 x */
+        const float *x_hidden[DS_MAX_EXPERTS]; /* down: 各专家的 SwiGLU 输出 */
+        for (int k = 0; k < top_k; k++) {
+            int expert_id = top_indices[k];
+            if (all_fused) {
+                w_a[k] = layer->experts[expert_id].gate_up_fused_bf16;
+            } else {
+                w_a[k] = layer->experts[expert_id].gate_weight_bf16;
+                w_b[k] = layer->experts[expert_id].up_weight_bf16;
+            }
+            w_down[k] = layer->experts[expert_id].down_weight_bf16;
+            x_shared[k] = x;
+            /* 预取本专家全部权重（原实现为循环内预取下一个专家） */
+            size_t inter_bytes = (size_t)hidden * moe_inter * 2;
+            madvise((void *)w_down[k], inter_bytes, MADV_WILLNEED);
+            if (all_fused) {
+                madvise((void *)w_a[k], 2 * inter_bytes, MADV_WILLNEED);
+            } else {
+                madvise((void *)w_a[k], inter_bytes, MADV_WILLNEED);
+                madvise((void *)w_b[k], inter_bytes, MADV_WILLNEED);
+            }
+        }
+
+        /* gate_up_all 复用为 split 布局的 gate_all + up_all 两段 */
+        float *gate_up_all = ctx->moe_grouped_gate_up_buf;   /* [top_k × 2*inter] */
+        float *hidden_all = ctx->moe_grouped_hidden_buf;     /* [top_k × inter] */
+        if (gate_up_all && hidden_all) {
+            extern int ds_bf16_simulate_python;
+            float *up_all = gate_up_all + (size_t)top_k * moe_inter;
+            for (int k = 0; k < top_k; k++)
+                x_hidden[k] = hidden_all + (size_t)k * moe_inter;
+
+            if (all_fused) {
+                /* Phase 1: 全部专家的 gate_up 投影（一个并行区） */
+                ds_grouped_matvec_bf16(gate_up_all, x_shared, w_a, top_k,
+                                        2 * moe_inter, hidden);
+            } else {
+                ds_grouped_matvec_bf16(gate_up_all, x_shared, w_a, top_k,
+                                        moe_inter, hidden);
+                ds_grouped_matvec_bf16(up_all, x_shared, w_b, top_k,
+                                        moe_inter, hidden);
+            }
+
+            /* 逐专家: 截断 gate/up → SwiGLU → 截断（与旧路径相同的函数与顺序，
+             * 元素级操作，串行 ~20μs） */
+            for (int k = 0; k < top_k; k++) {
+                float *gu, *uu;
+                float *hbuf = hidden_all + (size_t)k * moe_inter;
+                if (all_fused) {
+                    gu = gate_up_all + (size_t)k * 2 * moe_inter;
+                    uu = gu + moe_inter;
+                } else {
+                    gu = gate_up_all + (size_t)k * moe_inter;
+                    uu = up_all + (size_t)k * moe_inter;
+                }
+                if (ds_bf16_simulate_python) {
+                    ds_bf16_truncate_array(gu, moe_inter);
+                    ds_bf16_truncate_array(uu, moe_inter);
+                }
+                ds_swiglu_direct(hbuf, gu, uu, 1, moe_inter);
+                if (ds_bf16_simulate_python)
+                    ds_bf16_truncate_array(hbuf, moe_inter);
+            }
+
+            /* Phase 2: 全部专家的 down 投影（一个并行区）→ 截断 → 加权合并 */
+            ds_grouped_matvec_bf16(expert_outputs, x_hidden, w_down, top_k,
+                                    hidden, moe_inter);
+            if (ds_bf16_simulate_python)
+                ds_bf16_truncate_array(expert_outputs, top_k * hidden);
+            goto moe_combine;
+        }
+        /* scratch 分配失败 → 落回逐专家路径 */
+    }
+
     if (layer->expert_block_bf16 && top_k > 1) {
         /* Find min/max offset of selected experts within the block */
         size_t fused_per_expert = (size_t)2 * moe_inter * hidden * sizeof(uint16_t);
@@ -438,7 +531,9 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
     /* Step 4: 加权合并路由专家的输出
      * ds_expert_combine 对每个 expert 的输出乘以路由权重并累加:
      *   output[h] = Σ_{k=0..5} top_weights[k] * expert_outputs[k*hidden + h]
-     * 这是 CPU 路径的合并（GPU 路径在 Metal 内核中直接合并）。*/
+     * 这是 CPU 路径的合并（GPU 路径在 Metal 内核中直接合并）。
+     * 分组快路径（上方 all_experts_fused 分支）也汇合到这里。 */
+moe_combine:
     ds_expert_combine(output, expert_outputs, top_indices, top_weights, top_k, hidden);
     if (!expert_outputs_buf) free(expert_outputs);
     else memset(expert_outputs_buf, 0, top_k * hidden * sizeof(float));

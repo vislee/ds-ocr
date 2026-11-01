@@ -921,6 +921,46 @@ static void ds_bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_
     ds_parallel_for(ds_matvec_worker, &task);
 }
 
+/* ── Grouped row-parallel matvec（解码 MoE 快路径，r4）──
+ * 以"行对"为切分粒度（见 ds_kernels.h 注释）：线程边界永远落在偶数行对齐处，
+ * 每行的累加顺序与整段调用 bf16_matvec_fused 时完全一致 → 数值逐位不变。
+ * 输入指针按单元给出：gate/up 共享同一 x，down 用各自专家的 SwiGLU 输出。 */
+typedef struct {
+    float *out;
+    const float *const *X;
+    const uint16_t *const *W;
+    int n_units;
+    int rows_per_unit;
+    int in_dim;
+} ds_grouped_matvec_task_t;
+
+static void ds_grouped_matvec_worker(int tid, int n_threads, void *arg) {
+    ds_grouped_matvec_task_t *t = (ds_grouped_matvec_task_t *)arg;
+    int pairs_per_unit = t->rows_per_unit / 2;
+    int total_pairs = t->n_units * pairs_per_unit;
+    int chunk = (total_pairs + n_threads - 1) / n_threads;
+    int p = tid * chunk;
+    int p_end = p + chunk;
+    if (p_end > total_pairs) p_end = total_pairs;
+
+    while (p < p_end) {
+        int unit = p / pairs_per_unit;
+        int pair0 = p - unit * pairs_per_unit;
+        int pairs_here = pairs_per_unit - pair0;
+        if (pairs_here > p_end - p) pairs_here = p_end - p;
+        bf16_matvec_fused(t->out + (size_t)unit * t->rows_per_unit + 2 * pair0,
+                          t->X[unit], t->W[unit] + (size_t)2 * pair0 * t->in_dim,
+                          NULL, t->in_dim, 2 * pairs_here);
+        p += pairs_here;
+    }
+}
+
+void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *const *W,
+                             int n_units, int rows_per_unit, int in_dim) {
+    ds_grouped_matvec_task_t task = { out, X, W, n_units, rows_per_unit, in_dim };
+    ds_parallel_for(ds_grouped_matvec_worker, &task);
+}
+
 typedef struct {
     float *q;
     float *k;
