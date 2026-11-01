@@ -114,5 +114,9 @@ int ds_visual_tokenizer_load(ds_ctx_t *ctx);
  * run across raw pthreads. Multi-crop encoding sets this to 0 around its
  * concurrent crop workers to avoid oversubscription. */
 extern int ds_sam_window_parallel;
+extern int ds_sam_global_parallel;   /* 全局注意力(layers 2/5/8/11) head 并行门控 */
+extern int ds_enc_attn_parallel;     /* DeepEncoder 注意力 head 并行线程预算（0=关） */
+void ds_sam_thread_gates(int win, int gbl, int enc);   /* worker 线程局部钉住本 crop 预算 */
+void ds_enc_thread_gate(int budget);                   /* DeepEncoder 侧联动 */
 
 #endif /* DS_VISUAL_TOKENIZER_H */

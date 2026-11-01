@@ -71,6 +71,11 @@
 /* Set by ds_visual_tokenizer_forward based on model version */
 static int g_sam_is_v2 = 0;
 
+/* Debug: SAM 调用计数器 (0=global 图串行首调, 1+=local crops 并行)。
+ * __sync_fetch_and_add 原子自增，9 个 crop 线程各得唯一 slot。 */
+static int g_sam_call_idx = 0;
+int ds_sam_debug_slot(void) { return g_sam_call_idx; }
+
 /* Window-attention parallelism gate. When a single SAM forward runs alone
  * (V1, or the small-image/global-view paths), the 25 per-layer windows are
  * independent and run across raw pthreads (~650 of SAM's ~900 GFLOP live in
@@ -78,6 +83,32 @@ static int g_sam_is_v2 = 0;
  * During multi-crop encoding the crops already run concurrently, so the
  * caller turns this off to avoid oversubscription. */
 int ds_sam_window_parallel = 1;
+
+/* Global-attention (layers 2/5/8/11) head parallelism. Per-head sgemm shapes
+ * are identical to the serial path → bit-identical results. Same single-SAM
+ * discipline as the window gate: cleared by the caller during multi-crop
+ * waves (crops already run concurrently). Each worker holds a private
+ * [seq_len,seq_len] score buffer (67MB at 1024²) — DS_SAM_GBL_THREADS
+ * (default 6) trades speed vs transient memory. */
+int ds_sam_global_parallel = 6;   /* 线程预算: 0=关，N=每次 SAM 全局注意力用 N 线程 */
+
+/* ── 线程局部有效门控 ─────────────────────────────────────────────────
+ * crop 波次里“本地 crop 降级、全局视图任务全速”需要 per-task 门控，
+ * 而门控被 SAM/编码器深层读取，逐层传参会穿过 5 层调用链——改用
+ * 线程局部影子变量: worker 启动时 ds_sam_thread_gates() 钉住本线程
+ * 预算，读取点优先用钉住值；未钉住（主线程 V1 路径）用全局默认。 */
+static __thread int tl_gate_win, tl_gate_gbl, tl_gate_enc;
+static __thread int tl_gate_pinned;
+
+void ds_sam_thread_gates(int win, int gbl, int enc) {
+    tl_gate_win = win; tl_gate_gbl = gbl; tl_gate_enc = enc;
+    tl_gate_pinned = 1;
+    ds_enc_thread_gate(enc);
+}
+
+static inline int sam_gate_win(void) { return tl_gate_pinned ? tl_gate_win : ds_sam_window_parallel; }
+static inline int sam_gate_gbl(void) { return tl_gate_pinned ? tl_gate_gbl : ds_sam_global_parallel; }
+int ds_enc_gate_budget(void);   /* ds_deep_encoder.c 提供读取点 */
 
 /* ========================================================================
  * SAM LayerNorm2d (Channel-wise LayerNorm for spatial features)
@@ -473,6 +504,202 @@ static void *sam_window_worker(void *arg) {
     return NULL;
 }
 
+/* ── 全局注意力（layers 2/5/8/11）head 并行 ───────────────────────────
+ * 每 head 的两次 sgemm 形状与串行路径完全一致（M=seq_len 不变），
+ * 并行不改变任何浮点结果（逐位一致 → 回归 CER 保持 0.00）。
+ * 线程 t 处理 head t, t+nw, ...；每线程私有 [seq_len,seq_len] scores 缓冲
+ * （1024² 时 67MB/线程；DS_SAM_GBL_THREADS 可调，默认 6）。
+ * 门控纪律与窗口并行相同: 多 crop 波次期间由调用方清零（crop 已并行）。 */
+typedef struct {
+    const float *Q, *K, *V;
+    float *attn_out;
+    int seq_len, seq_h, seq_w, dim, n_heads, head_dim;
+    float scale;
+    const float *eff_rel_h, *eff_rel_w;
+    int layer_idx;
+    int tid, nthreads;
+} sam_global_task_t;
+
+static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) {
+    const int seq_len = t->seq_len, dim = t->dim, head_dim = t->head_dim;
+    const int seq_h = t->seq_h, seq_w = t->seq_w;
+    const int layer_idx = t->layer_idx;
+    const float scale = t->scale;
+    const float *eff_rel_h = t->eff_rel_h, *eff_rel_w = t->eff_rel_w;
+    const float *Q = t->Q, *K = t->K, *V = t->V;
+    float *attn_out = t->attn_out;
+    const float *Q_h = Q + h * head_dim;
+    const float *K_h = K + h * head_dim;
+    const float *V_h = V + h * head_dim;
+    float *out_h = attn_out + h * head_dim;
+
+            /* Step 1: scores = Q_h @ K_h^T * scale
+             * Q_h is [seq_len, dim] with leading dim = dim, but we only want
+             * the head_dim columns. We use a stride-aware sgemm:
+             * Q_h has stride=dim, but only head_dim contiguous elements per row.
+             * K_h similarly.
+             *
+             * Since Q/K are laid out as [seq_len, n_heads*head_dim], and we want
+             * columns [h*head_dim .. (h+1)*head_dim), we need to use the
+             * column-major BLAS with appropriate leading dimensions.
+             *
+             * Equivalently: scores[i,j] = sum_d Q[i, h*hd+d] * K[j, h*hd+d]
+             * = Q[:, h*hd:(h+1)*hd] @ K[:, h*hd:(h+1)*hd]^T
+             *
+             * Using CblasRowMajor, CblasNoTrans, CblasTrans:
+             *   C = alpha * A * B^T + beta * C
+             *   A = Q_h [seq_len, head_dim], lda = dim (row stride)
+             *   B = K_h [seq_len, head_dim], ldb = dim (row stride)
+             *   C = scores [seq_len, seq_len], ldc = seq_len
+             */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq_len, seq_len, head_dim,
+                        scale, Q_h, dim, K_h, dim,
+                        0.0f, scores, seq_len);
+#else
+            for (int i = 0; i < seq_len; i++) {
+                for (int j = 0; j < seq_len; j++) {
+                    float s = 0.0f;
+                    for (int d = 0; d < head_dim; d++)
+                        s += Q_h[i * dim + d] * K_h[j * dim + d];
+                    scores[i * seq_len + j] = s * scale;
+                }
+            }
+#endif
+
+            /* Step 2: Add rel_pos bias using block-structured computation.
+             *
+             * Key insight: rel_pos bias decomposes as:
+             *   bias_h[i,j] = Q[i] · rh[qy-ky+seq_h-1]  (depends on qy,ky only)
+             *   bias_w[i,j] = Q[i] · rw[qx-kx+seq_w-1]  (depends on qx,kx only)
+             *
+             * For height: within a (qy,ky) block, bias is row-constant.
+             * For width: within a (qx,kx) block, bias is col-constant.
+             * This reduces O(seq²*head_dim) to O(seq_h²*seq_w*head_dim + seq_w²*seq_h*head_dim).
+             */
+
+            /* Height bias: for each dy offset, fill matching blocks */
+            for (int dy = 0; dy < 2 * seq_h - 1; dy++) {
+                int actual_dy = dy - (seq_h - 1);
+                const float *rh_vec = eff_rel_h + dy * head_dim;
+
+                for (int qy = 0; qy < seq_h; qy++) {
+                    int ky = qy - actual_dy;
+                    if (ky < 0 || ky >= seq_h) continue;
+
+                    int row_start = qy * seq_w;
+                    int col_start = ky * seq_w;
+
+                    /* Compute dot products for each qx: [seq_w] vector */
+                    for (int qx = 0; qx < seq_w; qx++) {
+                        const float *q_vec = Q_h + (row_start + qx) * dim;
+                        float bias = 0.0f;
+                        for (int d = 0; d < head_dim; d++)
+                            bias += q_vec[d] * rh_vec[d];
+
+                        /* Fill entire row in this block (same value for all kx) */
+                        float *row = scores + (row_start + qx) * seq_len + col_start;
+                        for (int kx = 0; kx < seq_w; kx++)
+                            row[kx] += bias;
+                    }
+                }
+            }
+
+            /* Width bias: for each dx offset, fill matching positions */
+            for (int dx = 0; dx < 2 * seq_w - 1; dx++) {
+                int actual_dx = dx - (seq_w - 1);
+                const float *rw_vec = eff_rel_w + dx * head_dim;
+
+                for (int qx = 0; qx < seq_w; qx++) {
+                    int kx = qx - actual_dx;
+                    if (kx < 0 || kx >= seq_w) continue;
+
+                    /* For each qy: compute dot product and add to score */
+                    for (int qy = 0; qy < seq_h; qy++) {
+                        const float *q_vec = Q_h + (qy * seq_w + qx) * dim;
+                        float bias = 0.0f;
+                        for (int d = 0; d < head_dim; d++)
+                            bias += q_vec[d] * rw_vec[d];
+
+                        /* Add to all ky positions at column kx */
+                        for (int ky = 0; ky < seq_h; ky++) {
+                            int row = qy * seq_w + qx;
+                            int col = ky * seq_w + kx;
+                            scores[row * seq_len + col] += bias;
+                        }
+                    }
+                }
+            }
+
+            /* Debug: dump scores with bias for block 11 head 0 */
+            if (layer_idx == 11 && h == 0 && getenv("DS_DUMP_TENSORS")) {
+                FILE *sf = fopen("dump/c_block11_h0_scores_with_bias.bin", "wb");
+                if (sf) { fwrite(scores, sizeof(float), (size_t)seq_len * seq_len, sf); fclose(sf); }
+                fprintf(stderr, "Dumped block11 head0 scores+relpos_bias (%d x %d)\n", seq_len, seq_len);
+            }
+
+            /* Step 2b: Softmax (row-wise), float32.
+             * Python's nn.Softmax runs on FP32 tensors — float32 here matches
+             * it and is ~4x faster than the previous double-precision loop
+             * (16.7M exp() calls per head on 1024x1024 input made softmax the
+             * single largest SAM cost). */
+            for (int i = 0; i < seq_len; i++) {
+                float *score_row = scores + i * seq_len;
+
+                float max_s = -1e30f;
+                for (int j = 0; j < seq_len; j++) {
+                    float s = score_row[j];
+                    if (s > max_s) max_s = s;
+                }
+
+                float sum_e = 0.0f;
+                for (int j = 0; j < seq_len; j++) {
+                    float e = expf(score_row[j] - max_s);
+                    score_row[j] = e;
+                    sum_e += e;
+                }
+                if (sum_e > 0.0f) {
+                    float inv = 1.0f / sum_e;
+                    for (int j = 0; j < seq_len; j++)
+                        score_row[j] *= inv;
+                }
+            }
+
+            /* Step 3: attn_out_h = softmax_scores @ V_h
+             * scores is [seq_len, seq_len], V_h is [seq_len, head_dim] with stride dim
+             * out_h is [seq_len, head_dim] with stride dim
+             */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, head_dim, seq_len,
+                        1.0f, scores, seq_len, V_h, dim,
+                        0.0f, out_h, dim);
+#else
+            for (int i = 0; i < seq_len; i++) {
+                const float *srow = scores + i * seq_len;
+                float *o_row = out_h + i * dim;
+                for (int d = 0; d < head_dim; d++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < seq_len; j++)
+                        sum += srow[j] * V_h[j * dim + d];
+                    o_row[d] = sum;
+                }
+            }
+#endif
+}
+
+static void *sam_global_worker(void *arg) {
+    sam_global_task_t *t = (sam_global_task_t *)arg;
+    float *scores = (float *)malloc((size_t)t->seq_len * t->seq_len * sizeof(float));
+    if (!scores) return NULL;
+    for (int h = t->tid; h < t->n_heads; h += t->nthreads)
+        sam_global_process_head(t, h, scores);
+    free(scores);
+    return NULL;
+}
+
+
 static void sam_layer_forward(float *out, const float *x,
                                const ds_visual_tokenizer_t *vt,
                                int layer_idx, int seq_h, int seq_w) {
@@ -630,169 +857,39 @@ static void sam_layer_forward(float *out, const float *x,
          */
         float scale = 1.0f / sqrtf((float)head_dim);
 
-        /* Allocate score buffer: [seq_len, seq_len] in row-major */
-        float *scores = (float *)malloc((size_t)seq_len * seq_len * sizeof(float));
+        sam_global_task_t gtask = {
+            .Q = Q, .K = K, .V = V, .attn_out = attn_out,
+            .seq_len = seq_len, .seq_h = seq_h, .seq_w = seq_w,
+            .dim = dim, .n_heads = n_heads, .head_dim = head_dim,
+            .scale = scale, .eff_rel_h = eff_rel_h, .eff_rel_w = eff_rel_w,
+            .layer_idx = layer_idx, .tid = 0, .nthreads = 1,
+        };
 
-        for (int h = 0; h < n_heads; h++) {
-            const float *Q_h = Q + h * head_dim;   /* [seq_len, dim] with stride dim */
-            const float *K_h = K + h * head_dim;
-            const float *V_h = V + h * head_dim;
-            float *out_h = attn_out + h * head_dim;
-
-            /* Step 1: scores = Q_h @ K_h^T * scale
-             * Q_h is [seq_len, dim] with leading dim = dim, but we only want
-             * the head_dim columns. We use a stride-aware sgemm:
-             * Q_h has stride=dim, but only head_dim contiguous elements per row.
-             * K_h similarly.
-             *
-             * Since Q/K are laid out as [seq_len, n_heads*head_dim], and we want
-             * columns [h*head_dim .. (h+1)*head_dim), we need to use the
-             * column-major BLAS with appropriate leading dimensions.
-             *
-             * Equivalently: scores[i,j] = sum_d Q[i, h*hd+d] * K[j, h*hd+d]
-             * = Q[:, h*hd:(h+1)*hd] @ K[:, h*hd:(h+1)*hd]^T
-             *
-             * Using CblasRowMajor, CblasNoTrans, CblasTrans:
-             *   C = alpha * A * B^T + beta * C
-             *   A = Q_h [seq_len, head_dim], lda = dim (row stride)
-             *   B = K_h [seq_len, head_dim], ldb = dim (row stride)
-             *   C = scores [seq_len, seq_len], ldc = seq_len
-             */
-#ifdef USE_BLAS
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        seq_len, seq_len, head_dim,
-                        scale, Q_h, dim, K_h, dim,
-                        0.0f, scores, seq_len);
-#else
-            for (int i = 0; i < seq_len; i++) {
-                for (int j = 0; j < seq_len; j++) {
-                    float s = 0.0f;
-                    for (int d = 0; d < head_dim; d++)
-                        s += Q_h[i * dim + d] * K_h[j * dim + d];
-                    scores[i * seq_len + j] = s * scale;
+        if (sam_gate_gbl() && ds_get_threads() > 1) {
+            int nw = sam_gate_gbl();
+            const char *nw_env = getenv("DS_SAM_GBL_THREADS");
+            if (nw_env && nw_env[0]) { int v = atoi(nw_env); if (v > 0) nw = v; }
+            if (nw > n_heads) nw = n_heads;
+            if (nw > 1) {
+                pthread_t *th = (pthread_t *)malloc((nw - 1) * sizeof(pthread_t));
+                sam_global_task_t *dt = (sam_global_task_t *)malloc(nw * sizeof(sam_global_task_t));
+                for (int i = 1; i < nw; i++) {
+                    dt[i] = gtask; dt[i].tid = i; dt[i].nthreads = nw;
+                    pthread_create(&th[i - 1], NULL, sam_global_worker, &dt[i]);
                 }
+                gtask.nthreads = nw;
+                sam_global_worker(&gtask);
+                for (int i = 1; i < nw; i++) pthread_join(th[i - 1], NULL);
+                free(th); free(dt);
+            } else {
+                float *scores = (float *)malloc((size_t)seq_len * seq_len * sizeof(float));
+                for (int h = 0; h < n_heads; h++) sam_global_process_head(&gtask, h, scores);
+                free(scores);
             }
-#endif
-
-            /* Step 2: Add rel_pos bias using block-structured computation.
-             *
-             * Key insight: rel_pos bias decomposes as:
-             *   bias_h[i,j] = Q[i] · rh[qy-ky+seq_h-1]  (depends on qy,ky only)
-             *   bias_w[i,j] = Q[i] · rw[qx-kx+seq_w-1]  (depends on qx,kx only)
-             *
-             * For height: within a (qy,ky) block, bias is row-constant.
-             * For width: within a (qx,kx) block, bias is col-constant.
-             * This reduces O(seq²*head_dim) to O(seq_h²*seq_w*head_dim + seq_w²*seq_h*head_dim).
-             */
-
-            /* Height bias: for each dy offset, fill matching blocks */
-            for (int dy = 0; dy < 2 * seq_h - 1; dy++) {
-                int actual_dy = dy - (seq_h - 1);
-                const float *rh_vec = eff_rel_h + dy * head_dim;
-
-                for (int qy = 0; qy < seq_h; qy++) {
-                    int ky = qy - actual_dy;
-                    if (ky < 0 || ky >= seq_h) continue;
-
-                    int row_start = qy * seq_w;
-                    int col_start = ky * seq_w;
-
-                    /* Compute dot products for each qx: [seq_w] vector */
-                    for (int qx = 0; qx < seq_w; qx++) {
-                        const float *q_vec = Q_h + (row_start + qx) * dim;
-                        float bias = 0.0f;
-                        for (int d = 0; d < head_dim; d++)
-                            bias += q_vec[d] * rh_vec[d];
-
-                        /* Fill entire row in this block (same value for all kx) */
-                        float *row = scores + (row_start + qx) * seq_len + col_start;
-                        for (int kx = 0; kx < seq_w; kx++)
-                            row[kx] += bias;
-                    }
-                }
-            }
-
-            /* Width bias: for each dx offset, fill matching positions */
-            for (int dx = 0; dx < 2 * seq_w - 1; dx++) {
-                int actual_dx = dx - (seq_w - 1);
-                const float *rw_vec = eff_rel_w + dx * head_dim;
-
-                for (int qx = 0; qx < seq_w; qx++) {
-                    int kx = qx - actual_dx;
-                    if (kx < 0 || kx >= seq_w) continue;
-
-                    /* For each qy: compute dot product and add to score */
-                    for (int qy = 0; qy < seq_h; qy++) {
-                        const float *q_vec = Q_h + (qy * seq_w + qx) * dim;
-                        float bias = 0.0f;
-                        for (int d = 0; d < head_dim; d++)
-                            bias += q_vec[d] * rw_vec[d];
-
-                        /* Add to all ky positions at column kx */
-                        for (int ky = 0; ky < seq_h; ky++) {
-                            int row = qy * seq_w + qx;
-                            int col = ky * seq_w + kx;
-                            scores[row * seq_len + col] += bias;
-                        }
-                    }
-                }
-            }
-
-            /* Debug: dump scores with bias for block 11 head 0 */
-            if (layer_idx == 11 && h == 0 && getenv("DS_DUMP_TENSORS")) {
-                FILE *sf = fopen("dump/c_block11_h0_scores_with_bias.bin", "wb");
-                if (sf) { fwrite(scores, sizeof(float), (size_t)seq_len * seq_len, sf); fclose(sf); }
-                fprintf(stderr, "Dumped block11 head0 scores+relpos_bias (%d x %d)\n", seq_len, seq_len);
-            }
-
-            /* Step 2b: Softmax (row-wise), float32.
-             * Python's nn.Softmax runs on FP32 tensors — float32 here matches
-             * it and is ~4x faster than the previous double-precision loop
-             * (16.7M exp() calls per head on 1024x1024 input made softmax the
-             * single largest SAM cost). */
-            for (int i = 0; i < seq_len; i++) {
-                float *score_row = scores + i * seq_len;
-
-                float max_s = -1e30f;
-                for (int j = 0; j < seq_len; j++) {
-                    float s = score_row[j];
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_e = 0.0f;
-                for (int j = 0; j < seq_len; j++) {
-                    float e = expf(score_row[j] - max_s);
-                    score_row[j] = e;
-                    sum_e += e;
-                }
-                if (sum_e > 0.0f) {
-                    float inv = 1.0f / sum_e;
-                    for (int j = 0; j < seq_len; j++)
-                        score_row[j] *= inv;
-                }
-            }
-
-            /* Step 3: attn_out_h = softmax_scores @ V_h
-             * scores is [seq_len, seq_len], V_h is [seq_len, head_dim] with stride dim
-             * out_h is [seq_len, head_dim] with stride dim
-             */
-#ifdef USE_BLAS
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        seq_len, head_dim, seq_len,
-                        1.0f, scores, seq_len, V_h, dim,
-                        0.0f, out_h, dim);
-#else
-            for (int i = 0; i < seq_len; i++) {
-                const float *srow = scores + i * seq_len;
-                float *o_row = out_h + i * dim;
-                for (int d = 0; d < head_dim; d++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < seq_len; j++)
-                        sum += srow[j] * V_h[j * dim + d];
-                    o_row[d] = sum;
-                }
-            }
-#endif
+        } else {
+            float *scores = (float *)malloc((size_t)seq_len * seq_len * sizeof(float));
+            for (int h = 0; h < n_heads; h++) sam_global_process_head(&gtask, h, scores);
+            free(scores);
         }
 
     } else {
@@ -819,7 +916,7 @@ static void sam_layer_forward(float *out, const float *x,
             .tid = 0, .nthreads = 1,
         };
 
-        if (ds_sam_window_parallel && n_windows > 1 && ds_get_threads() > 1) {
+        if (sam_gate_win() && n_windows > 1 && ds_get_threads() > 1) {
             /* Parallel windows: raw pthreads with stride partitioning (not the
              * shared thread pool — SAM may already be running inside a crop
              * worker thread; the gate keeps this path single-SAM only).
@@ -1212,6 +1309,10 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     ds_visual_tokenizer_t *vt = &ctx->vis_tokenizer;
     ds_config_t *cfg = &ctx->config;
 
+    /* Debug: SAM 调用序号 (0=global 图，串行确定；1+=local crops 并行竞争)。
+     * 原子自增保证 9 个 crop 线程各自拿到唯一 slot。 */
+    int _sam_call_idx = __sync_fetch_and_add(&g_sam_call_idx, 1);
+
     /* Patch embedding */
     int grid_h, grid_w;
     float *patch_spatial = sam_patch_embed(image_chw, img_h, img_w,
@@ -1227,24 +1328,32 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     }
 
     /* Debug: dump patch_embed and input image for comparison */
-    if (getenv("DS_DUMP_PATCH_EMBED")) {
-        FILE *df = fopen("dump/c_sam_patch_embed.bin", "wb");
+    if (getenv("DS_DUMP_PATCH_EMBED") && _sam_call_idx < 2) {
+        char _pp[256], _ip[256];
+        snprintf(_pp, sizeof(_pp), "dump/c_samslot%d_patch_embed.bin", _sam_call_idx);
+        snprintf(_ip, sizeof(_ip), "dump/c_samslot%d_input.bin", _sam_call_idx);
+        FILE *df = fopen(_pp, "wb");
         if (df) { fwrite(patch_spatial, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
-        df = fopen("dump/c_sam_input_image.bin", "wb");
+        df = fopen(_ip, "wb");
         if (df) { fwrite(image_chw, sizeof(float), 3 * img_h * img_w, df); fclose(df); }
-        fprintf(stderr, "Dumped patch_embed (%d patches x %d dim) and input image (%dx%d)\n",
-                n_patches, DS_SAM_EMBED_DIM, img_w, img_h);
+        fprintf(stderr, "Dumped slot%d patch_embed (%d p) + input (%dx%d)\n",
+                _sam_call_idx, n_patches, img_w, img_h);
     }
 
     /* Add positional embedding (with interpolation for non-1024 inputs) */
     float *x = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
 
-    if (cfg->model_version == 2) {
-        /* V2: pos_embed is 2D spatial [1, src_grid, src_grid, 768]
-         * src_grid = image_size / patch_size = 1024/16 = 64
-         * If input is 768x768, grid = 48, need bicubic interpolation 64->48 */
+    /* All versions (V1/V2/V3): the checkpoint stores pos_embed as a 2D spatial
+     * grid [1, 64, 64, 768] with NO CLS token — verified in all three model
+     * safetensors headers. Inputs smaller than 1024² (V2 768 crops → grid 48,
+     * V3 640 crops/small images → grid 40) need bicubic interpolation 64→grid,
+     * matching Python's get_abs_pos_sam(). Indexing is row-major over the
+     * ACTUAL patch grid; the old per-version branches (V1 "+1 CLS offset",
+     * V3 "no interpolation") were both wrong and the V1 one also read past
+     * the end of the 4096-row tensor. */
+    {
         int src_grid = cfg->image_size / DS_SAM_PATCH_SIZE;  /* 64 */
-        int tgt_grid = grid_h;  /* may differ from src_grid for 768x768 inputs */
+        int tgt_grid = grid_h;  /* may differ from src_grid for 768/640 inputs */
 
         float *pos_embed = vt->sam_pos_embed;
         float *interp_pos = NULL;
@@ -1285,27 +1394,31 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
             }
         }
 
+        /* Debug: dump SAM 输入三件套 (slot1 = 首个 local crop, 对照官方 tile0)
+         * 1) patch_spatial — conv 后的 patch 特征 (加 pos 前, CHW→HWC 后)
+         * 2) 插值后的 pos_embed
+         * 3) 相加结果 = SAM 层 0 输入 */
+        {
+            extern int ds_sam_debug_slot(void);
+            if (getenv("DS_DUMP_SAM_LAYERS") && ds_sam_debug_slot() == 1) {
+                FILE *df;
+                /* patch_spatial 是 CHW 布局，先转 token-major 再存 */
+                float *pmaj = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
+                for (int p = 0; p < n_patches; p++)
+                    for (int d = 0; d < DS_SAM_EMBED_DIM; d++)
+                        pmaj[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p];
+                df = fopen("dump/c_slot1_patch.bin", "wb");
+                if (df) { fwrite(pmaj, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
+                free(pmaj);
+                df = fopen("dump/c_slot1_pos.bin", "wb");
+                if (df) { fwrite(pos_embed, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
+                df = fopen("dump/c_slot1_after_posembed.bin", "wb");
+                if (df) { fwrite(x, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
+                fprintf(stderr, "Dumped SAM slot1 patch/pos/sum\n");
+            }
+        }
+
         if (interp_pos) free(interp_pos);
-    } else if (cfg->model_version == 3) {
-        /* V3 (Unlimited-OCR): pos_embed is 2D spatial [1, 64, 64, 768] (same as V2)
-         * No CLS token, no interpolation needed for 1024×1024 input (64×64 patches).
-         * Uses the same 2D spatial indexing as V2. */
-        for (int p = 0; p < n_patches; p++) {
-            int row = p / grid_w;
-            int col = p % grid_w;
-            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
-                    + vt->sam_pos_embed[(row * grid_w + col) * DS_SAM_EMBED_DIM + d];
-            }
-        }
-    } else {
-        /* V1: pos_embed is 1D sequence [1, n_patches+1, 768] (with CLS token at index 0) */
-        for (int p = 0; p < n_patches; p++) {
-            for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
-                x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
-                    + vt->sam_pos_embed[(p + 1) * DS_SAM_EMBED_DIM + d];
-            }
-        }
     }
     free(patch_spatial);
 
@@ -1313,33 +1426,35 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         fprintf(stderr, "SAM patch embed: %dx%d -> %d patches (grid %dx%d)\n",
                 img_h, img_w, n_patches, grid_h, grid_w);
 
-    /* SAM transformer layers (12 layers with window/global attention) */
-    static int _sam_call_idx = 0;  /* track which SAM call (crop 0-5 or global 6) */
     double _sam_t0 = 0, _sam_t1 = 0; struct timespec _sam_ts; clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t0 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9;
     for (int l = 0; l < 12; l++) {
         float *next = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
         sam_layer_forward(next, x, vt, l, grid_h, grid_w);
         
         /* Debug: dump layer output for comparison with Python (only crop 0 to avoid overwrite) */
-        if (getenv("DS_DUMP_SAM_LAYERS") && _sam_call_idx == 0) {
+        int _dump_this = getenv("DS_DUMP_SAM_LAYERS") != NULL &&
+                         (_sam_call_idx == 0 || _sam_call_idx == 1);
+        int _dump_slot = _sam_call_idx == 0 ? 0 : 1;  /* 0=global, 1=首个local crop */
+        if (_dump_this) {
             char _lpath[256];
-            snprintf(_lpath, sizeof(_lpath), "dump/c_sam_crop0_layer%d_out.bin", l);
+            snprintf(_lpath, sizeof(_lpath), "dump/c_samslot%d_layer%d_out.bin", _dump_slot, l);
             FILE *df = fopen(_lpath, "wb");
             if (df) { fwrite(next, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
             /* Also dump input to SAM layer 0 (after pos_embed) */
             if (l == 0) {
-                df = fopen("dump/c_sam_crop0_after_posembed.bin", "wb");
+                snprintf(_lpath, sizeof(_lpath), "dump/c_samslot%d_after_posembed.bin", _dump_slot);
+                df = fopen(_lpath, "wb");
                 if (df) { fwrite(x, sizeof(float), n_patches * DS_SAM_EMBED_DIM, df); fclose(df); }
             }
-            fprintf(stderr, "Dumped SAM layer %d I/O for comparison\n", l);
+            fprintf(stderr, "Dumped SAM slot%d layer %d I/O for comparison\n", _dump_slot, l);
         }
         
         free(x);
         x = next;
 
         if (ds_verbose >= 1)
-            clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t1 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9; \
-            if (ds_verbose >= 2) fprintf(stderr, "  SAM layer %d: %.2fs\n", l, _sam_t1 - _sam_t0); _sam_t0 = _sam_t1;
+            clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t1 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9;
+        if (ds_verbose >= 2) fprintf(stderr, "  SAM layer %d: %.2fs\n", l, _sam_t1 - _sam_t0); _sam_t0 = _sam_t1;
 
         if (ds_verbose >= 2)
             fprintf(stderr, "SAM layer %d/%d done (global_attn=%d)\n", l + 1, 12,
@@ -1397,8 +1512,6 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
     if (ds_verbose >= 1)
         fprintf(stderr, "SAM forward: %dx%d -> %d tokens (grid %dx%d, downsampled %dx%d)\n",
                 img_h, img_w, *out_n_tokens, grid_h, grid_w, ds_h, ds_w);
-
-    _sam_call_idx++;  /* increment for next SAM call (next crop or global view) */
 
     return tokens;
 }
@@ -1466,8 +1579,10 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
              * Same as V2 — pad to maintain aspect ratio, don't stretch. */
             resized_img = ds_image_pad(&img, target_size, 127);
         } else {
-            /* V1: stretch to target size */
-            resized_img = ds_image_resize(&img, target_size, target_size);
+            /* V1: Python's crop-mode global view is ImageOps.pad(image,(1024,1024),127)
+             * — pad to preserve aspect ratio. The old stretch distorted the
+             * aspect ratio of non-square documents before SAM ever saw them. */
+            resized_img = ds_image_pad(&img, target_size, 127);
         }
         if (!resized_img) {
             fprintf(stderr, "Failed to resize image\n");

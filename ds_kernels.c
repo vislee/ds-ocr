@@ -921,6 +921,46 @@ static void ds_bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_
     ds_parallel_for(ds_matvec_worker, &task);
 }
 
+/* ── Grouped row-parallel matvec（解码 MoE 快路径，r4）──
+ * 以"行对"为切分粒度（见 ds_kernels.h 注释）：线程边界永远落在偶数行对齐处，
+ * 每行的累加顺序与整段调用 bf16_matvec_fused 时完全一致 → 数值逐位不变。
+ * 输入指针按单元给出：gate/up 共享同一 x，down 用各自专家的 SwiGLU 输出。 */
+typedef struct {
+    float *out;
+    const float *const *X;
+    const uint16_t *const *W;
+    int n_units;
+    int rows_per_unit;
+    int in_dim;
+} ds_grouped_matvec_task_t;
+
+static void ds_grouped_matvec_worker(int tid, int n_threads, void *arg) {
+    ds_grouped_matvec_task_t *t = (ds_grouped_matvec_task_t *)arg;
+    int pairs_per_unit = t->rows_per_unit / 2;
+    int total_pairs = t->n_units * pairs_per_unit;
+    int chunk = (total_pairs + n_threads - 1) / n_threads;
+    int p = tid * chunk;
+    int p_end = p + chunk;
+    if (p_end > total_pairs) p_end = total_pairs;
+
+    while (p < p_end) {
+        int unit = p / pairs_per_unit;
+        int pair0 = p - unit * pairs_per_unit;
+        int pairs_here = pairs_per_unit - pair0;
+        if (pairs_here > p_end - p) pairs_here = p_end - p;
+        bf16_matvec_fused(t->out + (size_t)unit * t->rows_per_unit + 2 * pair0,
+                          t->X[unit], t->W[unit] + (size_t)2 * pair0 * t->in_dim,
+                          NULL, t->in_dim, 2 * pairs_here);
+        p += pairs_here;
+    }
+}
+
+void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *const *W,
+                             int n_units, int rows_per_unit, int in_dim) {
+    ds_grouped_matvec_task_t task = { out, X, W, n_units, rows_per_unit, in_dim };
+    ds_parallel_for(ds_grouped_matvec_worker, &task);
+}
+
 typedef struct {
     float *q;
     float *k;
@@ -1117,86 +1157,91 @@ int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
     return ds_argmax_matvec_bf16_excluding(x, W_bf16, in_dim, out_dim, NULL, 0);
 }
 
-/* Argmax with token ID exclusion list (for V3 det tag suppression).
- * Each thread's chunk skips excluded token IDs when checking the best. */
+/* True if id appears in the exclusion list (n is tiny, linear scan) */
+static int ds_id_excluded(const int *exclude_ids, int n_exclude, int id) {
+    for (int e = 0; e < n_exclude; e++)
+        if (exclude_ids[e] == id) return 1;
+    return 0;
+}
+
+/* Exact argmax over [0, out_dim) with excluded rows skipped.
+ * Splits the range into contiguous segments around the sorted/deduped
+ * excluded ids and runs the fast range kernel on each segment, so the
+ * result is the TRUE best non-excluded row. The previous per-thread /
+ * per-chunk fallbacks dropped a thread's (or chunk's) runner-up when its
+ * best was excluded and could return a lower-ranked token. Cost: one
+ * extra full-vocab scan (~8ms) on the rare ban-hit step. */
+static int ds_argmax_rescan_excluding(const float *x, const uint16_t *W_bf16,
+                                      int in_dim, int out_dim,
+                                      const int *exclude_ids, int n_exclude) {
+    int ex[64];
+    int n = n_exclude < 64 ? n_exclude : 64;
+    for (int i = 0; i < n; i++) ex[i] = exclude_ids[i];
+    /* Insertion sort + dedupe (n is tiny) */
+    for (int i = 1; i < n; i++) {
+        int v = ex[i], j = i - 1;
+        while (j >= 0 && ex[j] > v) { ex[j + 1] = ex[j]; j--; }
+        ex[j + 1] = v;
+    }
+    int m = 0;
+    for (int i = 0; i < n; i++)
+        if (i == 0 || ex[i] != ex[i - 1]) ex[m++] = ex[i];
+
+    int best = -1;
+    float best_val = -1e30f;
+    int start = 0;
+    for (int k = 0; k < m; k++) {
+        int e = ex[k];
+        if (e < start) continue;         /* duplicate or unsorted leftover */
+        if (e > out_dim - 1) break;      /* beyond vocab */
+        if (e > start) {
+            int chunk_best;
+            float chunk_val;
+            argmax_bf16_range(x, W_bf16, in_dim, start, e, &chunk_best, &chunk_val);
+            if (chunk_val > best_val) { best_val = chunk_val; best = chunk_best; }
+        }
+        start = e + 1;
+    }
+    if (start < out_dim) {
+        int chunk_best;
+        float chunk_val;
+        argmax_bf16_range(x, W_bf16, in_dim, start, out_dim, &chunk_best, &chunk_val);
+        if (chunk_val > best_val) { best_val = chunk_val; best = chunk_best; }
+    }
+    return best >= 0 ? best : 0;
+}
+
+/* Argmax with token ID exclusion list (n-gram blocking, EOS warmup ban).
+ * The common case (winner not excluded) costs one streaming argmax; when
+ * the winner IS excluded we rescan exactly around the excluded rows. */
 int ds_argmax_matvec_bf16_excluding(const float *x, const uint16_t *W_bf16,
                                        int in_dim, int out_dim,
                                        const int *exclude_ids, int n_exclude) {
-    if (tp.n_threads <= 1) {
-        int best;
+    int best;
+    if (tp.n_threads > 1) {
+        ds_argmax_task_t task;
+        task.x = x;
+        task.W_bf16 = W_bf16;
+        task.in_dim = in_dim;
+        task.out_dim = out_dim;
+        ds_parallel_for(ds_argmax_worker, &task);
+
+        best = task.best_idx[0];
+        float best_val = task.best_val[0];
+        for (int i = 1; i < tp.n_threads; i++) {
+            if (task.best_val[i] > best_val) {
+                best_val = task.best_val[i];
+                best = task.best_idx[i];
+            }
+        }
+    } else {
         float best_val;
         argmax_bf16_range(x, W_bf16, in_dim, 0, out_dim, &best, &best_val);
-        for (int e = 0; e < n_exclude; e++) {
-            if (best == exclude_ids[e]) {
-                /* Best was excluded — redo argmax and skip excluded IDs.
-                 * For small exclusion lists, just re-do the argmax ignoring them. */
-                int second_best = 0;
-                float second_val = -1e30f;
-                for (int chunk_start = 0; chunk_start < out_dim; chunk_start += 8192) {
-                    int chunk_end = chunk_start + 8192;
-                    if (chunk_end > out_dim) chunk_end = out_dim;
-                    int chunk_best;
-                    float chunk_val;
-                    argmax_bf16_range(x, W_bf16, in_dim, chunk_start, chunk_end, &chunk_best, &chunk_val);
-                    int skip = 0;
-                    for (int e2 = 0; e2 < n_exclude; e2++) {
-                        if (chunk_best == exclude_ids[e2]) { skip = 1; break; }
-                    }
-                    if (!skip && chunk_val > second_val) {
-                        second_val = chunk_val;
-                        second_best = chunk_best;
-                    }
-                }
-                return second_best;
-            }
-        }
-        return best;
     }
 
-    ds_argmax_task_t task;
-    task.x = x;
-    task.W_bf16 = W_bf16;
-    task.in_dim = in_dim;
-    task.out_dim = out_dim;
-    ds_parallel_for(ds_argmax_worker, &task);
-
-    int best = task.best_idx[0];
-    float best_val = task.best_val[0];
-    for (int i = 1; i < tp.n_threads; i++) {
-        if (task.best_val[i] > best_val) {
-            best_val = task.best_val[i];
-            best = task.best_idx[i];
-        }
-    }
-    /* Check if the global best is in the exclusion list */
-    for (int e = 0; e < n_exclude; e++) {
-        if (best == exclude_ids[e]) {
-            /* Global best was excluded — find best from per-thread results
-             * that is NOT in the exclusion list. */
-            int found = 0;
-            int second_best = -1;
-            float second_val = -1e30f;
-            for (int i = 0; i < tp.n_threads; i++) {
-                int tid_best = task.best_idx[i];
-                float tid_val = task.best_val[i];
-                int tid_excluded = 0;
-                for (int e2 = 0; e2 < n_exclude; e2++) {
-                    if (tid_best == exclude_ids[e2]) { tid_excluded = 1; break; }
-                }
-                if (tid_excluded) continue;
-                if (!found || tid_val > second_val) {
-                    second_val = tid_val;
-                    second_best = tid_best;
-                    found = 1;
-                }
-            }
-            if (found) return second_best;
-            /* Fallback: if ALL thread bests are excluded, compute dot products
-             * for a small set of common tokens to find the real best.
-             * This should never happen in practice with 8 threads and 4 excluded IDs. */
-            break;
-        }
-    }
+    if (n_exclude > 0 && ds_id_excluded(exclude_ids, n_exclude, best))
+        return ds_argmax_rescan_excluding(x, W_bf16, in_dim, out_dim,
+                                          exclude_ids, n_exclude);
     return best;
 }
 
@@ -2378,6 +2423,100 @@ void ds_causal_attention_aligned(float *out, const float *Q, const float *K, con
  * Reference Sliding Window Attention (R-SWA) for Unlimited-OCR
  * ======================================================================== */
 
+float ds_dot_bf16xf32(const uint16_t *k, const float *q, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) {
+        union { uint32_t u; float f; } e;
+        e.u = (uint32_t)k[i] << 16;
+        s += q[i] * e.f;
+    }
+    return s;
+}
+
+void ds_axpy_bf16xf32(float *o, const uint16_t *v, float w, int n) {
+    for (int i = 0; i < n; i++) {
+        union { uint32_t u; float f; } e;
+        e.u = (uint32_t)v[i] << 16;
+        o[i] += w * e.f;
+    }
+}
+
+/* R-SWA decode: 每 head 独立（在线 softmax 只依赖本 head 的 Q/O），
+ * 参考集 [0,prefill_len) + 窗口 [window_start,kv_seq_len) 两段扫描按 head 切分并行。 */
+typedef struct {
+    float *out; const float *Q; const float *K_base; const float *V_base;
+    const uint16_t *K16; const uint16_t *V16;   /* BF16 KV 模式（r2 任务2） */
+    int bf16;
+    int n_heads, head_dim; float scale; int kv_stride;
+    int prefill_len, window_start, kv_seq_len;
+} ds_rswa_attn_task_t;
+
+static void ds_rswa_attn_worker(int tid, int nt, void *arg) {
+    ds_rswa_attn_task_t *t = (ds_rswa_attn_task_t *)arg;
+    int chunk = (t->n_heads + nt - 1) / nt;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    for (int h = h0; h < h1; h++) {
+        const float *q = t->Q + h * t->head_dim;
+        float *o = t->out + h * t->head_dim;
+        const float *k_h = t->bf16 ? NULL : t->K_base + h * t->head_dim;
+        const float *v_h = t->bf16 ? NULL : t->V_base + h * t->head_dim;
+        const uint16_t *k16 = t->bf16 ? t->K16 + h * t->head_dim : NULL;
+        const uint16_t *v16 = t->bf16 ? t->V16 + h * t->head_dim : NULL;
+        float max_s = -1e30f, sum_e = 0.0f;
+        for (int d = 0; d < t->head_dim; d++) o[d] = 0.0f;
+
+        /* Range 1: reference [0, prefill_len) + Range 2: window
+         * [window_start, kv_seq_len)，两段共用同一在线 softmax 状态 */
+        for (int range = 0; range < 2; range++) {
+            int j0 = range == 0 ? 0 : t->window_start;
+            int j1 = range == 0 ? t->prefill_len : t->kv_seq_len;
+            for (int j = j0; j < j1; j++) {
+                float score;
+                if (t->bf16) {
+                    score = ds_dot_bf16xf32(k16 + (size_t)j * t->kv_stride, q, t->head_dim) * t->scale;
+                } else {
+                    const float *k_row = k_h + (size_t)j * t->kv_stride;
+                    score = ds_dot_f32(q, k_row, t->head_dim) * t->scale;
+                }
+                if (j + 2 < j1) {
+                    if (t->bf16) {
+                        __builtin_prefetch(k16 + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                        __builtin_prefetch(v16 + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                    } else {
+                        __builtin_prefetch(k_h + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                        __builtin_prefetch(v_h + (size_t)(j + 2) * t->kv_stride, 0, 1);
+                    }
+                }
+                if (score > max_s) {
+                    float corr = ds_fast_expf(max_s - score);
+                    sum_e = sum_e * corr + 1.0f;
+                    if (t->bf16) {
+                        /* o = o*corr + v（与 F32 路径 ds_vec_scale_add 同一数学） */
+                        ds_vec_scale_inplace(o, corr, t->head_dim);
+                        ds_axpy_bf16xf32(o, v16 + (size_t)j * t->kv_stride, 1.0f, t->head_dim);
+                    } else {
+                        const float *v_row = v_h + (size_t)j * t->kv_stride;
+                        ds_vec_scale_add(o, v_row, corr, t->head_dim);
+                    }
+                    max_s = score;
+                } else {
+                    float wt = ds_fast_expf(score - max_s);
+                    sum_e += wt;
+                    if (t->bf16) {
+                        ds_axpy_bf16xf32(o, v16 + (size_t)j * t->kv_stride, wt, t->head_dim);
+                    } else {
+                        const float *v_row = v_h + (size_t)j * t->kv_stride;
+                        ds_vec_axpy_inplace(o, v_row, wt, t->head_dim);
+                    }
+                }
+            }
+        }
+        if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, t->head_dim);
+    }
+}
+
 void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, const float *V_base,
                                 int seq_q, int n_heads, int n_kv_heads, int head_dim,
                                 float scale, int kv_stride,
@@ -2398,6 +2537,17 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
 
     if (seq_q == 1 && n_heads == n_kv_heads) {
         /* Single-token decode fast path */
+        if (tp.n_threads > 1 && n_heads >= 2) {
+            ds_rswa_attn_task_t task = {
+                .out = out, .Q = Q, .K_base = K_base, .V_base = V_base,
+                .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+                .kv_stride = kv_stride,
+                .prefill_len = prefill_len, .window_start = window_start,
+                .kv_seq_len = kv_seq_len
+            };
+            ds_parallel_for(ds_rswa_attn_worker, &task);
+            return;
+        }
         for (int h = 0; h < n_heads; h++) {
             const float *q = Q + h * head_dim;
             const float *k_h = K_base + h * head_dim;
@@ -2454,6 +2604,7 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
         return;
     }
 
+
     /* General path: compute attention over combined reference + window positions.
      * For each head, build a compact K/V array from the two ranges,
      * then use standard attention. This is slower but handles GQA correctly. */
@@ -2505,6 +2656,33 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
 
         if (sum_e > 0.0f) ds_vec_scale_inplace(o, 1.0f / sum_e, head_dim);
     }
+}
+
+void ds_rswa_attention_aligned_bf16(float *out, const float *Q, const void *K_base, const void *V_base,
+                                    int seq_q, int n_heads, int n_kv_heads, int head_dim,
+                                    float scale, int kv_stride,
+                                    int prefill_len, int window_start, int kv_seq_len, int bf16) {
+    if (seq_q != 1 || n_heads != n_kv_heads) {
+        /* BF16 模式仅 V3/V4 解码（seq_q=1, MHA）；防御性断言 */
+        fprintf(stderr, "rswa_bf16: unsupported shape seq_q=%d\n", seq_q);
+        memset(out, 0, (size_t)seq_q * n_heads * head_dim * sizeof(float));
+        return;
+    }
+    ds_rswa_attn_task_t task = {
+        .out = out, .Q = Q,
+        .K_base = (const float *)K_base, .V_base = (const float *)V_base,
+        .K16 = (const uint16_t *)K_base, .V16 = (const uint16_t *)V_base,
+        .bf16 = bf16,
+        .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+        .kv_stride = kv_stride,
+        .prefill_len = prefill_len, .window_start = window_start,
+        .kv_seq_len = kv_seq_len
+    };
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        ds_parallel_for(ds_rswa_attn_worker, &task);
+        return;
+    }
+    ds_rswa_attn_worker(0, 1, &task);
 }
 
 void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {

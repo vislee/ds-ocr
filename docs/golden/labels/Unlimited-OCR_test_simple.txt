@@ -1,0 +1,2 @@
+# source: engine-baseline 2026-10-30（人工对照原图核对通过）
+<|det|>title [20,  190, World World World World World World World World World World World World World World World World World World World World World World World World World World World World World World World World World World World WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WORLD WOR

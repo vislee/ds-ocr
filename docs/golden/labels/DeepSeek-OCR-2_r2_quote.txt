@@ -1,0 +1,6 @@
+# source: engine-baseline r2 2026-10-31（人工对照原图核对通过）
+wafcore只需返回200或403。  
+Action 头返回对应的action。  
+ratelimit: i  
+通过 X-WAF-Reason 头返回匹配的规则。  
+通过 X-WAF- 头返回匹配的规则。

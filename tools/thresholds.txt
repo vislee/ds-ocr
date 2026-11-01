@@ -1,0 +1,37 @@
+# ═══ 冻结的 CER 阈值（%）═══════════════════════════════════════════
+# 键 = 模型_图（不带扩展名）  值 = CER 上限百分比
+# 冻结规则: 基线实测 CER(2026-10-30 全 0.00) + 1pt = 1.0
+# ⚠️ 修改此文件让失败变绿 = 作弊（任务书·规矩）；调整须经领导批准并记 PROGRESS.md
+# 黄金标签来源: 引擎基线输出（人工对照原图核对通过），见 labels/*.txt 头部
+# ═══════════════════════════════════════════════════════════════════
+DeepSeek-OCR_test截屏 1.0
+DeepSeek-OCR_test_simple 1.0
+DeepSeek-OCR_test_crop_640 1.0
+DeepSeek-OCR_crop_real 1.0
+DeepSeek-OCR-2_test截屏 1.0
+DeepSeek-OCR-2_test_simple 1.0
+DeepSeek-OCR-2_test_crop_640 1.0
+DeepSeek-OCR-2_crop_real 1.0
+Unlimited-OCR_test截屏 1.0
+Unlimited-OCR_test_simple 1.0
+Unlimited-OCR_test_crop_640 1.0
+Unlimited-OCR_crop_real 1.0
+Unlimited-OCR-2_test截屏 1.0
+Unlimited-OCR-2_test_simple 1.0
+Unlimited-OCR-2_test_crop_640 1.0
+Unlimited-OCR-2_crop_real 1.0
+
+DeepSeek-OCR_r2_dense 1.0
+DeepSeek-OCR-2_r2_dense 1.0
+Unlimited-OCR_r2_dense 1.0
+Unlimited-OCR-2_r2_dense 1.0
+DeepSeek-OCR_r2_action 1.0
+DeepSeek-OCR-2_r2_action 1.0
+Unlimited-OCR_r2_action 1.0
+DeepSeek-OCR_r2_list 1.0
+DeepSeek-OCR-2_r2_list 1.0
+Unlimited-OCR_r2_list 1.0
+Unlimited-OCR-2_r2_list 1.0
+DeepSeek-OCR_r2_quote 1.0
+DeepSeek-OCR-2_r2_quote 1.0
+Unlimited-OCR-2_r2_quote 1.0

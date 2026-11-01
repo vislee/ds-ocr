@@ -1,0 +1,3 @@
+# source: engine-baseline r2 2026-10-31（人工对照原图核对通过）
+- skip: 实现了白名单功能。
+- deny

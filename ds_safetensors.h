@@ -170,6 +170,10 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir);
  */
 void multi_safetensors_close(multi_safetensors_t *ms);
 
+/* multi_safetensors_madvise_unused — 丢弃 mmap 权重页的常驻副本（省 4-5GB 峰值 RSS）
+ * 见 ds_safetensors.c 内注释。在权重加载（含拷贝/F32 化）完成后调用一次。 */
+void multi_safetensors_madvise_unused(multi_safetensors_t *ms);
+
 /* multi_safetensors_find - 跨所有分片查找指定名称的张量
  *
  * 查找策略：线性遍历所有分片，在每个分片的tensors[]中按名称匹配。

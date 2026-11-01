@@ -1,0 +1,3 @@
+# source: engine-baseline r3 2026-10-31（V4 输出净化后重冻：默认剥离布局标签/丢弃空容器与畸形行，--raw-layout 可还原；用户指示的输出优化）
+Description
+云WAF系统，支持黑白名单和CC的防护系统分为以下阶段：
