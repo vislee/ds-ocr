@@ -131,8 +131,16 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed);
  *   Layer 1~11 shared_gate/up/down: BF16 — 2个共享专家的gate/up/down权重
  *   lm_head_bf16: [129280, 1280] — 输出投影（可能=tok_embeddings共享）
  *
- * 额外构建: gate_up_fused 权重（gate+up拼接为一行，单次matvec代替两次）
- *           连续 expert_block（所有expert+shared在同一块内存，减少page fault）
+ * 权重布局说明（r2 任务3 更新）:
+ *   专家权重按 safetensors 原生 split 布局（gate/up/down 三个独立 mmap
+ *   指针）零拷贝使用，decode 走"分组行并行"快路径（ds_grouped_matvec_bf16）。
+ *   历史版本曾额外构建 gate_up_fused（gate+up 拼接，单次 matvec）与连续
+ *   expert_block（所有专家同块内存减少 page fault），因拷贝导致 mmap 源页
+ *   双份驻留（峰值 RSS ~11-12GB）已移除；ds_dec_layer_t 中的
+ *   gate_up_fused_bf16 / expert_block_bf16 字段现恒为 NULL，fused/Metal-MoE/
+ *   INT4 专家路径在缺块时自动旁路。
+ * 可选: --int4 触发 ds_quantize_moe_int4()，把专家权重按行量化为
+ *   INT8（每行独立 scale/offset，见 ds_quantize.h），约 2× 内存节省。
  */
 int ds_decoder_load(ds_ctx_t *ctx);
 
