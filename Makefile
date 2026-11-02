@@ -85,7 +85,11 @@ help:
 # BLAS backend (Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
-BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_APPLE_VISION -DACCELERATE_NEW_LAPACK
+# ACCELERATE_NEW_LAPACK maps cblas_* to the ILP64 headers, which are annotated
+# API_AVAILABLE(macos(13.3)). Declaring the deployment target explicitly keeps
+# -Wunguarded-availability-new quiet without per-call __builtin_available guards.
+MACOS_MIN = -mmacosx-version-min=13.3
+BLAS_CFLAGS = $(CFLAGS_BASE) $(MACOS_MIN) -DUSE_BLAS -DUSE_APPLE_VISION -DACCELERATE_NEW_LAPACK
 BLAS_LDFLAGS = -lm -lpthread -framework Accelerate -framework ApplicationServices -framework Foundation -framework Vision -framework ImageIO -framework Metal -framework CoreGraphics
 else
 BLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
@@ -133,7 +137,7 @@ test: clean
 
 # Build test binary with debug + ASAN
 test_debug: clean
-	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
+	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) $(MACOS_MIN) -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
 		LDFLAGS="-lm -lpthread -framework Accelerate -framework ApplicationServices -fsanitize=address"
 	@echo ""
 	./$(TEST_TARGET)
