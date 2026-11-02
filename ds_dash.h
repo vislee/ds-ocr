@@ -64,35 +64,62 @@
  *   idx_scale = dash_scale_per_layer/√index_dim = 128/√128,
  *   K = dash_topk_blocks = 12 (读预算槽位数), topm = 16 (entmax 窗口),
  *   floor = dash_prior_floor = 1e-4, sigma = dash_sigma = 1.0 */
-#define DS_DASH_BLOCK_SIZE      32       /* sparse_block_size: KV 分块大小 */
-#define DS_DASH_LOCAL_BLOCKS    4        /* sparse_local_block: 局部块数 → 局部窗128 */
-#define DS_DASH_TOPK_BLOCKS     12       /* dash_topk_blocks: 读预算 K（选中块槽位数） */
-#define DS_DASH_TOPM            16       /* DASH_INFER_TOPM: entmax 前的 top-M 窗口 */
-#define DS_DASH_INDEX_DIM       128      /* sparse_index_dim: 索引头维度 */
-#define DS_DASH_IDX_SCALE       11.3137085f  /* dash_scale_per_layer 128 / sqrt(128) */
-#define DS_DASH_SIGMA           1.0f     /* dash_sigma: bias 温度 */
-#define DS_DASH_FLOOR           1e-4f    /* dash_prior_floor: log 先验下限 */
-#define DS_DASH_TOK_THETA       10000.0f /* sparse_rope_tok_theta: tok 轴基频 */
+#define DS_DASH_BLOCK_SIZE      32       /* sparse_block_size: KV 分块（路由/局部窗单位） */
+#define DS_DASH_LOCAL_BLOCKS    4        /* sparse_local_block: 局部块数 → 局部窗 4×32=128 */
+#define DS_DASH_TOPK_BLOCKS     12       /* dash_topk_blocks: 读预算 K（选中块槽位数）。
+                                             注意 K 是"部署路径直接选 12 个槽"，不是
+                                            "12 里还含局部块"——与训练路径的
+                                             _remote_topk=topk16−local4=12 只是数值巧合
+                                            （docs/14 §4.3 / bug ②） */
+#define DS_DASH_TOPM            16       /* DASH_INFER_TOPM: entmax 前的 top-M 窗口。
+                                             entmax 只在窗口内做（非全块），窗口内归一
+                                            保证 prior 可与 floor 直接 clamp 比较 */
+#define DS_DASH_INDEX_DIM       128      /* sparse_index_dim: 索引头维度（=head_dim=128，
+                                             故主分支与 router 共用同一套 cos/sin 表；
+                                            不相等时官方退回 1D 并告警） */
+#define DS_DASH_IDX_SCALE       11.3137085f  /* dash_scale_per_layer 128 / sqrt(128)。
+                                             作用: 块分数 z 乘它放大到 entmax 的输入量级 */
+#define DS_DASH_SIGMA           1.0f     /* dash_sigma: bias = (logp − μ)/σ 的温度 */
+#define DS_DASH_FLOOR           1e-4f    /* dash_prior_floor: log 先验下限。
+                                             sentinel 槽 prior≈0 → clamp 到 floor →
+                                             logp ≈ ln(1e-4) ≈ −9.2（但仍 invalid） */
+#define DS_DASH_TOK_THETA       10000.0f /* sparse_rope_tok_theta: tok 轴基频。
+                                            resample 模式: 63 对频率里重采样整个频谱
+                                             inv_tok[i] = 10000^(-i/63) */
 #define DS_DASH_PAGE_THETA      256.0f   /* sparse_rope_page_theta: page 轴基频率（page_pairs=1
-                                             时 inv_page = 256^0 = 1，角度 = page%2 弧度） */
-#define DS_DASH_PAGE_MOD        2        /* sparse_rope_page_mod: page 坐标取模 */
-#define DS_DASH_MAX_NBLK        256      /* 8192/32: 块数上限 */
+                                             时 inv_page = 256^0 = 1，角度 = page%2 弧度）。
+                                            【最常见实现错误】写成 p/256——多除了一次
+                                             base，页判别相位差被抹成 ~0.004 rad
+                                            （docs/14 §3.2 / bug ③） */
+#define DS_DASH_PAGE_MOD        2        /* sparse_rope_page_mod: page 坐标取模。
+                                            只表达"同页/跨页"，不表达第几页 */
+#define DS_DASH_MAX_NBLK        256      /* 8192/32: 块数上限（kv_cache_max/block_size） */
 #define DS_DASH_MAX_PAGES       128      /* 页桶数上限（decode 状态机 pf_cnt 表） */
 
 /* 每 token id（来自 sparse_attention_config）*/
 #define DS_TOKEN_PAGE_MARKER    128827   /* <PAGE>: 多页分隔 + 输出分页标记 */
 #define DS_TOKEN_IMAGE_V4       128815   /* <image>: 视觉占位（与 V3 相同） */
 
-/* 每 query 路由结果 */
+/* 每 query 路由结果（route_select 的输出，biased_attention 的输入）
+ * 【为什么 blk 可能是 -1】候选块不足 K 时，top-M 窗口由 sentinel（−1e4）补位
+ * ——entmax 后其 prior≈0 → clamp 到 floor → logp≈−9.2，但 valid=0：
+ * 不进 μ、注意力侧按"块号不存在"排除（docs/14 §4.3 / bug ⑤） */
 typedef struct {
     int   n_valid;                       /* 槽位数 K=min(12, M)（M=min(16,nblk)） */
     int   blk[DS_DASH_TOPK_BLOCKS];      /* 选中的 KV 块号（可能含哨兵槽 blk=-1） */
     float bias[DS_DASH_TOPK_BLOCKS];     /* log-prior 偏置（invalid 槽为 0） */
-    int   valid[DS_DASH_TOPK_BLOCKS];    /* 该槽是否有效候选（哨兵槽=0，不进注意力） */
+    int   valid[DS_DASH_TOPK_BLOCKS];    /* 该槽是否有效候选（哨兵槽=0，不进注意力）。
+                                            【bug ⑤ 教训】valid 必须查 eff = remote ∧
+                                            页候选，只查页候选会让 sentinel 槽拿到
+                                            −3.3 的偏置参与注意力 → 小图输出循环 */
 } ds_dash_route_t;
 
 /* ── KV cache 行访问（与 ds_moe_decoder.c 共享布局）───────────────────────
- * 布局: cache[layers][max_seq][kv_row_stride], kv_row_stride ≥ kv_dim, 64B 对齐 */
+ * 布局: cache[layers][max_seq][kv_row_stride], kv_row_stride ≥ kv_dim, 64B 对齐
+ * 【为什么 stride ≥ kv_dim 且对齐】行首落在 64B 边界上，SIMD 读取不跨行混叠；
+ *   余量填充让 BF16/F32 两种 elem 宽度共用同一套偏移公式。
+ * 两个 inline 只做指针算术（数据本体在 ctx->kv_cache_k/v），类型由调用方
+ * 按 ctx->kv_bf16 决定（F32 float* 或 BF16 uint16_t*）。 */
 static inline void *ds_kv_k_row(ds_ctx_t *ctx, int layer, int pos) {
     int stride = ctx->_kv_row_stride;
     size_t elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);
@@ -116,7 +143,18 @@ void ds_dash_reset_run(ds_ctx_t *ctx);
 /* ── page2d 坐标构建 ────────────────────────────────────────────────────
  * 由 prefill 的 token id 序列构建 (tok_pos, page_pos) 坐标并预计算 cos/sin。
  * token_ids[0..seq_len) = [BOS, <PAGE>, img..., 指令...]。
- * 同时记录 pf_cnt (每页 prefill 长度) 供 decode 状态机使用。返回 0 成功。*/
+ * 同时记录 pf_cnt (每页 prefill 长度) 供 decode 状态机使用。返回 0 成功。
+ *
+ * 三条页桶规则（官方 _build_page_rope_pos，C 逐条对齐）:
+ *   1. <PAGE> 是 1-based 计数: 遇 marker 页号 +1 → 第一页数据 page=1（非 0）；
+ *   2. 保留桶 0: BOS 与"最后一张图之后的指令文本" page 回 0——指令与任何
+ *      真实页 Δpage ≥ 1，永远不会被误认为"同页"；
+ *   3. 页内 running count: tok 是"本页桶内第几个 token"（跨不连续区间累计）。
+ *      页 k 拥有多段区域（prompt 图像段 + 响应正文段），段内重启会让两个
+ *      不同 token 撞坐标（docs/14 §3.1）。
+ * 算例: [BOS, <PAGE>, img×273, 指令×6] →
+ *   page: 0    1     1      0    tok: 0  0  1..273  1..6
+ */
 int  ds_dash_build_coords(ds_ctx_t *ctx, const int *token_ids, int seq_len);
 
 /* decode 状态机推进: 新 token 写入坐标表 pos=kv_cache_len 处。
@@ -138,5 +176,10 @@ int  ds_dash_attention_prefill(ds_ctx_t *ctx, int layer_idx,
 int  ds_dash_attention_decode(ds_ctx_t *ctx, int layer_idx,
                               const float *layer_input,
                               float *out /* [q_dim] */);
+/* 【两者与 V3 注意力的实现差异】V3（ds_rswa_attention_aligned_bf16）的可见集
+ * 是两段连续区间（参考集 ∪ 滑窗）；V4 的可见集是"局部窗 ∪ 若干离散选中块"，
+ * 无法用区间扫描表达，只能逐 token 判定归属（见 attn_head_range 的 mask 逻辑）。
+ * 【参考】官方 _infer_prefill_attend/_forward_dense 与 _dash_decode_forward/_decode_attend；
+ * V4 的 Q/K 主分支旋转也用本模块的 page2d 表（ds_moe_decoder.c 经 ds_dash_rope_row 取行）。 */
 
 #endif /* DS_DASH_H */
