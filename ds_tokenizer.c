@@ -47,6 +47,8 @@
  * Supports:
  *   - decode token IDs to UTF-8 text (for ASR output assembly)
  *   - encode UTF-8 text to token IDs using vocab.json + merges.txt
+ *
+ * 【教程】本文件逐行讲解见 docs/07-分词与词表篇.md，建议对照阅读
  */
 
 #include "ds_tokenizer.h"
@@ -115,32 +117,70 @@ static void init_gpt2_mapping(void) {
     gpt2_mapping_initialized = 1;
 }
 
-/* Convert one Unicode codepoint to UTF-8 bytes. Returns bytes written. */
+/* utf8_encode_cp - 把一个 Unicode 码位编码为 UTF-8 字节序列 (docs/07 §2)
+ *
+ * 【UTF-8 编码模板】按码位大小选档，有效位从低到高每 6 位填进一个续字节：
+ *   cp < 0x80    → 1 字节: 0xxxxxxx（ASCII 原样）
+ *   cp < 0x800   → 2 字节: 110xxxxx 10xxxxxx（BPE 载体字符都落在前两档）
+ *   cp < 0x10000 → 3 字节: 1110xxxx 10xxxxxx 10xxxxxx
+ *   首字节填剩余高位，续字节恒以 10 开头——解码端据此识别序列边界。
+ * 例: 'Ġ'(U+0120) → 110_00100 10_100000 = 0xC4 0xA0（词表里最常见的前缀）。
+ * 这也是 UTF-8 内部的"字节序"：有效位从首字节到尾字节由高到低铺开。
+ * 本函数只服务 GPT-2 载体码位（init_gpt2_mapping 产生，最大 323），
+ * 故未实现 4 字节档。
+ *
+ * @param cp   待编码码位（调用方保证 ≤0xFFFF）
+ * @param out  输出缓冲，至少 4 字节
+ * @return     写入的字节数（1-3） */
 static int utf8_encode_cp(int cp, char out[4]) {
-    if (cp < 0x80) {
+    if (cp < 0x80) {                            /* ASCII: 单字节原样输出 */
         out[0] = (char)cp;
         return 1;
     }
-    if (cp < 0x800) {
-        out[0] = (char)(0xC0 | (cp >> 6));
-        out[1] = (char)(0x80 | (cp & 0x3F));
+    if (cp < 0x800) {                           /* 两字节档: 110/10 模板 */
+        out[0] = (char)(0xC0 | (cp >> 6));      /* 首字节: 高 5 位 */
+        out[1] = (char)(0x80 | (cp & 0x3F));    /* 续字节: 低 6 位，恒置 10 前缀 */
         return 2;
     }
-    out[0] = (char)(0xE0 | (cp >> 12));
-    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-    out[2] = (char)(0x80 | (cp & 0x3F));
+    /* 三字节档: 1110/10/10 模板（载体码位 ≤323 实际用不到，兜底实现保完备） */
+    out[0] = (char)(0xE0 | (cp >> 12));         /* 首字节: 高 4 位 */
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); /* 中间续字节 */
+    out[2] = (char)(0x80 | (cp & 0x3F));        /* 尾部续字节 */
     return 3;
 }
 
-/*
- * Decode a GPT-2 encoded token string (vocab key) to raw bytes/UTF-8 text.
- * Returns allocated string (caller must free).
- */
+/* decode_gpt2_token - 把 GPT-2 载体字符表示的 vocab key 还原成原始字节/UTF-8 文本
+ * (docs/07 §4、§7)
+ *
+ * 【用途】加载 vocab.json 时批量反变换：词表 key 是"载体字符"串（空格是
+ * Ġ、换行是 Ċ，见 init_gpt2_mapping），decode 端要还原成真实字节才能拼出
+ * 可读文本——这是 encode 方向 text_to_bpe_unicode 的严格逆操作。
+ *
+ * 【算法】逐字符两步循环：
+ *   1. 按 UTF-8 规则解码 1-4 字节得到码位 cp（手写解析，不依赖 iconv）；
+ *   2. 查反表 gpt2_unicode_to_byte[cp] 得到原始字节，写进输出缓冲。
+ *
+ * 【UTF-8 多字节解码逐步展开——以中文"中"字为例】
+ *   "中" = U+4E2D，UTF-8 三字节 0xE4 0xB8 0xAD（有效位从首字节到尾字节
+ *   由高到低铺开——这就是"字节序"在 UTF-8 内部的含义）：
+ *     首字节 0xE4 = 1110_0100 → 前缀 1110 判定为 3 字节序列，取低 4 位 0100
+ *     续字节 0xB8 = 10_111000 → 前缀 10 是续字节，取低 6 位 111000
+ *     续字节 0xAD = 10_101101 → 取低 6 位 101101
+ *   拼接: 0100 111000 101101 = 0x4E2D ✓ 还原出 U+4E2D。
+ *   注意职责划分：这里解码的是"载体字符"（全是可见字符），中文字节本身
+ *   是查反表得到的输出——两个层面的字节不要混淆。
+ *
+ * 【容错/回退】截断序列（续字节缺失）按已有位凑合；非法首字节当 1 字节
+ * 原样带过；反表查不到写 '?' 占位——"未知字节回退"（理论不可达：词表
+ * key 与反表同源构建）。
+ *
+ * @param token_str  vocab.json 里的原始 key（载体字符 UTF-8 串）
+ * @return           malloc 出的还原字节串（调用者 free），失败返回 NULL */
 static char *decode_gpt2_token(const char *token_str) {
-    init_gpt2_mapping();
+    init_gpt2_mapping();   /* 惰性初始化：首次调用建表，进程内复用 */
 
     size_t len = strlen(token_str);
-    unsigned char *bytes = (unsigned char *)malloc(len + 1);
+    unsigned char *bytes = (unsigned char *)malloc(len + 1);   /* 最坏情况：全 ASCII 单字节 → len 字节 + NUL */
     if (!bytes) return NULL;
 
     int byte_count = 0;
@@ -151,48 +191,57 @@ static char *decode_gpt2_token(const char *token_str) {
         int cp;
         int nbytes;
 
-        if ((*p & 0x80) == 0) {
+        /* UTF-8 多字节解码：由首字节高位模式判定序列长度，再把各字节的
+         * 低位依次拼接成码位（逐步展开示例见函数头的"中"字 walkthrough） */
+        if ((*p & 0x80) == 0) {            /* 0xxxxxxx → 1 字节 ASCII */
             cp = *p;
             nbytes = 1;
-        } else if ((*p & 0xE0) == 0xC0) {
-            cp = (*p & 0x1F) << 6;
-            if (p + 1 < end) cp |= (p[1] & 0x3F);
+        } else if ((*p & 0xE0) == 0xC0) {  /* 110xxxxx → 2 字节序列 */
+            cp = (*p & 0x1F) << 6;                 /* 首字节低 5 位 = 码位高 5 位 */
+            if (p + 1 < end) cp |= (p[1] & 0x3F);  /* 续字节低 6 位补在低位 */
             nbytes = 2;
-        } else if ((*p & 0xF0) == 0xE0) {
-            cp = (*p & 0x0F) << 12;
-            if (p + 1 < end) cp |= (p[1] & 0x3F) << 6;
-            if (p + 2 < end) cp |= (p[2] & 0x3F);
+        } else if ((*p & 0xF0) == 0xE0) {  /* 1110xxxx → 3 字节序列 */
+            /* 拆位示例: 0xE4 0xB8 0xAD → 0x4<<12 | 0x38<<6 | 0x2D = 0x4E2D（"中"） */
+            cp = (*p & 0x0F) << 12;                    /* 首字节低 4 位 = 码位最高 4 位 */
+            if (p + 1 < end) cp |= (p[1] & 0x3F) << 6; /* 续字节 1 的低 6 位 */
+            if (p + 2 < end) cp |= (p[2] & 0x3F);      /* 续字节 2 的低 6 位 */
             nbytes = 3;
-        } else if ((*p & 0xF8) == 0xF0) {
+        } else if ((*p & 0xF8) == 0xF0) {  /* 11110xxx → 4 字节序列 */
             cp = (*p & 0x07) << 18;
             if (p + 1 < end) cp |= (p[1] & 0x3F) << 12;
             if (p + 2 < end) cp |= (p[2] & 0x3F) << 6;
             if (p + 3 < end) cp |= (p[3] & 0x3F);
             nbytes = 4;
         } else {
+            /* 非法首字节（10 续字节 / 11111xxx）：当 1 字节原样带过，容错不崩 */
             cp = *p;
             nbytes = 1;
         }
         p += nbytes;
 
         if (cp < 512 && gpt2_unicode_to_byte[cp] >= 0) {
+            /* 载体码位查反表还原原始字节（Ġ→0x20、Ċ→0x0A、256+n 区→原字节） */
             bytes[byte_count++] = (unsigned char)gpt2_unicode_to_byte[cp];
         } else {
+            /* 未知码位回退: '?' 占位。反表只覆盖载体码位（≤323），
+             * 词表 key 理论上全部来自同一映射，此分支不可达 */
             bytes[byte_count++] = '?';
         }
     }
-    bytes[byte_count] = '\0';
+    bytes[byte_count] = '\0';   /* 补 NUL：缓冲按 len+1 分配，输出 ≤ len 字节必然装得下 */
     return (char *)bytes;
 }
 
-/*
- * Decode a DeepSeek BPE token string to UTF-8 text.
- * DeepSeek uses a mix:
- *   - Special tokens use ▁ (U+2581) for space (e.g., <｜begin▁of▁sentence｜>)
- *   - Regular BPE tokens use Ġ (U+0120) for space (GPT-2 byte-level encoding)
- * We handle both: replace ▁ with space first, then apply GPT-2 decoding.
- * Returns allocated string (caller must free).
- */
+/* decode_deepseek_token - DeepSeek 系词表 key → UTF-8 文本 (docs/07 §8.1)
+ *
+ * 【两种空格表示并存】DeepSeek 系词表混用两套空格编码：
+ *   - 特殊 token 用 ▁ (U+2581)：如 <｜begin▁of▁sentence｜>
+ *   - 普通 BPE token 用 Ġ (U+0120)：GPT-2 字节级载体字符
+ * 处理顺序：第一遍把 ▁(0xE2 0x96 0x81) 替换成真实空格；第二遍对剩下的
+ * 串走 GPT-2 反变换（decode_gpt2_token 同款 UTF-8 解码 + 反表查字节）。
+ *
+ * @param token_str  vocab.json 的原始 key
+ * @return           malloc 出的 UTF-8 文本（调用者 free），失败返回 NULL */
 static char *decode_deepseek_token(const char *token_str) {
     init_gpt2_mapping();
 
@@ -214,7 +263,9 @@ static char *decode_deepseek_token(const char *token_str) {
     }
     cleaned[cw] = '\0';
 
-    /* Second pass: apply GPT-2 byte-level decoding */
+    /* Second pass: apply GPT-2 byte-level decoding
+     * 循环体与 decode_gpt2_token 完全同构（UTF-8 解码 + 反表还原），
+     * 逐步拆位示例见那边，此处不再重复展开 */
     size_t clen = strlen(cleaned);
     unsigned char *bytes = (unsigned char *)malloc(clen + 1);
     if (!bytes) { free(cleaned); return NULL; }
@@ -251,7 +302,7 @@ static char *decode_deepseek_token(const char *token_str) {
         }
     }
     bytes[byte_count] = '\0';
-    free(cleaned);
+    free(cleaned);   /* 第一遍的中间缓冲使命完成 */
     return (char *)bytes;
 }
 
@@ -259,12 +310,25 @@ static char *decode_deepseek_token(const char *token_str) {
  * Simple JSON parser for vocab.json
  * ======================================================================== */
 
+/* skip_ws - 跳过 JSON 空白（空格/换行/回车/制表），*p 停在首个有效字符
+ * 手写解析器的对齐工具：parse 与 skip 系列函数的入口第一步都调它。 */
 static void skip_ws(const char **p) {
     while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++;
 }
 
-/* Skip a JSON value (string, number, object, array, bool, null) at *p.
- * Correctly handles nested strings containing { } [ ] characters. */
+/* skip_json_value - 从 *p 起跳过一个完整的 JSON 值（字符串/数字/对象/数组/布尔/null）
+ *
+ * 【为什么需要】added_tokens 预扫描只关心 "id"/"content" 字段，其余字段
+ * 的值必须整体跳过才能继续向后扫；tokenizer.json 路径跳过非 model、
+ * 非 vocab 的嵌套值同理。
+ *
+ * 【算法】分三类：
+ *   字符串: 跳到配对引号，遇 '\' 连跳两个字符——转义串里的引号不能当终点；
+ *   对象/数组: 同型括号计嵌套深度，内部字符串照上法整体跳过，深度归零即止。
+ *     这正是"嵌套字符串里含 {} [] 字符也不出错"的全部原因；
+ *   其余: 扫到分隔符（',' '}' ']'）为止——数字/true/false/null 不含这些字符。
+ *
+ * @param p  游标指针的指针；返回时 *p 停在值之后的一个字符 */
 static void skip_json_value(const char **p) {
     skip_ws(p);
     if (**p == '"') {
@@ -300,13 +364,27 @@ static void skip_json_value(const char **p) {
     }
 }
 
+/* parse_json_string - 解析 JSON 字符串字面量到 out（处理转义），*p 越过收尾引号
+ *
+ * 【支持的转义】\n \t \" \\ \/ 五种单字符转义 + \uXXXX 码位转义。
+ * 【\uXXXX 展开】读 4 个十六进制位组成码位，按 UTF-8 三档模板写进 out：
+ *   <0x80 → 1 字节；<0x800 → 2 字节；其余 3 字节（代理对本场景不出现）。
+ *   词表 key 里的 "Ġ" 既可能直接存 UTF-8 字节 0xC4 0xA0，也可能写 "\u0120"，
+ *   两种写法解析结果一致。
+ * 【截断策略】out 满（i 达 max_len-1）即停止拷贝但继续向后扫，保证 *p
+ * 最终停在收尾引号处——游标永远不错位（key 缓冲 4096 字节远够用）。
+ *
+ * @param p        游标（入口处 *p 应指向 '"'，可先经 skip_ws 对齐）
+ * @param out      输出缓冲（UTF-8，NUL 结尾）
+ * @param max_len  out 容量（含 NUL）
+ * @return         0 成功；-1 非法（首字符不是引号 / 没找到收尾引号） */
 static int parse_json_string(const char **p, char *out, size_t max_len) {
     skip_ws(p);
     if (**p != '"') return -1;
     (*p)++;
     size_t i = 0;
     while (**p && **p != '"' && i < max_len - 1) {
-        if (**p == '\\') {
+        if (**p == '\\') {   /* 转义序列：反斜杠后的一个字符决定含义 */
             (*p)++;
             if (**p == 'n') out[i++] = '\n';
             else if (**p == 't') out[i++] = '\t';
@@ -314,15 +392,18 @@ static int parse_json_string(const char **p, char *out, size_t max_len) {
             else if (**p == '\\') out[i++] = '\\';
             else if (**p == '/') out[i++] = '/';
             else if (**p == 'u') {
+                /* \uXXXX: 4 个十六进制位拼出码位（从高到低逐个左移4入低4位） */
                 (*p)++;
                 unsigned int cp = 0;
                 for (int j = 0; j < 4 && **p; j++, (*p)++) {
-                    cp <<= 4;
+                    cp <<= 4;   /* 已读入的位整体左移一格，腾出低 4 位 */
                     char c = **p;
+                    /* '0'-'9' 贡献 0-9；字母位贡献 10-15（大小写都认） */
                     if (c >= '0' && c <= '9') cp |= (unsigned)(c - '0');
                     else if (c >= 'a' && c <= 'f') cp |= (unsigned)(c - 'a' + 10);
                     else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
                 }
+                /* 码位 → UTF-8 三档模板（与 utf8_encode_cp 同一套规则） */
                 if (cp < 0x80 && i + 1 < max_len) {
                     out[i++] = (char)cp;
                 } else if (cp < 0x800 && i + 2 < max_len) {
@@ -333,12 +414,14 @@ static int parse_json_string(const char **p, char *out, size_t max_len) {
                     out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                     out[i++] = (char)(0x80 | (cp & 0x3F));
                 }
+                /* 4 个 hex 位已由 for 循环越过，continue 跳过尾部的 (*p)++ */
                 continue;
             } else {
+                /* 未知转义（\d 等）：原样保留下一字符，尽力而为不报错 */
                 out[i++] = **p;
             }
         } else {
-            out[i++] = **p;
+            out[i++] = **p;   /* 普通字符（含多字节 UTF-8 原始字节）直接拷贝 */
         }
         (*p)++;
     }
@@ -348,12 +431,16 @@ static int parse_json_string(const char **p, char *out, size_t max_len) {
     return 0;
 }
 
+/* parse_json_int - 解析 JSON 整数字面量（支持负号），*p 越过数字串
+ * 十进制逐位展开 val = val*10 + digit；用 int64 累积防大 id 溢出。
+ * vocab 的值全是非负 id，支持 '-' 只是为了复用于其他字段。
+ * @return 累积值（遇非数字字符即停；无数字时返回 0） */
 static int64_t parse_json_int(const char **p) {
     skip_ws(p);
     int neg = 0;
     if (**p == '-') { neg = 1; (*p)++; }
     int64_t val = 0;
-    while (**p >= '0' && **p <= '9') {
+    while (**p >= '0' && **p <= '9') {   /* 连续数字逐位累加 */
         val = val * 10 + (**p - '0');
         (*p)++;
     }
@@ -489,6 +576,9 @@ static int split_utf8_symbols(const char *s, char ***out_syms, int *out_n) {
     return 0;
 }
 
+/* str_concat2 - 拼接 a+b 为新 malloc 串（NUL 结尾），失败返回 NULL
+ * BPE 合并的"二合一"工具：把相邻两个符号拼成一个新符号（如 "Ġ"+"pa"）。
+ * merge_rank 拼 "a b" 查表 key 时为省一次 free 直接手写 memcpy，思路相同。 */
 static char *str_concat2(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
     char *r = (char *)malloc(la + lb + 1);
@@ -522,15 +612,20 @@ static int merge_rank(const ds_tokenizer_t *tok, const char *a, const char *b) {
     return rank >= 0 ? rank : INT_MAX;
 }
 
+/* append_id - 向动态 int 数组尾插一个元素（几何扩容 16→32→64…）
+ * encode 最终结果数组的收集器：容量不足时 realloc 翻倍；
+ * realloc 失败时旧缓冲仍然有效（返回 -1，由调用方决定回收路径）。
+ * @param arr/n/cap  数组指针/长度/容量三件套（全部就地更新）
+ * @return           0 成功；-1 realloc 失败 */
 static int append_id(int **arr, int *n, int *cap, int id) {
-    if (*n >= *cap) {
+    if (*n >= *cap) {   /* 满了才扩容，均摊 O(1) */
         int new_cap = (*cap == 0) ? 16 : (*cap * 2);
         int *tmp = (int *)realloc(*arr, (size_t)new_cap * sizeof(int));
-        if (!tmp) return -1;
+        if (!tmp) return -1;   /* 旧 *arr 保持有效，调用方可继续用/释放 */
         *arr = tmp;
         *cap = new_cap;
     }
-    (*arr)[(*n)++] = id;
+    (*arr)[(*n)++] = id;   /* 尾插并推进长度 */
     return 0;
 }
 
@@ -547,12 +642,14 @@ static char *text_to_bpe_unicode(const char *text) {
 
     size_t w = 0;
     for (size_t i = 0; i < len; i++) {
+        /* 逐字节查映射表：可打印字节原样保留，空格 0x20 → U+0120(Ġ)、
+         * 换行 0x0A → U+010A(Ċ)、其余不可见字节 → 256+n 区（见 init_gpt2_mapping） */
         int cp = gpt2_byte_to_unicode[(unsigned char)text[i]];
         char tmp[4];
-        int n = utf8_encode_cp(cp, tmp);
+        int n = utf8_encode_cp(cp, tmp);   /* 载体码位 → 1-3 字节 UTF-8 */
         for (int j = 0; j < n; j++) out[w++] = tmp[j];
     }
-    out[w] = '\0';
+    out[w] = '\0';   /* 得到"全可见"串: "Multi page parsing." → "MultiĠpageĠparsing." */
     return out;
 }
 
@@ -597,19 +694,21 @@ static int encode_bpe_word(const ds_tokenizer_t *tok, const char *mapped, int **
 
         /* 二合一 + 数组左移补位。syms 的所有权在本函数内，
          * 失败路径要释放全部符号，不留半初始化状态。 */
-        char *merged = str_concat2(syms[best_i], syms[best_i + 1]);
+        char *merged = str_concat2(syms[best_i], syms[best_i + 1]);   /* 拼出 rank 最小对的合并结果 */
         if (!merged) {
             for (int i = 0; i < n_syms; i++) free(syms[i]);
             free(syms);
             return -1;
         }
-        free(syms[best_i]);
+        free(syms[best_i]);      /* 两个旧符号被 merged 取代，就地释放 */
         free(syms[best_i + 1]);
-        syms[best_i] = merged;
-        for (int j = best_i + 1; j < n_syms - 1; j++) syms[j] = syms[j + 1];
-        n_syms--;
+        syms[best_i] = merged;   /* 新符号占据前一个位置 */
+        for (int j = best_i + 1; j < n_syms - 1; j++) syms[j] = syms[j + 1];   /* 后续符号整体左移一格 */
+        n_syms--;                /* 数组缩短 1 → 下一轮重新全扫相邻对 */
     }
 
+    /* 合并收敛后，剩下的每个符号都应是词表完整 token：查 vocab_map 得最终 id。
+     * 这就是"token→id 查表"的最后一步（id→token 反查在 ds_tokenizer_decode）。 */
     int *ids = NULL;
     int n_ids = 0, cap = 0;
     for (int i = 0; i < n_syms; i++) {
@@ -653,24 +752,40 @@ static int derive_merges_path(const char *vocab_path, char *out_path, size_t out
     return 0;
 }
 
+/* trim_newline - 剥掉行尾的 '\n'/'\r'（fgets 会把换行符一并读进来）
+ * merges.txt 可能是 LF 或 CRLF 行尾，两个都剥掉再交给 parse_merge_pair。 */
 static void trim_newline(char *line) {
     size_t n = strlen(line);
     while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
 }
 
+/* parse_merge_pair - 把 merges.txt 一行拆成合并对 (a, b)（就地切片，零拷贝）
+ *
+ * 【规则行判定】空行 / 行首 '#'（'#version: 0.0' 等注释行）/ 无空格分隔
+ * 的行一律拒绝——这正是 load_merges_map 头注释里 bug 1 修复的落点：
+ * '#version' 若不过滤会被当成一条规则，污染 merge_map。
+ *
+ * 【切分手法】strchr 找第一个空格并改写成 '\0'，于是 line 前半是 a、
+ * 空格后跳过多余空格即 b——零拷贝。
+ * 【所有权】a/b 指向 line 内部，调用方必须在 line 被再次覆写前消费完
+ * （load_merges_map 拿到后立即 malloc 拼 key，符合约定）。
+ *
+ * @param line  一行文本（会被 '\0' 写破坏，调用方需允许）
+ * @param a/b   出参：指向 line 内部的两个子串
+ * @return      0 成功；-1 非规则行 */
 static int parse_merge_pair(char *line, char **a, char **b) {
     *a = NULL;
     *b = NULL;
     trim_newline(line);
-    if (line[0] == '\0') return -1;
-    if (line[0] == '#') return -1;
+    if (line[0] == '\0') return -1;   /* 空行 */
+    if (line[0] == '#') return -1;    /* 注释行（'#version: x.y'） */
 
-    char *sp = strchr(line, ' ');
+    char *sp = strchr(line, ' ');     /* 第一个空格 = 两个符号的分隔点 */
     if (!sp) return -1;
-    *sp = '\0';
+    *sp = '\0';                       /* 就地切分: line 前半成 a */
     char *p2 = sp + 1;
-    while (*p2 == ' ') p2++;
-    if (*line == '\0' || *p2 == '\0') return -1;
+    while (*p2 == ' ') p2++;          /* 容忍多余空格 */
+    if (*line == '\0' || *p2 == '\0') return -1;   /* 两半都非空才算规则行 */
     *a = line;
     *b = p2;
     return 0;
@@ -696,8 +811,9 @@ static int load_merges_map(ds_tokenizer_t *tok, const char *merges_path) {
     FILE *f = fopen(merges_path, "rb");
     if (!f) return -1;
 
+    /* ── 第一遍：只数有效规则行，精确定哈希容量（装载前一次到位） ── */
     int n_pairs = 0;
-    char line[8192];
+    char line[8192];   /* 载体字符行实际最长几十字节，8192 绰绰有余 */
     while (fgets(line, sizeof(line), f)) {
         char *a = NULL, *b = NULL;
         if (parse_merge_pair(line, &a, &b) == 0) n_pairs++;
@@ -715,12 +831,14 @@ static int load_merges_map(ds_tokenizer_t *tok, const char *merges_path) {
         return -1;
     }
 
+    /* ── 第二遍：真正插入，rank = 文件行号 = 合并优先级 ── */
     rewind(f);
     int rank = 0;
     while (fgets(line, sizeof(line), f)) {
         char *a = NULL, *b = NULL;
         if (parse_merge_pair(line, &a, &b) != 0) continue;
 
+        /* key 拼成 "a b" 形态——merge_rank 查表只认这种形态，两端必须一致 */
         size_t la = strlen(a), lb = strlen(b);
         char *key = (char *)malloc(la + 1 + lb + 1);
         if (!key) continue;
@@ -730,9 +848,9 @@ static int load_merges_map(ds_tokenizer_t *tok, const char *merges_path) {
         key[la + 1 + lb] = '\0';
 
         if (map_insert((str_int_entry_t *)tok->merge_map, tok->merge_map_cap, key, rank) != 0) {
-            free(key);
+            free(key);   /* 插入失败（表满/重复规则）：key 自持，就地释放防泄漏 */
         }
-        rank++;
+        rank++;          /* 失败也递增：rank 恒等于文件行号，语义不漂移 */
     }
     fclose(f);
     return 0;
@@ -771,6 +889,8 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         return NULL;
     }
 
+    /* 整文件读入内存：vocab.json 约 10 MB，malloc+一次 fread 比逐行解析快，
+     * 也便于对同一段 JSON 多遍回扫（vocab 两遍 + added_tokens 预扫） */
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -785,7 +905,10 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
     json[file_size] = '\0';
 
     /* Detect tokenizer type: DeepSeek/Llama uses ▁ (U+2581) for space,
-     * GPT-2 uses Ġ (U+0120). Check first few tokens to decide. */
+     * GPT-2 uses Ġ (U+0120). Check first few tokens to decide.
+     * 【探测原理】▁ 的 UTF-8 字节是 0xE2 0x96 0x81，strstr 一次匹配即可。
+     * 该标志只决定 decode 侧反变换走哪条路（见第二遍扫描的三元选择），
+     * encode 侧不受影响——两种词表的 BPE 合并表结构完全相同。 */
     int is_deepseek_tokenizer = 0;
     {
         const char *peek = json;
@@ -811,6 +934,10 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         }
     }
 
+    /* ── 第一遍扫描：只求 max_id，确定数组容量 ──
+     * vocab 的 id 不保证连续，但两张表必须能按 id 直接索引，
+     * 故 vocab_size = max_id + 1 是最保守的取法；没填到的稀疏槽位
+     * 保持 NULL，decode 端按空串兜底 */
     int max_id = 0;
     const char *p = json;
     skip_ws(&p);
@@ -820,7 +947,7 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
     }
     p++;
 
-    const char *saved = p;
+    const char *saved = p;   /* 记住首个 key 的位置，第二遍从这里回扫 */
     while (*p && *p != '}') {
         skip_ws(&p);
         if (*p == ',') { p++; continue; }
@@ -850,6 +977,10 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         return NULL;
     }
 
+    /* ── 第二遍扫描：逐条填充两张表 ──
+     *   id_to_bpe[id]  = 原始 key（载体字符串；vocab_map 的 key 借用它的指针）
+     *   id_to_text[id] = 反变换后的可读文本（decode 查这张表）
+     * 反变换按探测结果二选一：DeepSeek 用 ▁+Ġ 混合处理，GPT-2 纯 Ġ */
     p = saved;
     while (*p && *p != '}') {
         skip_ws(&p);
@@ -864,15 +995,20 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         int64_t id = parse_json_int(&p);
 
         if (id >= 0 && id < vocab_size) {
+            /* 先释放旧条目再覆盖：防御重复 id（正常词表不存在） */
             free(tok->id_to_bpe[id]);
             free(tok->id_to_text[id]);
             tok->id_to_bpe[id] = strdup(key);
             tok->id_to_text[id] = is_deepseek_tokenizer ?
                 decode_deepseek_token(key) : decode_gpt2_token(key);
         }
+        /* id 越界（负数或超 max_id，自洽词表不会发生）直接丢弃 */
     }
-    free(json);
+    free(json);   /* 解析完毕，原始 JSON 文本不再需要 */
 
+    /* ── 构建 vocab_map（token→id 查表，encode 用）──
+     * 先数非空条目定容量（负载因子 ≤0.5）；key 直接借用 id_to_bpe[i]
+     * 的指针、不 strdup——所有权约定见 ds_tokenizer_free 的注释 */
     int n_vocab_entries = 0;
     for (int i = 0; i < vocab_size; i++) if (tok->id_to_bpe[i]) n_vocab_entries++;
     tok->vocab_map_cap = next_pow2(n_vocab_entries * 2 + 1);
@@ -995,11 +1131,14 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
                                 }
                             }
                             if (*at == '}') at++;
+                            /* 收齐 id+content 才落表；id/content 缺失的条目跳过 */
                             if (at_id >= 0 && at_id < vocab_size && at_content[0]) {
                                 free(tok->id_to_text[(int)at_id]);
                                 free(tok->id_to_bpe[(int)at_id]);
                                 tok->id_to_bpe[(int)at_id] = strdup(at_content);
-                                /* Special tokens are stored as-is (not byte-level encoded) */
+                                /* Special tokens are stored as-is (not byte-level encoded)
+                                 * ——不做载体反变换，decode 出来就是 "<|det|>" 这样的
+                                 * 字面标签串，供后处理精确匹配（见 ds_strip_det_tags） */
                                 tok->id_to_text[(int)at_id] = strdup(at_content);
                                 n_added++;
                             }
@@ -1012,7 +1151,9 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         }
 
         if (n_added > 0) {
-            /* Rebuild vocab_map with expanded vocab to include added_tokens */
+            /* Rebuild vocab_map with expanded vocab to include added_tokens——
+             * 首次建表发生在扩容之前（容量按旧 vocab 算），必须推倒重建，
+             * added_tokens 的 key 才能进表、容量才匹配新条目数 */
             free(tok->vocab_map);
             int nve = 0;
             for (int i = 0; i < vocab_size; i++) if (tok->id_to_bpe[i]) nve++;
@@ -1029,6 +1170,9 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
         }
     }
 
+    /* ── 加载合并规则表（merge_map）──
+     * merges.txt 缺失只降级不致命：encode 退化为纯字节级编码（无合并），
+     * decode 不受影响；verbose≥2 时打日志提示 */
     char merges_path[1024];
     if (derive_merges_path(vocab_json_path, merges_path, sizeof(merges_path)) == 0) {
         if (load_merges_map(tok, merges_path) != 0 && ds_verbose >= 2) {
@@ -1050,8 +1194,9 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path) {
  * 输出缓冲；多字节中文无需特殊处理，逐 piece 追加字节，UTF-8 自然愈合。
  * added_tokens 的 id_to_text 是字面标签串（"<|det|>"），供后处理匹配。 */
 const char *ds_tokenizer_decode(const ds_tokenizer_t *tok, int token_id) {
-    if (!tok || token_id < 0 || token_id >= tok->vocab_size) return "";
-    return tok->id_to_text[token_id] ? tok->id_to_text[token_id] : "";
+    if (!tok || token_id < 0 || token_id >= tok->vocab_size) return "";  /* 越界/空指针 → 空串兜底，绝不崩 */
+    /* id→token 反查就这一行：所有反变换（Ġ/Ċ 还原 + ▁→空格）已在加载期完成 */
+    return tok->id_to_text[token_id] ? tok->id_to_text[token_id] : "";   /* 稀疏 NULL 槽位也返回空串 */
 }
 
 /* ds_tokenizer_encode - 文本 → token id 数组 (docs/07 §6)
@@ -1062,20 +1207,22 @@ const char *ds_tokenizer_decode(const ds_tokenizer_t *tok, int token_id) {
  * （ds_ocr.h: DS_TOKEN_BOS=0、DS_TOKEN_IMAGE_PLACEHOLDER=128815）。
  * 失败返回 NULL：上游 ds_ocr.c 用 fallback 常量 id 兜底，绝不带病输出。 */
 int *ds_tokenizer_encode(const ds_tokenizer_t *tok, const char *text, int *out_n_tokens) {
-    if (out_n_tokens) *out_n_tokens = 0;
-    if (!tok || !text || text[0] == '\0') return NULL;
+    if (out_n_tokens) *out_n_tokens = 0;   /* 失败约定：先清零计数，调用者看到 NULL+0 */
+    if (!tok || !text || text[0] == '\0') return NULL;   /* 空串按失败处理，上游走 fallback 常量 id */
 
+    /* 第①步：字节 → 载体字符文本（空格 0x20 → Ġ，见 text_to_bpe_unicode） */
     char *mapped = text_to_bpe_unicode(text);
     if (!mapped) return NULL;
 
+    /* 第②步：贪心合并 + 查 vocab_map（见 encode_bpe_word） */
     int *ids = NULL;
     int n_ids = 0;
     if (encode_bpe_word(tok, mapped, &ids, &n_ids) != 0) {
-        free(mapped);
-        free(ids);
+        free(mapped);   /* 中间缓冲无论如何都要释放——失败路径不泄漏 */
+        free(ids);      /* 失败时 *out_ids 保持 NULL，free(NULL) 无害 */
         return NULL;
     }
-    free(mapped);
+    free(mapped);       /* 映射串使命完成（ids 已是最终结果），只留 id 数组给调用者 */
 
     if (out_n_tokens) *out_n_tokens = n_ids;
     return ids;
@@ -1091,21 +1238,22 @@ int *ds_tokenizer_encode(const ds_tokenizer_t *tok, const char *text, int *out_n
 void ds_tokenizer_free(ds_tokenizer_t *tok) {
     if (!tok) return;
 
-    if (tok->id_to_text) {
+    if (tok->id_to_text) {          /* 自持：先逐条 free 字符串，再 free 数组本身 */
         for (int i = 0; i < tok->vocab_size; i++) free(tok->id_to_text[i]);
         free(tok->id_to_text);
     }
-    if (tok->id_to_bpe) {
+    if (tok->id_to_bpe) {           /* 自持数组；这些字符串就是 vocab_map 的 key 真身，
+                                     * 在此统一释放——下面的 vocab_map 绝不再碰 key */
         for (int i = 0; i < tok->vocab_size; i++) free(tok->id_to_bpe[i]);
         free(tok->id_to_bpe);
     }
 
-    if (tok->merge_map) {
+    if (tok->merge_map) {           /* key 自持（load_merges_map malloc 拼接的）：逐槽 free(key) */
         str_int_entry_t *m = (str_int_entry_t *)tok->merge_map;
         for (int i = 0; i < tok->merge_map_cap; i++) free(m[i].key);
         free(tok->merge_map);
     }
-    free(tok->vocab_map);
+    free(tok->vocab_map);           /* key 借用 id_to_bpe[i]：只 free 桶数组，绝不 free key */
     free(tok);
 }
 
@@ -1127,6 +1275,8 @@ ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json
     FILE *f = fopen(tokenizer_json_path, "rb");
     if (!f) return NULL;
 
+    /* 整文件读入（tokenizer.json 约 17 MB）：vocab + merges + added_tokens
+     * 全在一个文件里，读一次、后面按需多段定位 */
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -1138,7 +1288,11 @@ ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json
     fclose(f);
     json[file_size] = '\0';
 
-    /* Navigate to model.vocab */
+    /* ── 定位 model.vocab ──
+     * 嵌套导航：外层逐 key 找 "model"，进入其对象再找 "vocab"；
+     * 其余 key 的值用 skip_json_value 整体跳过（含嵌套对象/数组）。
+     * 找到 vocab 后 goto found_vocab 直接跳出两层循环——C 处理深嵌套
+     * 的惯用法。畸形输入（"model" 不是对象等）返回 NULL。 */
     const char *vocab_start = NULL;
     {
         const char *p = json;
@@ -1180,7 +1334,10 @@ ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json
 found_vocab:
     if (!vocab_start) { free(json); return NULL; }
 
-    /* Find end of vocab object (matching }) */
+    /* ── 找 vocab 对象的收尾 '}' ──
+     * depth 配对大括号：遇 '{' 加一、'}' 减一，归零即对象结束；
+     * 字符串内部（key 里可能含 '{' '}'）先按转义规则整体跳过再计数，
+     * 保证括号计数不被字符串内容干扰 */
     const char *vocab_end = vocab_start;
     {
         int depth = 0;
@@ -1192,14 +1349,15 @@ found_vocab:
         }
     }
 
-    /* Extract vocab as standalone JSON string and parse with same logic as ds_tokenizer_load */
+    /* 把 vocab 对象切片成独立字符串 vjs——后续解析（类型探测/两遍扫描/
+     * 建 vocab_map）与 ds_tokenizer_load 完全同构，复用同一套逻辑 */
     size_t vlen = vocab_end - vocab_start;
     char *vjs = (char *)malloc(vlen + 1);
     if (!vjs) { free(json); return NULL; }
     memcpy(vjs, vocab_start, vlen);
     vjs[vlen] = '\0';
 
-    /* Detect tokenizer type */
+    /* Detect tokenizer type（与 ds_tokenizer_load 相同的 ▁ 字节探测） */
     int is_deepseek_tok = 0;
     {
         const char *pk = vjs; skip_ws(&pk);
@@ -1209,7 +1367,7 @@ found_vocab:
                 skip_ws(&pk); if(*pk==':'){pk++;skip_ws(&pk);parse_json_int(&pk);} } }
     }
 
-    /* First pass: max id */
+    /* First pass: 扫 max_id 定容量（vocab_size = max_id + 1，同 ds_tokenizer_load） */
     int max_id = 0;
     const char *p = vjs; skip_ws(&p);
     if (*p != '{') { free(vjs); free(json); return NULL; }
@@ -1236,7 +1394,7 @@ found_vocab:
     tok->id_to_bpe = (char **)calloc((size_t)vocab_size, sizeof(char *));
     if (!tok->id_to_text || !tok->id_to_bpe) { ds_tokenizer_free(tok); free(vjs); free(json); return NULL; }
 
-    /* Second pass: fill entries */
+    /* Second pass: 逐条填充 id_to_bpe/id_to_text（反变换二选一，同 ds_tokenizer_load） */
     p = saved;
     while (*p && *p != '}') {
         skip_ws(&p);
@@ -1255,7 +1413,7 @@ found_vocab:
         }
     }
 
-    /* Build vocab hash map */
+    /* Build vocab hash map（token→id，key 借用 id_to_bpe[i]，不 strdup） */
     int nve = 0;
     for (int i = 0; i < vocab_size; i++) if (tok->id_to_bpe[i]) nve++;
     tok->vocab_map_cap = next_pow2(nve * 2 + 1);
@@ -1347,6 +1505,10 @@ found_vocab:
                                 else { skip_json_value(&at); }
                             }
                             if(*at=='}')at++;
+                            /* 收齐 id+content 才落表；id_to_text 存字面标签串
+                             * （不做载体反变换）。这里的 map_insert 是提前插——
+                             * 随后 n_added>0 分支会整体重建 vocab_map 覆盖之，
+                             * 真正的保障在统一重建 */
                             if(aid>=0&&aid<vocab_size&&ac[0]){
                                 free(tok->id_to_bpe[aid]);free(tok->id_to_text[aid]);
                                 tok->id_to_bpe[aid]=strdup(ac); tok->id_to_text[aid]=strdup(ac);
@@ -1377,9 +1539,10 @@ found_vocab:
         }
     }
 
-    /* Load merges from model.merges
-     * vocab_end points just past the vocab object's closing }.
-     * Continue scanning within the model object for "merges" key. */
+    /* ── 加载 model.merges → merge_map ──
+     * vocab_end 恰好停在 vocab 对象收尾 '}' 之后，从这里继续在 model
+     * 对象内扫 "merges" key。数组下标 mi 就是 rank（数组序 = 训练轮次 =
+     * 合并优先级），与 merges.txt 行号语义完全一致（见本函数头注释） */
     {
         const char *mp2 = vocab_end;
         while(*mp2&&*mp2!='}'){
@@ -1394,19 +1557,20 @@ found_vocab:
                          *   Simple:  ["a b", "c d", ...]          (string per merge pair)
                          *   Nested:  [["a","b"], ["c","d"], ...]  (array per merge pair) */
                         if(*mp2=='"'){
-                            /* Simple format: "a b" */
+                            /* Simple format: "a b" —— 按第一个空格切成两半再拼回
+                             * 规范 key。载体字符里没有裸空格，这个空格就是分隔符 */
                             char ms[4096];
                             if(parse_json_string(&mp2,ms,sizeof(ms))==0){
                                 char*space=strchr(ms,' ');
                                 if(space){
-                                    *space='\0';
-                                    char mk2[8192]; snprintf(mk2,sizeof(mk2),"%s %s",ms,space+1);
-                                    if(!tok->merge_map){tok->merge_map_cap=262144;tok->merge_map=calloc((size_t)tok->merge_map_cap,sizeof(str_int_entry_t));}
+                                    *space='\0';   /* 就地切分: ms=前半, space+1=后半 */
+                                    char mk2[8192]; snprintf(mk2,sizeof(mk2),"%s %s",ms,space+1);   /* 拼回与 merges.txt 同构的 "a b" */
+                                    if(!tok->merge_map){tok->merge_map_cap=262144;tok->merge_map=calloc((size_t)tok->merge_map_cap,sizeof(str_int_entry_t));}   /* 首次: 按 12.7 万条规则预开 2^18 槽 */
                                     if(tok->merge_map&&mi<tok->merge_map_cap){
-                                        char *mk2_dup = strdup(mk2);
+                                        char *mk2_dup = strdup(mk2);   /* merge_map 的 key 自持（见 map_insert 所有权约定），必须堆拷贝 */
                                         if(mk2_dup) map_insert((str_int_entry_t*)tok->merge_map,tok->merge_map_cap,mk2_dup,mi);
                                     }
-                                    mi++;
+                                    mi++;   /* 数组序即 rank */
                                 }
                             }
                         } else if(*mp2=='['){
@@ -1427,8 +1591,8 @@ found_vocab:
                                 } else mp2++;
                             }
                             if(*mp2==']') mp2++;
-                            if(got_a&&got_b){
-                                char mk2[8192]; snprintf(mk2,sizeof(mk2),"%s %s",a_str,b_str);
+                            if(got_a&&got_b){   /* 两个元素都拿到才成一条规则 */
+                                char mk2[8192]; snprintf(mk2,sizeof(mk2),"%s %s",a_str,b_str);   /* 拼回与 merges.txt 同构的 key */
                                 if(!tok->merge_map){tok->merge_map_cap=next_pow2(mi*4+262144);tok->merge_map=calloc((size_t)tok->merge_map_cap,sizeof(str_int_entry_t));}
                                 if(tok->merge_map&&mi<tok->merge_map_cap){
                                     char *mk2_dup = strdup(mk2);
@@ -1446,8 +1610,8 @@ found_vocab:
             }
     }
 
-    free(vjs);
-    free(json);
+    free(vjs);   /* vocab 切片临时串 */
+    free(json);  /* 原始 JSON 文本 */
     if (ds_verbose >= 1)
         fprintf(stderr, "Tokenizer loaded from tokenizer.json: %d vocab, %s format\n",
                 tok->vocab_size, is_deepseek_tok ? "DeepSeek" : "GPT-2");

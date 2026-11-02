@@ -2,8 +2,9 @@
  * ds_ocr.h - DeepSeek-OCR Pure C Inference Engine
  * ds_ocr.h — DeepSeek-OCR 纯C推理引擎 公共头文件
  *
- * Supports DeepSeek-OCR (v1), DeepSeek-OCR-2 (v2), and Unlimited-OCR (v3) models.
- * 支持 DeepSeek-OCR (v1)、DeepSeek-OCR-2 (v2) 和 Unlimited-OCR (v3) 三种模型版本。
+ * Supports DeepSeek-OCR (v1), DeepSeek-OCR-2 (v2), Unlimited-OCR (v3), and Unlimited-OCR-2 (v4) models.
+ * 支持 DeepSeek-OCR (v1)、DeepSeek-OCR-2 (v2)、Unlimited-OCR (v3) 和
+ * Unlimited-OCR-2 (v4, DASH) 四种模型版本。
  *
  * Architecture: SAM Vision Tokenizer + DeepEncoder/DeepEncoderV2 + MoE Decoder
  * 架构: SAM视觉分词器 + 深层编码器(V1:CLIP / V2:Qwen2-0.5B) + MoE解码器
@@ -131,7 +132,8 @@
 
 /* ========================================================================
  * Model Configuration — 模型配置结构体
- * 记录三版本(V1/V2/V3)的所有架构超参数
+ * 记录四版本(V1/V2/V3/V4)的所有架构超参数
+ * （数值由 ds_ocr.c 的 init_config() 按检测出的版本号填充）
  * ======================================================================== */
 
 typedef struct {
@@ -184,7 +186,9 @@ typedef struct {
     int vocab_size;             /* 129280 */
     float dec_rms_norm_eps;     /* 1e-6 */
     float dec_rope_theta;       /* 10000.0 */
-    int has_qk_norm;            /* 1 = per-head Q/K RMSNorm (V1/V2), 0 = none (Unlimited-OCR) */
+    int has_qk_norm;            /* 1 = per-head Q/K RMSNorm, 0 = none。
+                                   注意: 当前 init_config() 对四版均置 0
+                                   （q_norm/k_norm 权重不加载，V1/V2 也不启用） */
 
     /* Unlimited-OCR specific */
     int image_token_id;         /* 128815 for Unlimited-OCR, unused for V1/V2 */
@@ -322,7 +326,10 @@ typedef struct {
 } ds_deep_encoder_t;
 
 /* ========================================================================
- * MoE Decoder Layer
+ * MoE Decoder Layer — MoE解码器单层权重（V1~V4共用同一解码器架构）
+ * 每层 = 自注意力(无bias) + FFN；第0层用Dense FFN，其余层用MoE
+ * （64路由专家top-6 + 2共享专家）。注意力/专家权重存BF16（mmap零拷贝、
+ * matvec时逐行转F32），norm/路由gate存F32（维度小、精度敏感）。
  * ======================================================================== */
 
 typedef struct {
@@ -424,16 +431,16 @@ typedef void (*ds_token_cb)(const char *piece, void *userdata);
  * ======================================================================== */
 
 typedef struct {
-    ds_config_t config;
-    ds_visual_tokenizer_t vis_tokenizer;
+    ds_config_t config;                 /* 架构超参数表（init_config 按版本填充） */
+    ds_visual_tokenizer_t vis_tokenizer; /* SAM ViT-B 视觉分词器权重（F32） */
     ds_clip_encoder_t clip_encoder;     /* V1 only */
     ds_projector_t projector;           /* V1: 2048→1280, V2: 896→1280 */
     ds_deep_encoder_t encoder;          /* V2 only */
-    ds_moe_decoder_t decoder;
+    ds_moe_decoder_t decoder;           /* MoE解码器权重（BF16零拷贝 + F32 norm/gate） */
 
     /* Model files (kept open for mmap) */
     void *safetensors;         /* multi_safetensors_t* */
-    char model_dir[512];
+    char model_dir[512];       /* 模型目录（ds_recognize_image 据此定位 vocab.json） */
 
     /* KV cache for decoder — stored as F32 with cache-line alignment for direct
      * attention access. Previous design used BF16 storage + per-step batch
@@ -445,11 +452,16 @@ typedef struct {
     int kv_bf16;             /* 1 = K/V 以 BF16 存储（仅 V3/V4） */
     float *kv_pf_scratch_k;  /* V3/V4 prefill 批量注意力的整层 F32 展开（懒分配） */
     float *kv_pf_scratch_v;
-    int kv_cache_len;
-    int kv_cache_max;
+    int kv_cache_len;        /* 当前已写入缓存的 token 数（= 下一个 K/V 写入槽位） */
+    int kv_cache_max;        /* 缓存容量上限（V1/V2=4096，V3/V4=8192，见 alloc_decoder_buffers） */
     int _kv_row_stride;      /* kv_dim rounded up to 16-float alignment for cache line access */
 
-    /* Persistent decoder buffers (single-token generation) */
+    /* Persistent decoder buffers (single-token generation)
+     * decode 逐 token 复用的"草稿纸"（alloc_decoder_buffers 一次分配、
+     * ds_free 统一释放）：dec_x=当前token嵌入/层间输出中转，dec_x_norm=
+     * RMSNorm 后副本，dec_q/k/v=注意力投影，dec_attn_out=注意力输出，
+     * dec_proj_out=wo投影后。MoE 专家串行处理，各专家可安全复用同一块
+     * scratch（见下方 moe_* 缓冲），避免热路径反复 malloc/free。 */
     float *dec_x, *dec_x_norm, *dec_q, *dec_k, *dec_v;
     float *dec_attn_out, *dec_proj_out;
     float *dec_expert_out, *dec_shared_out;
@@ -643,7 +655,8 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
 /* mmap 清洁源页归还内核（拷贝后调用）；ds_moe_decoder.c 的 lm_head F32 化后也用 */
 void ds_drop_source_pages(const void *p, size_t bytes);
 
-/* Global verbose flag */
+/* Global verbose flag — 全局日志详细度（0=静默 1=正常 2=调试 3=详细；
+ * main.c 按 --silent/--debug 修改，各模块的日志输出据此分级） */
 extern int ds_verbose;
 
 /* V3/V4 (Unlimited-OCR / Unlimited-OCR-2) post-processing: strip detection coordinate tags.

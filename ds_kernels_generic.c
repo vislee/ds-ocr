@@ -92,6 +92,7 @@ void ds_argmax_bf16_range_generic(const float *x, const uint16_t *W_bf16,
  * SIMD 版用多 lane 并行 + 多累加器打破 FMA 依赖链提速，语义不变。 */
 float ds_dot_f32_generic(const float *a, const float *b, int n) {
     float sum = 0.0f;
+    // 串行依赖链：本次累加必须等上一次的 sum——SIMD 版用多累加器打破它
     for (int i = 0; i < n; i++) sum += a[i] * b[i];
     return sum;
 }
@@ -99,12 +100,14 @@ float ds_dot_f32_generic(const float *a, const float *b, int n) {
 /* ds_vec_scale_inplace_generic - 原地缩放 dst[i] *= scale。
  * 注意力输出按 1/Σexp 归一化使用（ds_kernels.c 的在线 softmax 收尾）。 */
 void ds_vec_scale_inplace_generic(float *dst, float scale, int n) {
+    // 逐元素读-改-写，元素间零依赖——SIMD 版只是把多个元素并成一拍处理
     for (int i = 0; i < n; i++) dst[i] *= scale;
 }
 
 /* ds_vec_axpy_inplace_generic - 原地 axpy：dst[i] += alpha·src[i]。
  * 注意力在线 softmax 中把新 V 行按权重 exp(score-max) 累入输出。 */
 void ds_vec_axpy_inplace_generic(float *dst, const float *src, float alpha, int n) {
+    // axpy = alpha·x plus y（BLAS 命名传统）：每元素一次乘、一次加
     for (int i = 0; i < n; i++) dst[i] += alpha * src[i];
 }
 
@@ -113,5 +116,7 @@ void ds_vec_axpy_inplace_generic(float *dst, const float *src, float alpha, int 
  * 重缩放后并入新 V 行——"缩放旧和 + 加新和"一次遍历完成（见 ds_kernels.c
  * 的 attention 主循环）。 */
 void ds_vec_scale_add_generic(float *dst, const float *src, float correction, int n) {
+    // 本式恰为一个 FMA 的形状（dst·correction + src）：SIMD 版直接映射成
+    // 一条融合乘加指令（vfmaq_f32 / _mm*_fmadd_ps），一次完成乘与加、中间不舍入
     for (int i = 0; i < n; i++) dst[i] = dst[i] * correction + src[i];
 }

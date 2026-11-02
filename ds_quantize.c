@@ -85,11 +85,11 @@ static void int8_quantize_row(int8_t *qrow, float *row_scale, float *row_offset,
     *row_scale = scale;
     *row_offset = min_val;
     /* Step 3: 逐元素量化（四舍五入、裁剪、减 128 偏移） */
-    float inv_scale = 1.0f / scale;
+    float inv_scale = 1.0f / scale;      /* 预计算倒数: 循环内除法变乘法 */
     for (int c = 0; c < in_dim; c++) {
-        int v = (int)roundf((values[c] - min_val) * inv_scale);
-        if (v < 0) v = 0; if (v > 255) v = 255;
-        qrow[c] = (int8_t)(v - 128);
+        int v = (int)roundf((values[c] - min_val) * inv_scale);  /* 归一到 [0,255] 格点 */
+        if (v < 0) v = 0; if (v > 255) v = 255;  /* 裁剪: 防浮点误差越出格点范围 */
+        qrow[c] = (int8_t)(v - 128);     /* 平移到 int8 表示域 [-128,127] */
     }
 }
 
@@ -135,7 +135,8 @@ int ds_int4_quantize_bf16(ds_int4_block_t *block,
                           W_f32 + (size_t)r * in_dim, in_dim);
 
     block->bytes = (size_t)out_dim * in_dim + (size_t)out_dim * sizeof(float) * 2;
-    free(W_f32);
+                      /* 内存账: qweight 1B/值 + scale/offset 各 4B/行（BF16 版路径） */
+    free(W_f32);      /* 中间 F32 副本完成使命，释放（qweight 已是最终形态） */
     return 0;
 }
 
@@ -159,11 +160,12 @@ int ds_int4_quantize_f32(ds_int4_block_t *block,
     }
 
     for (int r = 0; r < out_dim; r++)
-        int8_quantize_row(block->qweight + (size_t)r * in_dim,
-                          &block->scale[r], &block->offset[r],
-                          W_f32 + (size_t)r * in_dim, in_dim);
+        int8_quantize_row(block->qweight + (size_t)r * in_dim,   /* 第 r 行的量化输出 */
+                          &block->scale[r], &block->offset[r],   /* 第 r 行的元数据 */
+                          W_f32 + (size_t)r * in_dim, in_dim);   /* 第 r 行的输入 */
 
     block->bytes = (size_t)out_dim * in_dim + (size_t)out_dim * sizeof(float) * 2;
+                      /* 内存账: qweight 1B/值 + scale/offset 各 4B/行（F32 直入路径） */
     return 0;
 }
 
@@ -180,17 +182,22 @@ void ds_int4_block_free(ds_int4_block_t *block) {
 
 /**
  * ds_int4_dequantize_f32() — 将 INT8 权重反量化为 F32（调试/验证用）
+ * @out:     输出缓冲，需 out_dim*in_dim 个 float（行主序，同原矩阵布局）
+ * @block:   量化权重块
+ *
  * 反量化公式: val = scale * (qval + 128) + offset
+ * （加回 128 恢复 [0,255] 无符号格点，乘 scale 还原跨度，加 min 还原平移）
+ * 这是 ds_int4_quant_error_rms 的内部依赖，也供单元测试对拍。
  */
 void ds_int4_dequantize_f32(float *out, const ds_int4_block_t *block) {
     if (!out || !block) return;
-    for (int r = 0; r < block->out_dim; r++) {
-        float scale = block->scale[r];
+    for (int r = 0; r < block->out_dim; r++) {       /* 逐行：scale/offset 是 per-row 的 */
+        float scale = block->scale[r];               /* 取本行的 scale/offset，内层循环不再查表 */
         float off   = block->offset[r];
-        const int8_t *qrow = block->qweight + (size_t)r * block->in_dim;
-        float *orow = out + (size_t)r * block->in_dim;
+        const int8_t *qrow = block->qweight + (size_t)r * block->in_dim;  /* 本行量化值 */
+        float *orow = out + (size_t)r * block->in_dim;                    /* 本行输出 */
         for (int c = 0; c < block->in_dim; c++)
-            orow[c] = scale * ((int)qrow[c] + 128) + off;
+            orow[c] = scale * ((int)qrow[c] + 128) + off;  /* 逐元素套反量化公式 */
     }
 }
 
@@ -206,19 +213,19 @@ float ds_int4_quant_error_rms(const ds_int4_block_t *block,
                                 const uint16_t *W_bf16) {
     if (!block || !W_bf16) return -1.0f;
     size_t total = (size_t)block->out_dim * block->in_dim;
-    float *deq = (float *)malloc(total * sizeof(float));
+    float *deq = (float *)malloc(total * sizeof(float));   /* 反量化结果的临时缓冲 */
     if (!deq) return -1.0f;
-    ds_int4_dequantize_f32(deq, block);
-    double ssq = 0, sor = 0;
+    ds_int4_dequantize_f32(deq, block);                    /* 得到"量化再还原"的权重 */
+    double ssq = 0, sor = 0;                               /* double 累加防大矩阵求和漂移 */
     for (size_t i = 0; i < total; i++) {
-        uint32_t u = ((uint32_t)W_bf16[i]) << 16;
-        float orig; memcpy(&orig, &u, 4);
-        float d = orig - deq[i];
-        ssq += d * d;
-        sor += orig * orig;
+        uint32_t u = ((uint32_t)W_bf16[i]) << 16;          /* BF16 → F32：尾数补零左移 16 位 */
+        float orig; memcpy(&orig, &u, 4);                  /* 位型重解释成 float（无类型双关） */
+        float d = orig - deq[i];                           /* 单元素量化误差 */
+        ssq += d * d;                                      /* 误差平方和 Σ(orig-deq)² */
+        sor += orig * orig;                                /* 原值平方和 Σorig²（归一化基准） */
     }
     free(deq);
-    return (sor > 0) ? sqrtf((float)(ssq / sor)) : 0.0f;
+    return (sor > 0) ? sqrtf((float)(ssq / sor)) : 0.0f;   /* 相对 RMS；全零矩阵定义为 0 */
 }
 
 /* ========================================================================
@@ -241,16 +248,16 @@ static void __attribute__((unused)) int8_matvec_generic(float *y, const float *x
                                   const ds_int4_block_t *block,
                                   int row_start, int nrows) {
     const int in_dim = block->in_dim;
-    for (int r = row_start; r < row_start + nrows; r++) {
-        float scale = block->scale[r];
+    for (int r = row_start; r < row_start + nrows; r++) {  /* 只算 [row_start, row_start+nrows) 区间 */
+        float scale = block->scale[r];                     /* 本行的反量化参数 */
         float off   = block->offset[r];
         const int8_t *qrow = block->qweight + (size_t)r * in_dim;
-        float dot_sum = 0.0f, x_sum = 0.0f;
+        float dot_sum = 0.0f, x_sum = 0.0f;                /* 两个独立归约（分解技巧，见上方推导） */
         for (int c = 0; c < in_dim; c++) {
-            dot_sum += (float)((int)qrow[c] + 128) * x[c];
-            x_sum += x[c];
+            dot_sum += (float)((int)qrow[c] + 128) * x[c]; /* 归约一: Σ(q+128)·x —— 带偏移点积 */
+            x_sum += x[c];                                 /* 归约二: Σx —— 供 offset 项使用 */
         }
-        y[r - row_start] = scale * dot_sum + off * x_sum;
+        y[r - row_start] = scale * dot_sum + off * x_sum;  /* 合成: y = scale·dot + offset·sum(x) */
     }
 }
 
@@ -345,47 +352,53 @@ typedef struct {
 /** int8_matvec_worker: 线程工作函数，按chunk分片计算INT8 matvec */
 static void int8_matvec_worker(int tid, int n_threads, void *arg) {
     int8_matvec_task_t *t = (int8_matvec_task_t *)arg;
+    /* 行分片: 总行数按线程数切成等大 chunk，线程 tid 取第 tid 块。
+     * chunk = ceil(total/n_threads) 保证恰好覆盖全部行；末线程裁掉越界部分 */
     int total = t->nrows;
-    int chunk = (total + n_threads - 1) / n_threads;
-    int my_off = tid * chunk;
+    int chunk = (total + n_threads - 1) / n_threads;   /* 向上取整的块大小 */
+    int my_off = tid * chunk;                          /* 本线程负责的行在任务内的起点 */
     int my_count = chunk;
-    if (my_off + my_count > total) my_count = total - my_off;
-    if (my_count <= 0) return;
-    int my_start = t->row_start + my_off;
-    float *my_y = t->y + my_off;
+    if (my_off + my_count > total) my_count = total - my_off;  /* 末块收尾: 裁到剩余行数 */
+    if (my_count <= 0) return;                         /* 行数少于线程数: 多余线程直接返回 */
+    int my_start = t->row_start + my_off;              /* 换算成权重矩阵里的绝对行号 */
+    float *my_y = t->y + my_off;                       /* 输出 y 同样按块偏移，互不重叠 */
 
 #ifdef __ARM_NEON
-    int8_matvec_neon(my_y, t->x, t->block, my_start, my_count);
+    int8_matvec_neon(my_y, t->x, t->block, my_start, my_count);   /* NEON 路径 */
 #else
-    int8_matvec_generic(my_y, t->x, t->block, my_start, my_count);
+    int8_matvec_generic(my_y, t->x, t->block, my_start, my_count);/* 纯 C 路径 */
 #endif
 }
 
-/** ds_int4_matvec: 完整INT8矩阵×向量乘法（自动选择单线程/多线程） */
+/** ds_int4_matvec: 完整INT8矩阵×向量乘法（自动选择单线程/多线程）
+ * y[out_dim] = W_quant·x[in_dim]；decode 的专家投影都走这里。
+ * 行间无依赖、天然可并行；线程池按行分片（见 int8_matvec_worker）。 */
 void ds_int4_matvec(float *y, const float *x, const ds_int4_block_t *block) {
     if (!y || !x || !block || block->out_dim <= 0) return;
-    ds_dispatch_ensure_init();
+    ds_dispatch_ensure_init();                     /* 惰性初始化线程池（重复调用无害） */
 
-    if (ds_get_threads() <= 1) {
+    if (ds_get_threads() <= 1) {                   /* 单线程: 省掉 fork-join 开销直算 */
 #ifdef __ARM_NEON
-        int8_matvec_neon(y, x, block, 0, block->out_dim);
+        int8_matvec_neon(y, x, block, 0, block->out_dim);       /* 全部行一次算完 */
 #else
         int8_matvec_generic(y, x, block, 0, block->out_dim);
 #endif
         return;
     }
-    int8_matvec_task_t task = { y, x, block, 0, block->out_dim };
-    ds_parallel_for(int8_matvec_worker, &task);
+    int8_matvec_task_t task = { y, x, block, 0, block->out_dim };  /* 任务 = 整个矩阵 */
+    ds_parallel_for(int8_matvec_worker, &task);    /* fork-join: 每线程领一块行区间 */
 }
 
-/** ds_int4_matvec_rows: 部分行的INT8矩阵×向量乘法（从row_start开始计算nrows行） */
+/** ds_int4_matvec_rows: 部分行的INT8矩阵×向量乘法（从row_start开始计算nrows行）
+ * 与 ds_int4_matvec 同一套分片逻辑，只是行区间缩小——供调用方自己做
+ * 粗粒度并行（如按专家分层）时复用；y 长度只需 nrows。 */
 void ds_int4_matvec_rows(float *y, const float *x,
                            const ds_int4_block_t *block,
                            int row_start, int nrows) {
     if (!y || !x || !block || nrows <= 0) return;
     ds_dispatch_ensure_init();
 
-    if (ds_get_threads() <= 1) {
+    if (ds_get_threads() <= 1) {                   /* 单线程直算指定行区间 */
 #ifdef __ARM_NEON
         int8_matvec_neon(y, x, block, row_start, nrows);
 #else
@@ -393,7 +406,7 @@ void ds_int4_matvec_rows(float *y, const float *x,
 #endif
         return;
     }
-    int8_matvec_task_t task = { y, x, block, row_start, nrows };
+    int8_matvec_task_t task = { y, x, block, row_start, nrows };  /* 区间起点透传给分片器 */
     ds_parallel_for(int8_matvec_worker, &task);
 }
 
@@ -404,7 +417,18 @@ void ds_bf16_truncate_array(float *a, int n);
 void ds_swiglu_direct(float *out, const float *gate, const float *up,
                         int seq_len, int intermediate);
 
-/** ds_expert_forward_fused_int4: INT8版本的专家前向（gate+up融合，INT8→F32反量化） */
+/** ds_expert_forward_fused_int4: INT8版本的专家前向（gate+up融合，INT8→F32反量化）
+ * 数学: out = Down · SwiGLU(GateUp·x)，与 BF16 版 ds_expert_forward_fused
+ * 逐算子对应，ds_moe_decoder.c 按 int4_enabled 二选一。
+ * @param out           输出 [hidden]（bf16_simulate 开启时会做 BF16 截断）
+ * @param x             输入 [hidden]
+ * @param gate_up_int4  gate+up 融合权重量化块 [2*inter, hidden]
+ * @param down_int4     down 投影权重量化块 [hidden, inter]
+ * @param hidden        隐层维度（1280）
+ * @param intermediate  专家中间维度（896）
+ * @param gate_up_buf/gate_buf/up_buf/hidden_buf
+ *                      调用方预分配的复用缓冲（每步零 malloc，形状见函数体）
+ * 量化误差只发生在权重读取，激活与累加全程 F32（docs/09 §3.5）。 */
 void ds_expert_forward_fused_int4(
     float *out, const float *x,
     const ds_int4_block_t *gate_up_int4,
@@ -412,10 +436,11 @@ void ds_expert_forward_fused_int4(
     int hidden, int intermediate,
     float *gate_up_buf, float *gate_buf,
     float *up_buf, float *hidden_buf) {
-    /* Step 1: 融合 gate+up 投影 → INT8反量化 → F32 */
-    ds_int4_matvec(gate_up_buf, x, gate_up_int4);
-    memcpy(gate_buf, gate_up_buf, intermediate * sizeof(float));
-    memcpy(up_buf, gate_up_buf + intermediate, intermediate * sizeof(float));
+    /* Step 1: 融合 gate+up 投影 → INT8反量化 → F32
+     * gate_up_buf = [gate | up] 两段拼接（2*inter），两次 memcpy 拆开 */
+    ds_int4_matvec(gate_up_buf, x, gate_up_int4);   /* 反量化融在 matvec 里，不落中间矩阵 */
+    memcpy(gate_buf, gate_up_buf, intermediate * sizeof(float));              /* 前段 = gate */
+    memcpy(up_buf, gate_up_buf + intermediate, intermediate * sizeof(float)); /* 后段 = up */
 
     /* Step 2: BF16精度截断（匹配Python autocast行为） */
     if (ds_bf16_simulate_python) {
@@ -424,12 +449,12 @@ void ds_expert_forward_fused_int4(
     }
 
     /* Step 3: SwiGLU激活 */
-    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);
+    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);  /* SiLU(gate)*up，逐元素 */
     if (ds_bf16_simulate_python)
-        ds_bf16_truncate_array(hidden_buf, intermediate);
+        ds_bf16_truncate_array(hidden_buf, intermediate);   /* 激活输出同样截断回 BF16 */
 
     /* Step 4: Down投影 → INT8反量化 → F32 */
-    ds_int4_matvec(out, hidden_buf, down_int4);
+    ds_int4_matvec(out, hidden_buf, down_int4);   /* 第二次量化 matvec: [hidden,inter]·buf */
     if (ds_bf16_simulate_python)
-        ds_bf16_truncate_array(out, hidden);
+        ds_bf16_truncate_array(out, hidden);      /* 专家最终输出截断，对齐 PyTorch autocast */
 }

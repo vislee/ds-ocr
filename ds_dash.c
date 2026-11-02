@@ -151,6 +151,8 @@ static void rope2d_cos_sin_row(float *cosr, float *sinr, int tok, int page, int 
     int p = page % DS_DASH_PAGE_MOD;     /* 折叠成 0/1 交替：只判"同页/跨页" */
     float ang[64];                       /* [half] 个角度；emb = cat(ang, ang) */
     for (int i = 0; i < n_tok; i++)
+        /* tok 轴角度 = tok·10000^(-i/63)：resample 模式把整个频谱重铺进 63 对，
+         * 页内相对距离决定旋转差，与文档总长无关 */
         ang[i] = (float)tok * powf(DS_DASH_TOK_THETA, -(float)i / (float)n_tok);
     ang[n_tok] = (float)p;               /* inv_page = 1.0（page_pairs=1）——bug ③ 防回归点 */
     for (int i = 0; i < half; i++) {
@@ -246,7 +248,7 @@ int ds_dash_build_coords(ds_ctx_t *ctx, const int *token_ids, int seq_len) {
     memset(st->pf_cnt, 0, sizeof(st->pf_cnt));
     int run[DS_DASH_MAX_PAGES];          /* 每个页桶的 running count 游标 */
     memset(run, 0, sizeof(run));
-    int n_pages = pp;
+    int n_pages = pp;                    /* prompt 页数（指令文本回退到保留桶 0 用） */
     for (int s = 0; s < seq_len; s++) {
         int in_pf = (s <= last_img);
         /* 页桶规则: 图像及之前 → cum1（1-based 页号）；之后（指令文本）→
@@ -388,6 +390,8 @@ static int router_qk(ds_ctx_t *ctx, int layer_idx,
     int hidden = cfg->dec_hidden, d = DS_DASH_INDEX_DIM;
     int hd = cfg->dec_head_dim;
 
+    /* 路由投影权重缺失（非 V4 模型或未加载）直接报错——DASH 路径没有
+     * "退化成稠密注意力"的降级模式，静默跳过会让路由读到垃圾 */
     if (!layer->dash_q_proj_bf16 || !layer->dash_k_proj_bf16) return -1;
     if (layer_idx < 0 || layer_idx >= st->n_layers) return -1;
     /* scratch 懒增长（prefill seq_len 可达数千；decode 只需 1 行） */
@@ -722,6 +726,21 @@ static void route_select(ds_ctx_t *ctx, const float *z, int nblk, int q, ds_dash
  * 【在线 softmax】逐 KV 流式维护 (run_m, run_s, O) 三元组（docs/13 §2），
  *   遇更大分数先修旧账再写入——两段离散可见域（局部窗 + 远处散块）共用
  *   同一组在线状态，正是 FA"分段扫描、状态合并"的思想。
+ * 【稀疏度算账】（块稀疏省 FLOP 的账）
+ *   全注意力: 每 query 扫 total_kv 个 KV，每个一次 128 维 QK 点积 → O(total_kv·d)。
+ *   DASH 可见域 ≤ 局部窗 128 + K×32 = 12×32 = 384，合计 ≤512 个 KV 位置
+ *   （局部窗与最远一档选中块 b=q_blk−4 可能重叠最多 32 个 token，实际略少）
+ *   → O(512·d)。total_kv=2048 时约省 4×，kv_cache_max=8192 满载时约 16×；
+ *   路由自身开销（k_bar 每块一次、z 每 query 对 nblk 块各一次 128 维点积）
+ *   是低阶项——注意力成本不再随长文档线性放大，这是 DASH 的存在意义。
+ * 【与全注意力的等价边界】
+ *   1. q_abs < 局部窗 128: 全部 KV 天然可见、bias 恒 0、无 continue 跳过
+ *      → 与稠密全注意力逐位一致（对照官方 _forward_dense 路径的回归依据）；
+ *   2. 一般情形与全注意力的差 = 被掩掉的未选中远程块 + 选中块上的
+ *      log-prior 偏置——仅当全部远程块都被选中且偏置为 0 时才退回全注意力；
+ *   3. 局部窗与选中块共用一组在线 (m,l,O) 状态，数学上等价于对两段可见域
+ *      做同一次 softmax（FA 分段合并公式保证）；浮点下结果随扫描顺序存在
+ *      舍入差——C 按 KV 位置递增扫描，与官方实现同序，可复现对齐。
  * 【为什么 V4 的 KV 用 F32】代码保留 BF16 通路（ds_dot_bf16xf32 精确展开），
  *   但 r2 实验中 BF16 KV 在 V4 打红（DASH 对 KV 精度敏感，与 V3 全绿相反）
  *   而回退——config 维持 F32（docs/14 §7 对比表）。
@@ -758,6 +777,9 @@ static void attn_head_range(ds_ctx_t *ctx, int layer_idx, const float *Qbuf,
         if (!is_local) {
             /* 非局部：默认 −inf（用 −1e30 表示），在选中块里找本块偏置 */
             bias = -1e30f;
+            /* 在选中块列表里找本块：命中则整块共用该槽的 log-prior 偏置——
+             * 路由粒度是块、注意力粒度是 token，块内部仍是稠密逐 token 计算，
+             * 只是每个 token 的分数统一加上同一个 bias */
             for (int k = 0; k < rt->n_valid; k++) {
                 if (!rt->valid[k] || rt->blk[k] != tb) continue;
                 bias = rt->bias[k]; break;
@@ -766,6 +788,8 @@ static void attn_head_range(ds_ctx_t *ctx, int layer_idx, const float *Qbuf,
              * （这是块稀疏省算力的来源：远处只算被路由选中的 ~12 块） */
             if (bias <= -1e29f) continue;           /* 未选中块 → -inf */
         }
+        /* 取本 token 的 K/V 行（F32/BF16 双宽度，由 ctx->kv_bf16 决定；
+         * 布局见 ds_dash.h 的 ds_kv_k_row/ds_kv_v_row 行访问注释） */
         const void *kt = ds_kv_k_row(ctx, layer_idx, t);
         const void *vt = ds_kv_v_row(ctx, layer_idx, t);
         for (int hh = 0; hh < nh; hh++) {
@@ -897,8 +921,8 @@ int ds_dash_attention_prefill(ds_ctx_t *ctx, int layer_idx,
                               const float *x_norm, const float *Q_rot,
                               int seq_len, float *out) {
     ds_dash_state_t *st = (ds_dash_state_t *)ctx->dash_state;
-    int total_kv = ctx->kv_cache_len + seq_len;
-    int nblk = (total_kv + DS_DASH_BLOCK_SIZE - 1) / DS_DASH_BLOCK_SIZE;
+    int total_kv = ctx->kv_cache_len + seq_len;   /* 含本批 prefill token 的 KV 总数 */
+    int nblk = (total_kv + DS_DASH_BLOCK_SIZE - 1) / DS_DASH_BLOCK_SIZE;  /* KV 总块数 */
 
     if (router_qk(ctx, layer_idx, x_norm, seq_len) != 0) return -1;
     /* 路由结果缓冲懒增长（最小 1024 条，避免小 prefill 反复 malloc） */
@@ -934,8 +958,8 @@ int ds_dash_attention_prefill(ds_ctx_t *ctx, int layer_idx,
 int ds_dash_attention_decode(ds_ctx_t *ctx, int layer_idx,
                              const float *x_norm, float *out) {
     ds_dash_state_t *st = (ds_dash_state_t *)ctx->dash_state;
-    int total_kv = ctx->kv_cache_len + 1;
-    int nblk = (total_kv + DS_DASH_BLOCK_SIZE - 1) / DS_DASH_BLOCK_SIZE;
+    int total_kv = ctx->kv_cache_len + 1;   /* 含本步即将写入的 token */
+    int nblk = (total_kv + DS_DASH_BLOCK_SIZE - 1) / DS_DASH_BLOCK_SIZE;  /* KV 总块数 */
 
     if (router_qk(ctx, layer_idx, x_norm, 1) != 0) return -1;
     /* decode 的 z 只有 1 行（单 query 对全部块的分数） */

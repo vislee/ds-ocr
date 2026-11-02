@@ -1306,7 +1306,7 @@ int main(int argc, char **argv) {
 
     /* ── 初始化线程池 ── */
     if (n_threads <= 0) n_threads = ds_get_num_cpus();  /* 默认: 使用所有CPU核心 */
-    ds_set_threads(n_threads);
+    ds_set_threads(n_threads);   /* 初始化线程池（数学内核 sgemm/matvec 的并行度） */
 
     /* ── 加载模型 ──
      * ds_load() 执行以下步骤:
@@ -1329,14 +1329,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ── 应用推理设置 ── */
-    ctx->max_new_tokens = max_new_tokens;
-    ctx->keep_raw_layout = raw_layout;
-    ctx->temperature = temperature;
-    ctx->repeat_penalty = repeat_penalty;
-    ctx->no_repeat_ngram_size = no_repeat_ngram_size;
-    if (min_new_tokens >= 0) ctx->min_new_tokens = min_new_tokens;
-    if (profile) ctx->profile_enabled = 1;
+    /* ── 应用推理设置 ──（把 CLI 解析值写入 ctx，覆盖 ds_load/alloc_decoder_buffers 的内置默认） */
+    ctx->max_new_tokens = max_new_tokens;              /* -n: 生成上限（默认 4096） */
+    ctx->keep_raw_layout = raw_layout;                 /* --raw-layout: V4 保留原生结构化输出 */
+    ctx->temperature = temperature;                    /* --temp: 采样温度（0=贪心） */
+    ctx->repeat_penalty = repeat_penalty;              /* --rp: 重复惩罚（1.0=无惩罚） */
+    ctx->no_repeat_ngram_size = no_repeat_ngram_size;  /* --ngram: n-gram 阻断（0=禁用，V3 下方强制 35） */
+    if (min_new_tokens >= 0) ctx->min_new_tokens = min_new_tokens;  /* --min-tokens: -1=沿用内置默认（V3/V4=32、V1/V2=0） */
+    if (profile) ctx->profile_enabled = 1;             /* --profile: 逐层计时开关 */
     if (int4) {
         /* INT4量化: 将BF16专家权重量化为逐行INT8（--int4 名称系历史遗留，
          * 结构体 ds_int4_block_t 同理保留旧名）。存储每值 1 字节 vs BF16

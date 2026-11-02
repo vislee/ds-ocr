@@ -25,9 +25,9 @@
 #include <stdint.h>
 
 #ifdef __APPLE__
-#define DS_METAL_AVAILABLE 1
+#define DS_METAL_AVAILABLE 1   /* 编译期就有 Metal 框架可链接（运行时仍可能初始化失败） */
 #else
-#define DS_METAL_AVAILABLE 0
+#define DS_METAL_AVAILABLE 0   /* 非 Apple 平台：ds_metal.c 不参与编译，调用方走 CPU */
 #endif
 
 #ifdef __cplusplus
@@ -46,7 +46,8 @@ typedef struct ds_metal_ctx ds_metal_ctx_t;
  * a command queue ready for compute work. */
 ds_metal_ctx_t *ds_metal_init(void);
 
-/* Release all Metal resources (pipelines, buffers, device). */
+/* Release all Metal resources (pipelines, buffers, device).
+ * NULL 安全；权重底层内存归 safetensors 的 mmap 管，这里只释放 Metal 对象。 */
 void ds_metal_free(ds_metal_ctx_t *ctx);
 
 /* Check if Metal context is valid and ready for compute. */
@@ -162,6 +163,8 @@ int ds_metal_lm_head_argmax(ds_metal_ctx_t *ctx,
 
 /* Single BF16 matvec on GPU: y = x @ W^T (+ bias if non-NULL)
  * For seq_len=1 (decode), this is equivalent to ds_linear_nobias_bf16.
+ * 注意: 当前实现派发 bf16_matvec kernel（无 bias 输入），bias 暂被忽略；
+ * 带 bias 的 bf16_matvec_bias kernel 已注册待接（见 ds_metal.m 同名函数）。
  *
  * Parameters:
  *   ctx    - Metal context

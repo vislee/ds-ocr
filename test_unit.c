@@ -64,6 +64,8 @@ static void ut_run_all(void) {
     }
 }
 
+/* slurp - 整文件读入内存（e2e 对照冻结标签用），失败返回 NULL，
+ * 读到的字节数经 len 出参带回。 */
 static char *slurp(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -77,10 +79,14 @@ static char *slurp(const char *path, size_t *len) {
 }
 
 /* ════════════════ 1. kernels ════════════════ */
+/* test_dot_axpy_vec - 向量内核的精确值钉扎 (docs/03)
+ * 期望值手算: dot([1..8],[2,2,…]) = 2×(1+…+8) = 72；add 逐项相加；
+ * axpy 即 c += α·a；scale_add 的 rescale 语义（d = d×α + src，
+ * 在线 softmax 更新增幅的基础）逐值对照 3×1+5=8。 */
 static void test_dot_axpy_vec(void) {
     UT_SUITE("kernels");
     float a[8] = {1, 2, 3, 4, 5, 6, 7, 8}, b[8] = {2, 2, 2, 2, 2, 2, 2, 2};
-    UT_CLOSE(ds_dot_f32(a, b, 8), 72.0f, 1e-5);
+    UT_CLOSE(ds_dot_f32(a, b, 8), 72.0f, 1e-5);   /* 2*(1+2+...+8) = 72 */
     float o[8] = {0}; ds_vec_add(o, a, b, 8);
     UT_CLOSE(o[3], 6.0f, 1e-6);
     ds_vec_scale_inplace(o, 0.5f, 8);
@@ -96,6 +102,10 @@ static void test_dot_axpy_vec(void) {
     UT_CLOSE(d[4], 16.0f, 1e-6);
 }
 
+/* test_fast_expf - 快速 exp 的精度换刀验证 (docs/05)
+ * 性质: 相对误差 <5%（远小于在线 softmax 的累积容差），逐点对照
+ * libm expf；深负输入饱和为 0（exp(-100) 下溢归零，绝不能出 NaN）。
+ * 步长 0.37 故意避开整数点，扫出拟合多项式的周期性误差。 */
 static void test_fast_expf(void) {
     UT_SUITE("kernels");
     for (float x = -10.0f; x <= 4.0f; x += 0.37f) {
@@ -105,6 +115,10 @@ static void test_fast_expf(void) {
     UT_CHECK(ds_fast_expf(-100.0f) == 0.0f);
 }
 
+/* test_activations - SiLU/GELU/SwiGLU 对照公式参考逐点检查 (docs/01/02)
+ * 期望值 = 测试内用 libm expf 重算的 silu(gate)·up——容差 2% 是因为
+ * 内核走 fast_expf 而参考用精确 expf；gelu(3)≈2.996 用已知值钉扎；
+ * swiglu_multiply 的交错布局（fused[2j]=gate、fused[2j+1]=up）单独验。 */
 static void test_activations(void) {
     UT_SUITE("kernels");
     float g[4] = {0.0f, 1.0f, -1.0f, 2.0f}, u[4] = {1, 1, 1, 1}, out[8];
@@ -127,6 +141,10 @@ static void test_activations(void) {
     }
 }
 
+/* test_norms - LayerNorm/RMSNorm 对照手算期望 (docs/01)
+ * x=[1,2,3,4]: mean=2.5、var=(2.25+0.25+0.25+2.25)/4=1.25；
+ * RMS = sqrt((1+4+9+16)/4 + eps)。期望值全部是函数体内手算的常数，
+ * 不依赖被测实现本身（避免"用实现验证实现"）。 */
 static void test_norms(void) {
     UT_SUITE("kernels");
     float x[4] = {1, 2, 3, 4}, w[4] = {1, 1, 1, 1}, b[4] = {0, 0, 0, 0}, o[4];
@@ -139,6 +157,10 @@ static void test_norms(void) {
     for (int i = 0; i < 4; i++) UT_CLOSE(r[i], x[i] / rms, 1e-4);
 }
 
+/* test_rope_neox - RoPE 旋转的三个数学性质 (docs/01)
+ * ① 恒等: cos=1/sin=0 → 向量不变；② 90°: cos=0/sin=1 → 前后半交换
+ * （NeoX 布局 x'[i] = x[i]·cos − x[i+half]·sin，v2[2]=3 钉住交叉项）；
+ * ③ 范数守恒: 任意旋转角下平方和不变——旋转矩阵正交性的直接体现。 */
 static void test_rope_neox(void) {
     UT_SUITE("kernels");
     /* 旋转保持范数；cos=1,sin=0 恒等；cos=0,sin=1 交换半轴 */
@@ -160,12 +182,16 @@ static void test_rope_neox(void) {
     UT_CLOSE(n1, n0, 1e-3);
 }
 
+/* test_bf16_convert - BF16 转换的位级与数值验证 (docs/09)
+ * 期望值: 1.0f 的 BF16 位型恰为 0x3F80（尾数低 16 位截断）、0.0→0x0000；
+ * bf16→f32 精确无损（位型左移 16 位即 f32）；bf16×f32 点积/axpy 必须与
+ * "先精确展开再 F32 计算"逐位一致；linear_nobias 对照手算矩阵乘。 */
 static void test_bf16_convert(void) {
     UT_SUITE("kernels");
     float f[6] = {1.0f, -2.5f, 3.14159f, 65504.0f, 1e-8f, 0.0f};
     uint16_t b[6];
     ds_f32_to_bf16_batch(b, f, 6);
-    UT_CHECK(b[0] == 0x3F80); UT_CHECK(b[5] == 0x0000);
+    UT_CHECK(b[0] == 0x3F80); UT_CHECK(b[5] == 0x0000);   /* 1.0→0x3F80, 0.0→0x0000（位型钉扎） */
     float back[6];
     ds_bf16_to_f32_batch(back, b, 6);
     for (int i = 0; i < 6; i++) UT_CLOSE(back[i], f[i], fabsf(f[i]) * 0.004f + 1e-9);
@@ -196,6 +222,10 @@ static void test_bf16_convert(void) {
     UT_CLOSE(y[1], x[0]*Wexp[3] + x[1]*Wexp[4] + x[2]*Wexp[5], 1e-4);
 }
 
+/* test_moe_topk - top-k 路由的排序与归一化性质 (docs/02)
+ * 8 个得分取 top-3 → [0.9, 0.85, 0.7] → idx [1,6,3]（手算构造）；
+ * 权重 = top-k 集合内 softmax → 和为 1 且严格降序——
+ * 这是专家加权求和 Σwᵢ·Eᵢ(x) 保持凸组合的数学前提。 */
 static void test_moe_topk(void) {
     UT_SUITE("kernels");
     float scores[8] = {0.1f, 0.9f, 0.3f, 0.7f, 0.5f, 0.05f, 0.85f, 0.2f};
@@ -207,6 +237,10 @@ static void test_moe_topk(void) {
     UT_CHECK(w[0] >= w[1] && w[1] >= w[2]);
 }
 
+/* test_thread_pool - 线程池冒烟测试 (docs/05)
+ * 开 4 线程跑 256 元素大点积，对照串行参考——验证分片归约不丢项、
+ * 不乱序（容差 1e-4 相对值，容忍浮点求和顺序差异）；结束后恢复
+ * 单线程，避免污染后续测试。 */
 static void test_thread_pool(void) {
     UT_SUITE("kernels");
     ds_set_threads(4);
@@ -223,6 +257,10 @@ static void test_thread_pool(void) {
 }
 
 /* ════════════════ 2. attention ════════════════ */
+/* brute_causal_1tok - 单 token 因果注意力的朴素参考实现（对照真值）
+ * 按定义三步走: 全量点积打分 → 减 max 后 exp 归一（精确 softmax）
+ * → 加权求和 V。没有任何优化技巧，慢但数学上直白，
+ * 是被测内核的"教科书真值"。kv_stride 支持 K/V 带行跨步的布局。 */
 static void brute_causal_1tok(float *out, const float *q, const float *K, const float *V,
                               int n_heads, int head_dim, int kv_len, int kv_stride, float scale) {
     for (int h = 0; h < n_heads; h++) {
@@ -246,6 +284,10 @@ static void brute_causal_1tok(float *out, const float *q, const float *K, const 
     }
 }
 
+/* test_causal_decode_vs_brute - 解码注意力内核 vs 朴素参考对拍 (docs/05)
+ * K/V 随机填 40 长 cache、单 q token；容差按每 head 最大幅值 10% 放宽：
+ * 内核用 fast_expf（~1.5%/次）且在线 softmax 的 rescale 逐次复合——
+ * 本测只当"结构性 bug 门"（漏项/错 head/错 stride），不做精度竞赛。 */
 static void test_causal_decode_vs_brute(void) {
     UT_SUITE("attention");
     int nh = 4, hd = 16, kvlen = 40, stride = 80;
@@ -266,6 +308,11 @@ static void test_causal_decode_vs_brute(void) {
     free(K); free(V);
 }
 
+/* test_rswa_bf16_matches_expanded_f32 - R-SWA 的 BF16-KV ≡ 展开 F32 等价性
+ * 数学约定（r2 任务2）: 同一批数据量化成 bf16 后，BF16 路径的结果必须
+ * ≡ 把它精确展开回 F32 再算的结果——F32 路径故意先读 bf16 再展开、
+ * 两者共用 fast_expf 在线 softmax，把差异来源压缩到只剩 bf16 存储舍入
+ * （~0.4%）→ 容差按幅值 2%。等价性破了 = 内核读取/反量化有 bug。 */
 static void test_rswa_bf16_matches_expanded_f32(void) {
     UT_SUITE("attention");
     /* BF16 KV 路径 ≡ 把同一 bf16 数据精确展开后的 F32 路径（r2 任务2 的数学约定） */
@@ -298,6 +345,10 @@ static void test_rswa_bf16_matches_expanded_f32(void) {
 }
 
 /* ════════════════ 3. safetensors ════════════════ */
+/* write_synth_safetensors - 造一个 8 字节对齐的合成 safetensors 文件
+ * header 描述两个 BF16 张量（bias [4]、weight [2,4]）；数据区 12 个
+ * uint16 全是已知位型（1,2,3,4 / 1,2,3,4 / -1,2,3,4，注释标在字面量上）——
+ * 后续断言直接对照这些常量，不依赖任何真实模型文件。 */
 static void write_synth_safetensors(const char *path) {
     /* header: {"w.bias":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]},
      *          "w.weight":{"dtype":"BF16","shape":[2,4],"data_offsets":[8,24]}} */
@@ -317,6 +368,11 @@ static void write_synth_safetensors(const char *path) {
     fclose(f);
 }
 
+/* test_safetensors_open_find_read - safetensors 打开/查找/直读全链路 (docs/03)
+ * 覆盖: 不存在文件返回 NULL；正常打开；按名查找张量；元数据核对
+ * （8 个 BF16 = 16 字节、shape [2,4]）；mmap 直读指针对照已知位型
+ * （位型 <<16 即 f32，验证 1.0/4.0/-1.0/4.0 四个采样点）；查不到返回
+ * NULL；madvise_unused 释放后 close 不崩。 */
 static void test_safetensors_open_find_read(void) {
     UT_SUITE("safetensors");
     const char *dir = "/tmp/ut_st";
@@ -356,6 +412,11 @@ static void test_safetensors_open_find_read(void) {
 }
 
 /* ════════════════ 4. image ════════════════ */
+/* test_image_resize_pad_chw - 图像加载/pad/缩放/CHW 变换 (docs/06)
+ * 期望值: golden 测试图恰为 400×100；pad 到 640×640 后顶部像素 =
+ * pad 色 127（等比缩放 400×100→640×160、垂直居中，上下留黑边）；
+ * resize 非等比强改尺寸；CHW 变换走 BasicImageTransform 归一化
+ * (x/255−0.5)/0.5 → 值域约 [-1,1]（统计断言: 无越界、有真实内容）。 */
 static void test_image_resize_pad_chw(void) {
     UT_SUITE("image");
     ds_image_t *img = ds_image_load("docs/golden/images/test_simple.png");
@@ -392,6 +453,10 @@ static void test_image_resize_pad_chw(void) {
     ds_image_free(img);
 }
 
+/* test_dynamic_preprocess - 动态切分的块数与块尺寸 (docs/06)
+ * 宽图 1794×1578（真实截图比例）→ 贪心行列布局切成 ≥2 块、每块恰
+ * 640×640；小图 400×100 双边 ≤640 → 1 块。期望值由切块公式得出，
+ * 手工构造的图像（calloc 全 0）即可，无需真实内容。 */
 static void test_dynamic_preprocess(void) {
     UT_SUITE("image");
     /* 宽图 1794×1578 → 多块（与真实截图行为一致） */
@@ -425,6 +490,12 @@ static void test_dynamic_preprocess(void) {
 }
 
 /* ════════════════ 5. tokenizer ════════════════ */
+/* test_tokenizer_real - 真实 tokenizer.json 的编解码与已知 ids 钉扎 (docs/07)
+ * 期望值来源 = HuggingFace 官方 tokenizer 对同文本的输出:
+ *   "Multi page parsing."    → [37460, 4366, 76466, 16]（'Multi'/' page'/' parsing'/'.')
+ *   "\ndocument parsing."    → [201, 34030, 76466, 16]（201 = 'Ċ' 换行 token）
+ * 钉扎断言可捕获 merges rank 错位、added_tokens 丢失等"不崩但答错"的
+ * 静默回归。另验: CJK 编码不崩、空串返回空、单 id 解码往返。 */
 static void test_tokenizer_real(void) {
     UT_SUITE("tokenizer");
     const char *tdir = "models/DeepSeek-OCR/tokenizer.json";
@@ -458,6 +529,12 @@ static void test_tokenizer_real(void) {
 }
 
 /* ════════════════ 6. dash（unity statics）════════════════ */
+/* test_rope2d_values - DASH 页面 2D RoPE 的角度生成 (docs/14)
+ * 页轴: inv_page=1（page_pairs=1）→ page 偶数角 0、奇数角 1 rad——
+ * 注意是整弧度而非 1/256（与旧版实现的分界，test 注释专门钉住）；
+ * tok 轴: inv_tok[i] = 10000^(−i/63) → tok=5 时 i=0 角 5 rad；
+ * cat(ang,ang) 布局: 前后半相等（cosr[64]==cosr[0]、sinr[100]==sinr[36]）。
+ * 期望值 = cosf/sinf 对照。 */
 static void test_rope2d_values(void) {
     UT_SUITE("dash");
     /* 页轴: inv_page = 1（page_pairs=1）→ 角度 = (page%2)·1.0 rad
@@ -480,6 +557,10 @@ static void test_rope2d_values(void) {
     UT_CLOSE(sinr[100], sinr[36], 1e-6);
 }
 
+/* test_gemma_rms - Gemma 风格 RMSNorm 的 (1+w) 缩放约定 (docs/14)
+ * 与标准 RMSNorm 的唯一区别: scale = 1 + weight（而非 weight）。
+ * w=0 → scale=1（输出=x/rms，rms 手算 = sqrt((1+4+9+16)/4+eps)）；
+ * w=1 → scale=2（输出翻倍）。两个期望值都是手算常数。 */
 static void test_gemma_rms(void) {
     UT_SUITE("dash");
     float x[4] = {1, 2, 3, 4}, w[4] = {0, 0, 0, 0}, o[4];
@@ -491,6 +572,11 @@ static void test_gemma_rms(void) {
     for (int i = 0; i < 4; i++) UT_CLOSE(o[i], 2.0f * x[i] / rms, 1e-4);
 }
 
+/* test_entmax15_props - entmax15 的稀疏 softmax 性质 (docs/14)
+ * 性质: 输出非负、总和为 1、支持集稀疏（存在严格零分量——与 softmax
+ * 的本质区别，τ 截断所致）、argmax 保序（最大输入分得最大概率）。
+ * 极端用例钉边界: 全相等输入 → 均匀 1/n；单峰输入 → argmax 吃满
+ * 全部质量（one-hot，τ 抬到恰好只剩支持集 {argmax}）。 */
 static void test_entmax15_props(void) {
     UT_SUITE("dash");
     /* 性质: 输出非负、和为 1、支持稀疏、τ 由「支持集平方和=1」确定 */
@@ -516,6 +602,8 @@ static void test_entmax15_props(void) {
     UT_CLOSE(s[2], 1.0f, 1e-5);
 }
 
+/* make_dash_ctx - 构造最小 DASH 上下文（2 层 hist、1024 KV 槽位，省内存），
+ * 失败返回 NULL 由调用方跳过用例。 */
 static ds_ctx_t *make_dash_ctx(void) {
     ds_ctx_t *ctx = calloc(1, sizeof(ds_ctx_t));
     ctx->config.dec_head_dim = 128;
@@ -527,6 +615,13 @@ static ds_ctx_t *make_dash_ctx(void) {
     return ctx;
 }
 
+/* test_dash_coords_multipage - 多页 prompt 的页坐标状态机 (docs/14)
+ * 用官方多页布局 [BOS, <PAGE>, img×5, <PAGE>, img×2, 指令×3] 逐 token
+ * 断言四组状态: page_pos（页面轴，指令落在 cum−pp=0 保留桶）、
+ * tok_pos（各页桶内 running 计数）、pf_cnt（prefill 桶计数，只数
+ * in_prefill ≤last_img）、decode 初值（末行延续）与推进语义
+ * （普通 token tok+1、候选页 qp=mcum−1−pp；<PAGE> 触发 mcum+1、
+ * 页切换到 pf_cnt[新页]）；最后验证 rope 行地址 = cos2d + abs×128。 */
 static void test_dash_coords_multipage(void) {
     UT_SUITE("dash");
     ds_ctx_t *ctx = make_dash_ctx();
@@ -575,6 +670,12 @@ static void test_dash_coords_multipage(void) {
     free(ctx);
 }
 
+/* test_route_select_sentinel - 回归钉扎 r1 修复: remote 哨兵块必须失效 (docs/14)
+ * 构造 8 块: 块 0/1 是页候选（remote∧候选 → valid），块 2..4 分数 -1e9
+ * （remote 窗外），块 5,6 remote 但非候选 → 必须置 valid=0 且 bias=0，
+ * 哨兵块不得参与 μ 中心化与注意力（r1 的 bug 正是它们混了进来）。
+ * 再验: 两有效块的 bias 均值中心化（b0+b1≈0、一正一负）；
+ * 无页候选（cand=-1）时 fallback 全部 remote 放开、仍有 2 块 valid。 */
 static void test_route_select_sentinel(void) {
     UT_SUITE("dash");
     /* 回归钉扎 r1 修复: 未过 remote 掩码的哨兵块必须 invalid，不参与 μ 与注意力 */
@@ -629,6 +730,7 @@ static void test_route_select_sentinel(void) {
 }
 
 /* ════════════════ 7. ocr statics ════════════════ */
+/* write_fixture_config - 往目录写一个 config.json 夹具（版本探测的输入） */
 static void write_fixture_config(const char *dir, const char *body) {
     mkdir(dir, 0755);
     char p[256]; snprintf(p, sizeof(p), "%s/config.json", dir);
@@ -636,6 +738,11 @@ static void write_fixture_config(const char *dir, const char *body) {
     if (f) { fputs(body, f); fclose(f); }
 }
 
+/* test_detect_model_version - 四代模型的 config.json 版本探测钉扎 (docs/04)
+ * 判据链（由弱到强）: 缺省 V1 → "deepencoderv2"/enc_type → V2，
+ * "sliding_window_size" → V3，"training_stage":"dash"/
+ * "sparse_attention_config" → V4；目录不存在返回 -1。
+ * 每个夹具只放该代的独有字段——期望值 = 官方 config.json 的判别特征。 */
 static void test_detect_model_version(void) {
     UT_SUITE("ocr_statics");
     write_fixture_config("/tmp/ut_v1", "{\"hidden_size\":1280}");
@@ -651,6 +758,11 @@ static void test_detect_model_version(void) {
     UT_CHECK(detect_model_version("/tmp/ut_noexist_dir") == -1);
 }
 
+/* test_init_config_versions - 四代 init_config 的关键维度钉扎 (docs/04)
+ * 期望值 = 各代官方 config: V1/V2 共用 hidden 1280、12 层解码器；
+ * V3 增加 sliding_window_size=128 与 image_size_crop=640；
+ * V4 滑动窗归零（DASH 稀疏注意力接管）、image_token_id=128815。
+ * 一处字段错 → 权重 mmap 错位，这里在加载前就拦住。 */
 static void test_init_config_versions(void) {
     UT_SUITE("ocr_statics");
     ds_config_t cfg;
@@ -668,6 +780,10 @@ static void test_init_config_versions(void) {
     UT_CHECK(cfg.model_version == 4 && cfg.sliding_window_size == 0 && cfg.image_token_id == 128815);
 }
 
+/* test_strip_det_tags - 后处理: 检测/引用标签整块剥离 (docs/08)
+ * 期望值 = 去块后首尾拼接: "hello<|det|>…<|/det|>world" → "helloworld"
+ * （坐标串绝不外漏）；ref+det 混排 "A<|ref|>cat…<|/det|>B" → "AB"
+ * ——ref 描述与 det 坐标整块同删，输出长度恰好等于剥离后剩余。 */
 static void test_strip_det_tags(void) {
     UT_SUITE("ocr_statics");
     char buf[512];
@@ -686,6 +802,11 @@ static void test_strip_det_tags(void) {
 }
 
 /* ════════════════ 8. e2e（模型存在才跑）════════════════ */
+/* e2e_model - 单模型端到端: 加载 → 识别 → 对照冻结标签 (docs/04)
+ * 与 CLI 完全同条件跑（全核线程、V3 ngram 守卫 35、80 token 上限）；
+ * 标签对照用 ds_ut_cer_hint 的宽松下界判定（≥85% 字符命中）——
+ * 冻结标签防"答非所问"，但不做逐字 diff（生成有合法随机性）；
+ * 模型目录或标签缺失则 SKIP。 */
 static void e2e_model(const char *dir, const char *img, const char *label_path) {
     if (access(dir, R_OK) != 0) { fprintf(stderr, "  (skip: 无 %s)\n", dir); return; }
     /* 与 CLI 完全同条件: 全核线程（main.c 默认）+ V3 ngram 守卫 + token 上限 */
@@ -719,7 +840,11 @@ static void e2e_model(const char *dir, const char *img, const char *label_path) 
     ds_free(ctx);
 }
 
-/* 轻量相似性: 归一化后按 3-gram 重合率（下界判定，防错别字级敏感） */
+/* ds_ut_cer_hint - 轻量文本相似性判定（CER 的下界替代，e2e 对照冻结标签用）
+ * 归一化（保留中文字节/字母/数字）后统计 b 的字符在 a 中的多重集合
+ * 命中比例，≥85% 判同源。不是真 CER——刻意粗糙，换取对生成
+ * 措辞差异的鲁棒性（SequenceMatcher 在 C 里的成本不值得）。
+ * @return 1 视为同源；0 明显不同源 */
 int ds_ut_cer_hint(const char *a, const char *b) {
     /* 统计 b 的字符在 a 中的命中比例（多重集合）——粗糙但足以下界判定 */
     int ha[256] = {0}, hb[256] = {0};
@@ -732,6 +857,10 @@ int ds_ut_cer_hint(const char *a, const char *b) {
     return hit * 100 >= lb * 85;    /* ≥85% 字符命中即认为同源 */
 }
 
+/* test_e2e_all_models - e2e 入口: 四个模型各跑一张 golden 图并对照冻结标签
+ * V1/V2 用 test_simple.png；V3/V4 故意用多裁剪宽图——覆盖 crop 池/
+ * 全局 worker/预处理重叠这些单图路径够不到的代码。UT_SKIP_E2E 或
+ * 缺 models/ 时整体跳过（基础设施缺失不算失败）。 */
 static void test_e2e_all_models(void) {
     UT_SUITE("e2e");
     if (getenv("UT_SKIP_E2E")) { fprintf(stderr, "  (skip: UT_SKIP_E2E)\n"); return; }
@@ -748,6 +877,9 @@ static void test_e2e_all_models(void) {
 }
 
 /* ════════════════ main ════════════════ */
+/* main - 单元测试驱动: g_cases 表驱动注册全部用例 → ut_run_all 统一执行，
+ * 汇总 pass/fail；退出码 = 是否有用例失败（CI 判据）。
+ * UT_CASE 的注册与执行分离，便于单独增删用例调试。 */
 int main(void) {
     UT_CASE(test_dot_axpy_vec);
     UT_CASE(test_fast_expf);

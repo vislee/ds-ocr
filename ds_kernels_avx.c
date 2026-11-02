@@ -25,7 +25,14 @@
  *
  * 寄存器宽度速查：__m512 = 512 位 = 16 个 F32 lane；__m256i = 256 位 =
  * 32 字节 = 16 个 BF16；_mm256_* / _mm512_* 的 loadu/storeu 均不要求
- * 对齐（对应 NEON 的 vld1q/vst1q），故对权重指针无对齐假设。 */
+ * 对齐（对应 NEON 的 vld1q/vst1q），故对权重指针无对齐假设。
+ *
+ * 【对齐 vs unaligned load】x86 另有对齐版 _mm512_load_ps/_mm256_load_ps，
+ * 要求指针满足 64/32 字节对齐，违反会触发 GP fault（程序直接崩溃）；
+ * 本项目权重由 mmap 映射而来，行首仅保证元素自然对齐（BF16 = 2 字节），
+ * 对齐版无从保证安全。现代 x86 上 unaligned load 只在跨缓存行边界时有
+ * 约 1 拍的额外代价，且不妨碍编译器自动向量化——故全文件统一用
+ * loadu/storeu，不做任何对齐假设。 */
 
 /* =====================================================================
  * BF16 matvec - uses AVX-512F+BW when available, AVX2 fallback otherwise
@@ -103,7 +110,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
             a7 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r3b), 16)), xv1, a7);
         }
 
-        for (; k + 16 <= in_dim; k += 16) { // 次级循环：16 元素/次（in_dim%32 余数）
+        for (; k + 16 <= in_dim; k += 16) { // 次级循环（peel 尾处理）：16 元素/次，消化 in_dim%32 余数
             __m512 xv = _mm512_loadu_ps(x + k);
             __m256i r0 = _mm256_loadu_si256((const __m256i *)(w0 + k));
             __m256i r1 = _mm256_loadu_si256((const __m256i *)(w1 + k));
@@ -122,7 +129,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         float s2 = _mm512_reduce_add_ps(_mm512_add_ps(a4, a5)) + (bias ? bias[o+2] : 0.0f);
         float s3 = _mm512_reduce_add_ps(_mm512_add_ps(a6, a7)) + (bias ? bias[o+3] : 0.0f);
 
-        for (; k < in_dim; k++) { // 标量兜底：in_dim%16 的 <16 个尾巴（同 generic 三连）
+        for (; k < in_dim; k++) { // 标量兜底（peel 最末级）：in_dim%16 的 <16 个尾巴（同 generic 三连）
             float xk = x[k];
             uint32_t b0=((uint32_t)w0[k])<<16, b1=((uint32_t)w1[k])<<16;
             uint32_t b2=((uint32_t)w2[k])<<16, b3=((uint32_t)w3[k])<<16;
@@ -142,7 +149,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         int k = 0;
 
-        for (; k + 32 <= in_dim; k += 32) {
+        for (; k + 32 <= in_dim; k += 32) { // 主循环：32 元素/次（2 行 × 2 累加器，骨架同 4 行版）
             __m512 xv0 = _mm512_loadu_ps(x + k);
             __m512 xv1 = _mm512_loadu_ps(x + k + 16);
             __m256i r0a = _mm256_loadu_si256((const __m256i *)(w0 + k));
@@ -154,7 +161,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
             a2 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r1a), 16)), xv0, a2);
             a3 = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r1b), 16)), xv1, a3);
         }
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 次级（peel）：16 元素/次
             __m512 xv = _mm512_loadu_ps(x + k);
             __m256i r0 = _mm256_loadu_si256((const __m256i *)(w0 + k));
             __m256i r1 = _mm256_loadu_si256((const __m256i *)(w1 + k));
@@ -165,7 +172,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         float s0 = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) + (bias ? bias[o]   : 0.0f);
         float s1 = _mm512_reduce_add_ps(_mm512_add_ps(a2, a3)) + (bias ? bias[o+1] : 0.0f);
 
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底
             uint32_t b0=((uint32_t)w0[k])<<16, b1=((uint32_t)w1[k])<<16;
             float v0,v1; memcpy(&v0,&b0,4); memcpy(&v1,&b1,4);
             s0+=v0*x[k]; s1+=v1*x[k];
@@ -179,13 +186,13 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         const uint16_t *w = W_bf16 + (size_t)o * in_dim;
         __m512 acc = _mm512_setzero_ps();
         int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 16 元素/轮：1 条权重载入 + 1 条 x 载入 + 1 条 FMADD
             __m256i raw = _mm256_loadu_si256((const __m256i *)(w + k));
             acc = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16)),
                                   _mm512_loadu_ps(x + k), acc);
         }
         float sum = _mm512_reduce_add_ps(acc) + (bias ? bias[o] : 0.0f);
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底
             uint32_t bits=((uint32_t)w[k])<<16; float wv; memcpy(&wv,&bits,4);
             sum += wv*x[k];
         }
@@ -220,7 +227,7 @@ void ds_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
         __m512 a6=_mm512_setzero_ps(), a7=_mm512_setzero_ps();
         int k = 0;
 
-        for (; k + 32 <= in_dim; k += 32) {
+        for (; k + 32 <= in_dim; k += 32) { // 主循环：32 元素/次，4 行 × 8 累加器（与 matvec 同构）
             __m512 xv0 = _mm512_loadu_ps(x + k);
             __m512 xv1 = _mm512_loadu_ps(x + k + 16);
             __m256i r0a=_mm256_loadu_si256((const __m256i*)(w0+k));
@@ -240,7 +247,7 @@ void ds_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
             a6=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r3a),16)),xv0,a6);
             a7=_mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(r3b),16)),xv1,a7);
         }
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 次级（peel）：16 元素/次
             __m512 xv = _mm512_loadu_ps(x + k);
             __m256i r0=_mm256_loadu_si256((const __m256i*)(w0+k));
             __m256i r1=_mm256_loadu_si256((const __m256i*)(w1+k));
@@ -257,7 +264,7 @@ void ds_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
         float s2=_mm512_reduce_add_ps(_mm512_add_ps(a4,a5));
         float s3=_mm512_reduce_add_ps(_mm512_add_ps(a6,a7));
 
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底：in_dim%16 尾巴
             float xk=x[k];
             uint32_t b0=((uint32_t)w0[k])<<16, b1=((uint32_t)w1[k])<<16;
             uint32_t b2=((uint32_t)w2[k])<<16, b3=((uint32_t)w3[k])<<16;
@@ -279,13 +286,13 @@ void ds_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
         const uint16_t *w = W_bf16 + (size_t)o * in_dim;
         __m512 acc = _mm512_setzero_ps();
         int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 16 元素/轮：单行单累加器
             __m256i raw = _mm256_loadu_si256((const __m256i *)(w + k));
             acc = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16)),
                                   _mm512_loadu_ps(x + k), acc);
         }
         float sum = _mm512_reduce_add_ps(acc);
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底
             uint32_t bits=((uint32_t)w[k])<<16; float wv; memcpy(&wv,&bits,4);
             sum += wv*x[k];
         }
@@ -337,7 +344,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
         __m256 a2=_mm256_setzero_ps(), a3=_mm256_setzero_ps();
         int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 主循环：16 元素/次（2×256 位）
             __m256 xlo = _mm256_loadu_ps(x + k);    // x[k..k+7]（低 8 lane）
             __m256 xhi = _mm256_loadu_ps(x + k + 8); // x[k+8..15]
             __m256 wlo, whi;
@@ -372,7 +379,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         const uint16_t *w = W_bf16 + (size_t)o * in_dim;
         __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
         int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 16 元素/次：低 8 元素进 a0、高 8 元素进 a1
             __m256 wlo, whi;
             ds_bf16x16_to_f32(w + k, &wlo, &whi);
             a0 = _mm256_fmadd_ps(wlo, _mm256_loadu_ps(x+k), a0);
@@ -382,7 +389,7 @@ void ds_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
         __m128 r = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1)); // 拆半区相加
         r = _mm_hadd_ps(r, r); r = _mm_hadd_ps(r, r); // 两级 hadd 收敛：lane0 = 全行和
         float sum = _mm_cvtss_f32(r) + (bias ? bias[o] : 0.0f);
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底
             uint32_t bits=((uint32_t)w[k])<<16; float wv; memcpy(&wv,&bits,4);
             sum+=wv*x[k];
         }
@@ -406,17 +413,18 @@ void ds_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
         const uint16_t *w = W_bf16 + (size_t)o * in_dim;
         __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
         int k = 0;
-        for (; k + 16 <= in_dim; k += 16) {
+        for (; k + 16 <= in_dim; k += 16) { // 16 元素/次：低 8 元素进 a0、高 8 元素进 a1
             __m256 wlo, whi;
             ds_bf16x16_to_f32(w + k, &wlo, &whi);
             a0 = _mm256_fmadd_ps(wlo, _mm256_loadu_ps(x+k), a0);
             a1 = _mm256_fmadd_ps(whi, _mm256_loadu_ps(x+k+8), a1);
         }
         a0 = _mm256_add_ps(a0, a1);
+        // 水平归约（同 matvec 单行版）：拆低/高 128 位半区相加，两级 hadd 收敛到 lane0
         __m128 r = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1));
         r = _mm_hadd_ps(r, r); r = _mm_hadd_ps(r, r);
         float sum = _mm_cvtss_f32(r);
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底
             uint32_t bits=((uint32_t)w[k])<<16; float wv; memcpy(&wv,&bits,4);
             sum+=wv*x[k];
         }

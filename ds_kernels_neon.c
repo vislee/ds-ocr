@@ -271,7 +271,8 @@ void ds_argmax_bf16_range_neon(const float *x, const uint16_t *W_bf16,
         float32x4_t b2 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
         int k = 0;
 
-        for (; k + 32 <= in_dim; k += 32) {
+        for (; k + 32 <= in_dim; k += 32) { // 主循环：32 元素/次（骨架同 matvec）
+            // 8 个 x 向量只载一次、两行共用；vshll+vfma 三连的逐条语义见 matvec
             float32x4_t x0 = vld1q_f32(x + k);
             float32x4_t x1 = vld1q_f32(x + k + 4);
             float32x4_t x2 = vld1q_f32(x + k + 8);
@@ -281,7 +282,7 @@ void ds_argmax_bf16_range_neon(const float *x, const uint16_t *W_bf16,
             float32x4_t x6 = vld1q_f32(x + k + 24);
             float32x4_t x7 = vld1q_f32(x + k + 28);
 
-            uint16x8_t r0a = vld1q_u16(w0 + k);
+            uint16x8_t r0a = vld1q_u16(w0 + k);      // 行0 的 32 个 BF16 按 4×8 加载
             uint16x8_t r0b = vld1q_u16(w0 + k + 8);
             uint16x8_t r0c = vld1q_u16(w0 + k + 16);
             uint16x8_t r0d = vld1q_u16(w0 + k + 24);
@@ -308,10 +309,11 @@ void ds_argmax_bf16_range_neon(const float *x, const uint16_t *W_bf16,
             b3 = vfmaq_f32(b3, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(r1d), 16)), x7);
         }
 
+        // 行和归约：4 累加器加树 + vaddvq 水平求和（顺序与 matvec 一致，可复现）
         float s0 = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
         float s1 = vaddvq_f32(vaddq_f32(vaddq_f32(b0, b2), vaddq_f32(b1, b3)));
 
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底：in_dim%8 尾巴（转换式同 matvec）
             uint32_t bits0 = ((uint32_t)w0[k]) << 16;
             uint32_t bits1 = ((uint32_t)w1[k]) << 16;
             float wv0, wv1;
@@ -326,13 +328,13 @@ void ds_argmax_bf16_range_neon(const float *x, const uint16_t *W_bf16,
         if (s1 > best_val) { best_val = s1; best = o + 1; }
     }
 
-    for (; o < end; o++) {
+    for (; o < end; o++) { // 区间内剩下的最后一行：同 matvec 单行版
         const uint16_t *w_row = W_bf16 + (size_t)o * in_dim;
         float sum = 0.0f;
         int k = 0;
 
         float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
-        for (; k + 8 <= in_dim; k += 8) {
+        for (; k + 8 <= in_dim; k += 8) { // 8 元素/轮：低 4 元素进 acc0、高 4 进 acc1
             uint16x8_t bf = vld1q_u16(w_row + k);
             acc0 = vfmaq_f32(acc0, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16)),
                              vld1q_f32(x + k));
@@ -610,7 +612,7 @@ void ds_argmax_bf16_range_neon_bf16(const float *x, const uint16_t *W_bf16,
         float32x4_t a0=vdupq_n_f32(0),a1=vdupq_n_f32(0),a2=vdupq_n_f32(0),a3=vdupq_n_f32(0);
         float32x4_t b0=vdupq_n_f32(0),b1=vdupq_n_f32(0),b2=vdupq_n_f32(0),b3=vdupq_n_f32(0);
         int k = 0;
-        for (; k + 32 <= in_dim; k += 32) {
+        for (; k + 32 <= in_dim; k += 32) { // 主循环：32 元素/次，双行 × 4 条 bfdot/行
             bfloat16x8_t xb0=f32x8_to_bf16x8(vld1q_f32(x+k),vld1q_f32(x+k+4));
             bfloat16x8_t xb1=f32x8_to_bf16x8(vld1q_f32(x+k+8),vld1q_f32(x+k+12));
             bfloat16x8_t xb2=f32x8_to_bf16x8(vld1q_f32(x+k+16),vld1q_f32(x+k+20));
@@ -620,13 +622,13 @@ void ds_argmax_bf16_range_neon_bf16(const float *x, const uint16_t *W_bf16,
             b0=bfdot_f32(b0,vld1q_bf16(BP(w1+k)),xb0);   b1=bfdot_f32(b1,vld1q_bf16(BP(w1+k+8)),xb1);
             b2=bfdot_f32(b2,vld1q_bf16(BP(w1+k+16)),xb2); b3=bfdot_f32(b3,vld1q_bf16(BP(w1+k+24)),xb3);
         }
-        for (; k+8 <= in_dim; k += 8) {
+        for (; k+8 <= in_dim; k += 8) { // 次级：8 元素/次（双行）
             bfloat16x8_t xb=f32x8_to_bf16x8(vld1q_f32(x+k),vld1q_f32(x+k+4));
             a0=bfdot_f32(a0,vld1q_bf16(BP(w0+k)),xb); b0=bfdot_f32(b0,vld1q_bf16(BP(w1+k)),xb);
         }
         float s0=vaddvq_f32(vaddq_f32(vaddq_f32(a0,a1),vaddq_f32(a2,a3)));
         float s1=vaddvq_f32(vaddq_f32(vaddq_f32(b0,b1),vaddq_f32(b2,b3)));
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底：in_dim%8 尾巴
             uint32_t u0=((uint32_t)w0[k])<<16,u1=((uint32_t)w1[k])<<16;
             float v0,v1; memcpy(&v0,&u0,4); memcpy(&v1,&u1,4);
             s0+=v0*x[k]; s1+=v1*x[k];
@@ -638,17 +640,17 @@ void ds_argmax_bf16_range_neon_bf16(const float *x, const uint16_t *W_bf16,
         const uint16_t *wr = W_bf16 + (size_t)o * in_dim;
         float sum = 0.0f; int k = 0;
         float32x4_t aa=vdupq_n_f32(0),ab=vdupq_n_f32(0);
-        for (; k+16 <= in_dim; k += 16) {
+        for (; k+16 <= in_dim; k += 16) { // 单行主循环：16 元素/次（2 个 BF16x8）
             bfloat16x8_t xb0=f32x8_to_bf16x8(vld1q_f32(x+k),vld1q_f32(x+k+4));
             bfloat16x8_t xb1=f32x8_to_bf16x8(vld1q_f32(x+k+8),vld1q_f32(x+k+12));
             aa=bfdot_f32(aa,vld1q_bf16(BP(wr+k)),xb0); ab=bfdot_f32(ab,vld1q_bf16(BP(wr+k+8)),xb1);
         }
         sum += vaddvq_f32(vaddq_f32(aa,ab));
-        for (; k+8 <= in_dim; k += 8) {
+        for (; k+8 <= in_dim; k += 8) { // 次级：8 元素独立成点积、算完即水平归约
             bfloat16x8_t xb=f32x8_to_bf16x8(vld1q_f32(x+k),vld1q_f32(x+k+4));
             sum += vaddvq_f32(bfdot_f32(vdupq_n_f32(0),vld1q_bf16(BP(wr+k)),xb));
         }
-        for (; k < in_dim; k++) {
+        for (; k < in_dim; k++) { // 标量兜底
             uint32_t u=((uint32_t)wr[k])<<16; float v; memcpy(&v,&u,4); sum+=v*x[k];
         }
         if (sum>best_val){best_val=sum;best=o;}

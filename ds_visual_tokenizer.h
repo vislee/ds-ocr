@@ -30,6 +30,10 @@
  * 【与 qwen-asr 的对应】
  * qwen-asr 没有视觉分词器——它用 Conv2D stem + Transformer encoder 处理 Mel 频谱图。
  * 两者都是"将原始输入转换为 token 序列"，但一个是视觉 patch，一个是音频帧。
+ *
+ * 【阅读指南】本模块的逐行注释以 docs/06-视觉编码器篇.md 为教材主线：
+ * §2 patch embed / §3 窗口与全局注意力 / §4 neck+降采样 / §6 位置编码插值。
+ * 权重张量名与形状对照见 ds_ocr.h 的 ds_visual_tokenizer_t 结构体。
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -112,7 +116,10 @@ int ds_visual_tokenizer_load(ds_ctx_t *ctx);
 /* Window-attention parallelism gate (defined in ds_visual_tokenizer.c).
  * 1 (default): when a single SAM forward runs alone, its per-layer windows
  * run across raw pthreads. Multi-crop encoding sets this to 0 around its
- * concurrent crop workers to avoid oversubscription. */
+ * concurrent crop workers to avoid oversubscription.
+ * 中文说明：窗口注意力的 25 个 14×14 小窗相互独立，单 SAM 独跑时用
+ * 裸 pthread 并行（约 650/900 GFLOP 在窗口层）；多 crop 波次期间
+ * crop 之间已并行，调用方置 0 防止超额订阅。 */
 extern int ds_sam_window_parallel;
 extern int ds_sam_global_parallel;   /* 全局注意力(layers 2/5/8/11) head 并行门控 */
 extern int ds_enc_attn_parallel;     /* DeepEncoder 注意力 head 并行线程预算（0=关） */

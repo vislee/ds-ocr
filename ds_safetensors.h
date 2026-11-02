@@ -90,9 +90,12 @@ typedef struct {
     size_t header_size;            /* JSON header的字节数（即前8字节记录的值）
                                     * 为什么单独记录：数据区起始位置 = data + 8 + header_size，
                                     * 这是计算任意张量数据指针的基础 */
-    char *header_json;             /* 指向JSON header字符串的指针（位于mmap区域内，零拷贝）
-                                    * 为什么保留：调试时可以打印原始header；也避免了字符串复制。
-                                    * 注意：此指针指向mmap区域内部，不需要单独free */
+    char *header_json;             /* JSON header的堆上副本（safetensors_open中malloc并
+                                    * 从mmap区memcpy出来，末尾补'\0'）
+                                    * 为什么不直接指向mmap区：mmap区内的JSON后面紧跟着
+                                    * 二进制数据而非NUL，指针推进式解析器按C字符串扫描
+                                    * （依赖'\0'兜底），所以必须有一份以NUL结尾的副本；
+                                    * safetensors_close 中会free */
     int num_tensors;               /* 本文件中包含的张量总数 */
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS]; /* 张量元数据数组，从JSON header解析填充 */
 } safetensors_file_t;
@@ -139,8 +142,11 @@ safetensors_file_t *safetensors_open(const char *path);
 
 /* safetensors_close - 关闭safetensors文件，释放资源
  *
- * 流程：munmap(data, file_size) → 释放mmap映射 → free(sf) 释放结构体
- * 注意：header_json指向mmap区域内部，munmap后自动失效，不需要单独释放。
+ * 流程：munmap(data, file_size) 解除映射 → free(path) → free(header_json)
+ * → free(sf) 结构体。与 open 的每一步分配一一对应（NULL安全）。
+ * 注意：header_json 是堆上副本（见结构体字段说明），需要显式free；
+ * 而 get_bf16_direct 等返回的"mmap区域内部指针"在munmap后全部失效，
+ * 使用时须保证 sf 的生命周期覆盖这些指针。
  *
  * @param sf  之前通过safetensors_open返回的句柄
  */

@@ -33,10 +33,13 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/* 头文件保护：本文件定义 typedef 与 _impl 分发宏，会被多个 .c 重复包含；
+ * 首次包含时定义 DS_KERNELS_IMPL_H，再次包含时预处理器整体跳过，
+ * 避免 typedef 重复声明与宏重定义告警。 */
 #ifndef DS_KERNELS_IMPL_H
 #define DS_KERNELS_IMPL_H
 
-#include <stdint.h>
+#include <stdint.h> /* BF16 以 uint16_t 位模式承载，转换出的 F32 位模式用 uint32_t */
 
 /* ── 标量参考实现（实现在 ds_kernels_generic.c，任何平台都编译）─────────────
  * 它们既是无 SIMD 平台的回退路径，也是 NEON/AVX 版本的正确性对照基准。 */
@@ -87,6 +90,9 @@ void ds_vec_axpy_inplace_generic(float *dst, const float *src, float alpha, int 
  * 整体重缩放后并入新项——一次遍历完成"缩放旧和 + 加新和"。 */
 void ds_vec_scale_add_generic(float *dst, const float *src, float correction, int n);
 
+/* 预处理器自上而下取第一个命中的分支：NEON 与 AVX2 属不同指令集架构，
+ * 两类平台宏不会同时定义，故同一份编译产物只会激活 NEON / AVX2 / 回退
+ * 三者之一，分支互斥、不叠加。 */
 #ifdef __ARM_NEON
 /* ── ARM NEON 候选实现（实现在 ds_kernels_neon.c）───────────────────────────
  * ds_bf16_matvec_fused_neon / ds_argmax_bf16_range_neon：vshll+vfma 路径——

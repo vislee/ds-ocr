@@ -843,11 +843,15 @@ void ds_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) 
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
+    /* 朴素三重循环（无 BLAS 平台的保底实现）：循环顺序 m→n→k 与行主序内存
+     * 布局对齐——最内层 k 沿 A 的第 m 行、B 的第 n 行连续滑动，硬件预取器
+     * 跟得上顺序访问；若把 n 放最内层则每步跳一整行 K 个 float，缓存行
+     * 利用率崩塌（这就是"行主序遍历对缓存友好"的具体含义） */
     for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
+        for (int n = 0; n < N; n++) {   /* C[m,n] = A 的第 m 行 · B 的第 n 行 */
+            float sum = 0.0f;           /* 寄存器累加器：K 次乘加期间不碰内存 */
             for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
+                sum += A[m * K + k] * B[n * K + k];   /* 行主序线性索引：A[m*K+k] 即 A[m,k] */
             }
             C[m * N + n] = sum;
         }
@@ -875,14 +879,17 @@ void ds_linear(float *y, const float *x, const float *W, const float *b,
         }
     }
 #else
+    /* 朴素实现：逐 token、逐输出行做点积。x_row/w_row/y_row 先取行指针，
+     * 内层循环免掉 s*in_dim、o*in_dim 的乘法地址计算；bias 直接作累加器
+     * 初值（sum 从 b[o] 起步），省一趟单独的"逐行加 bias"扫描 */
     for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * in_dim;
-        float *y_row = y + s * out_dim;
+        const float *x_row = x + s * in_dim;      /* 第 s 个 token 的输入行 */
+        float *y_row = y + s * out_dim;           /* 第 s 个 token 的输出行 */
         for (int o = 0; o < out_dim; o++) {
-            const float *w_row = W + o * in_dim;
+            const float *w_row = W + o * in_dim;  /* W 第 o 行 = 第 o 个输出特征的权重向量 */
             float sum = (b != NULL) ? b[o] : 0.0f;
             for (int i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
+                sum += x_row[i] * w_row[i];   /* 两条行指针同步右移：顺序访问对缓存友好 */
             }
             y_row[o] = sum;
         }
@@ -1212,11 +1219,11 @@ static void qkv_ds_matvec_worker(int tid, int n_threads, void *arg) {
     if (end > t->total_dim) end = t->total_dim;
     if (start >= end) return;
 
-    int q_end = t->q_dim;
+    int q_end = t->q_dim;          /* 三段输出在全局行号空间 [0,total_dim) 中的分界 */
     int k_end = q_end + t->kv_dim;
     int v_end = k_end + t->kv_dim;
 
-    if (start < q_end) {
+    if (start < q_end) {           /* 段 1：本线程区间头部落在 Q 权重行（块内行号 = 全局行号） */
         int s = start;
         int e = end < q_end ? end : q_end;
         if (s < e) {
@@ -1226,7 +1233,7 @@ static void qkv_ds_matvec_worker(int tid, int n_threads, void *arg) {
         }
     }
 
-    if (end > q_end && start < k_end) {
+    if (end > q_end && start < k_end) {   /* 段 2：与 K 权重行的交集；块内行号 = 全局行号 − Q 段宽度 */
         int s = start > q_end ? start - q_end : 0;
         int e_abs = end < k_end ? end : k_end;
         int e = e_abs - q_end;
@@ -1237,7 +1244,7 @@ static void qkv_ds_matvec_worker(int tid, int n_threads, void *arg) {
         }
     }
 
-    if (end > k_end && start < v_end) {
+    if (end > k_end && start < v_end) {   /* 段 3：与 V 权重行的交集，同理减去前两段宽度 */
         int s = start > k_end ? start - k_end : 0;
         int e_abs = end < v_end ? end : v_end;
         int e = e_abs - k_end;
@@ -1595,6 +1602,16 @@ void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n) {
  * SGEMM-accelerated matvec (for large output dims like LM head)
  * ======================================================================== */
 
+/* ds_f32_matvec_sgemm - F32 权重 matvec 的 BLAS 封装：y = W_f32 @ x
+ * 【用途】LM head 这类大输出维（本模型 129280）且权重已转成 F32 的 matvec。
+ * 【行主序/转置陷阱】CBLAS 传统接口是 Fortran 列主序，这里用 CblasRowMajor
+ *   显式声明行主序布局；W_f32 按 [out_dim, in_dim] 存储（每个输出元素一行，
+ *   与各 matvec 内核通用），而数学上 y[1,out] = x[1,in] @ W[in,out] 需要
+ *   "W 的转置参与乘法"，故 B 侧必须传 CblasTrans + ldb=in_dim——BLAS 内部
+ *   按自己的存储序挑最优微内核，无需物化转置副本。若误传 NoTrans 会静默
+ *   算出错误结果（行/列语义颠倒），这是 CBLAS 最常见的调用坑。
+ * 【参数】y[out_dim]、x[in_dim]、W_f32[out_dim,in_dim] 行主序。
+ * 【参考】docs/03 §4.3（BLAS 约定与陷阱）。 */
 void ds_f32_matvec_sgemm(float *y, const float *x, const float *W_f32,
                           int in_dim, int out_dim) {
 #ifdef USE_BLAS
@@ -1639,9 +1656,9 @@ static void im2col(const float *in, float *cols,
                 int col_row = (ic * kh + ki) * kw + kj;
                 float *col_ptr = cols + (size_t)col_row * col_len;
                 for (int oh = 0; oh < h_out; oh++) {
-                    int ih = oh * stride - padding + ki;
+                    int ih = oh * stride - padding + ki;   /* 感受野左上角 = oh·stride−padding，再偏移 ki 到本核行 */
                     for (int ow = 0; ow < w_out; ow++) {
-                        int iw = ow * stride - padding + kj;
+                        int iw = ow * stride - padding + kj;   /* 列方向同理；越界即 padding 补 0 */
                         if (ih >= 0 && ih < h_in && iw >= 0 && iw < w_in) {
                             col_ptr[oh * w_out + ow] = in[ic * h_in * w_in + ih * w_in + iw];
                         } else {
@@ -1674,7 +1691,10 @@ void ds_conv2d(float *out, const float *in, const float *weight, const float *bi
     float *cols = (float *)malloc((size_t)patch_size * spatial_out * sizeof(float));
     im2col(in, cols, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
 
-    /* DEBUG: dump im2col for any 3x3 s1 conv with c_in=256 */
+    /* DEBUG: dump im2col for any 3x3 s1 conv with c_in=256
+     * 【调试路径】设 DS_DUMP_CONV2_IM2COL=1 才激活，用于 C↔Python 数值对拍
+     * （落盘 dump/c_conv2_im2col.bin）；未设环境变量时每次调用只付一次
+     * getenv 的开销，正常推理不受影响 */
     {
         static int _conv2d_call_count = 0;
         _conv2d_call_count++;
@@ -1739,6 +1759,9 @@ void ds_layer_norm(float *out, const float *x, const float *weight, const float 
         float *out_row = out + s * hidden;
 
         /* Compute mean */
+        /* LayerNorm 是"逐 token 归一化"：统计量（μ、σ²）只在单行 hidden 维内
+         * 计算，同一 seq 的其他行互不影响。三条 SIMD 路径只是把求和向量化，
+         * 语义与标量版完全一致（水平求和：AVX-512 用 reduce_add，AVX2 用 hadd） */
 #if defined(__AVX512F__)
         __m512 sumv = _mm512_setzero_ps();
         int i = 0;
@@ -1762,9 +1785,12 @@ void ds_layer_norm(float *out, const float *x, const float *weight, const float 
         float mean = 0.0f;
         for (int i = 0; i < hidden; i++) mean += x_row[i];
 #endif
-        mean /= hidden;
+        mean /= hidden;   /* μ = Σx / n，第一遍扫描完毕 */
 
         /* Compute variance */
+        /* σ² = Σ(x-μ)²/n：第二遍扫描。两遍式比单遍 E[x²]−μ² 数值更稳——
+         * 后者是大数减小数相消（catastrophic cancellation），μ² 接近 E[x²]
+         * 时有效位被抹掉，可能出现负方差 */
 #if defined(__AVX512F__) && defined(__FMA__)
         __m512 meanv = _mm512_set1_ps(mean);
         __m512 accv = _mm512_setzero_ps();
@@ -1803,6 +1829,8 @@ void ds_layer_norm(float *out, const float *x, const float *weight, const float 
 #endif
         var /= hidden;
 
+        /* inv_std = 1/sqrt(σ²+ε)：ε 防方差为 0 的行除零；先求倒数，
+         * 第三遍归一化循环里只需乘法（除法指令延迟 ~20 周期 vs 乘法 ~4） */
         float inv_std = 1.0f / sqrtf(var + eps);
 #if defined(__AVX512F__) && defined(__FMA__)
         __m512 meanv2 = _mm512_set1_ps(mean);
@@ -1898,6 +1926,10 @@ void ds_rms_norm(float *out, const float *x, const float *weight,
             sum_sq += x_row[i] * x_row[i];
         }
 #endif
+        /* rms_inv = 1/sqrt(mean(x²)+ε)：RMSNorm 的核心缩放因子。
+         * eps（本模型 1e-5 量级，必须与 Python config 的 rms_norm_eps 逐位一致）
+         * 防两类退化：全零行 sum_sq=0 时除零；极小行时除以近 0 数导致输出爆表。
+         * 先求倒数再乘：归一化循环里 n 次乘法替代 n 次除法（除法 ~20 周期 vs 乘法 ~4） */
         float rms_inv = 1.0f / sqrtf(sum_sq / hidden + eps);
 
 #if defined(__AVX512F__)
@@ -1986,6 +2018,9 @@ void ds_rms_norm_per_head(float *x, const float *weight,
                 sum_sq += vec[d] * vec[d];
             }
 #endif
+            /* 1/sqrt(mean(x²)+eps)：统计范围仅本 head 的 head_dim 维（每个头
+             * 有自己的 RMS）；eps 与解码器全局 RMSNorm 同源、防零向量除零，
+             * 取值须与 Python 侧 qk-norm 的 eps 逐位一致 */
             float rms_inv = 1.0f / sqrtf(sum_sq / head_dim + eps);
 
 #if defined(__AVX512F__)
@@ -2022,6 +2057,14 @@ void ds_rms_norm_per_head(float *x, const float *weight,
  * Saves one full hidden-dim loop vs separate add then norm.
  * ======================================================================== */
 
+/* ds_residual_rms_norm - 融合算子：out = x + residual，norm_out = RMSNorm(out)·weight
+ * 【参数】out/norm_out/x/residual/weight 均 [hidden]（decode 单 token 的层尾路径）；
+ *   out 与 norm_out 必须是两个不同缓冲（out 供下一层残差链使用），eps 语义同
+ *   ds_rms_norm。
+ * 【为什么融合】第一遍"边加边顺手累加 Σout²"把残差加与求和扫描合并成一趟，
+ *   比先 ds_add_inplace 再 ds_rms_norm 少一遍 hidden 全量读；三条 SIMD 路径
+ *   + 标量回退，公式与 ds_rms_norm 完全一致。
+ * 【参考】docs/01 §8.4（残差 + 归一化的层结构）。 */
 void ds_residual_rms_norm(float *out, float *norm_out,
                            const float *x, const float *residual,
                            const float *weight, int hidden, float eps) {
@@ -2098,7 +2141,10 @@ void ds_residual_rms_norm(float *out, float *norm_out,
 #endif
 }
 
-/* Vector add: dst[i] = a[i] + b[i] — SIMD-optimized residual connection */
+/* ds_vec_add - 向量加 dst[i] = a[i] + b[i]（SIMD 版残差连接）
+ * 【模式】主循环每次处理 8/16 个 F32（NEON 两条 4 宽 / AVX-512 一条 16 宽），
+ *   尾部不足一个向量宽度的元素标量收尾——全文件 SIMD 内核的标准骨架。
+ *   逐元素运算无跨元素依赖，因此 dst 与 a/b 允许重叠（本工程调用方不重叠）。 */
 void ds_vec_add(float *dst, const float *a, const float *b, int n) {
 #if defined(__ARM_NEON)
     int i = 0;
@@ -2132,11 +2178,18 @@ void ds_vec_add(float *dst, const float *a, const float *b, int n) {
 void ds_silu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float val = x[i];
+        /* val 很负（<-88）时 expf(-val)=Inf，val/Inf = -0——恰好是正确的极限值 0，
+         * 无需特判；val 很大时 e^-val→0，val/1 = val，饱和为恒等。
+         * 即 SiLU 对任意输入数值安全（对比直接算 e^x 会在正向溢出成 Inf） */
         x[i] = val / (1.0f + expf(-val));
     }
 }
 
-/* ds_gelu - 精确 GELU 激活（原地），SAM ViT / qwen-asr 编码器 FFN 使用 */
+/* ds_gelu - 精确 GELU 激活（原地），SAM ViT / qwen-asr 编码器 FFN 使用
+ * 【公式】GELU(x) = x·Φ(x) = 0.5·x·(1 + erf(x/√2))，Φ 是标准正态分布 CDF；
+ *   0.7071067811865475f 即 1/√2。用 erf 的"精确版"而非 tanh 近似，
+ *   与 PyTorch nn.GELU(approximate='none') 逐位对齐；erf 是 libm 特殊函数，
+ *   比 SiLU 的 exp 慢，但编码器只在 prefill 阶段运行、可接受。 */
 void ds_gelu(float *x, int n) {
     /* Exact GELU using erf: 0.5 * x * (1 + erf(x / sqrt(2)))
      * Matches PyTorch nn.GELU(approximate='none') */
@@ -2294,8 +2347,12 @@ void ds_swiglu_direct(float *out, const float *gate_buf, const float *up_buf,
 }
 
 /* ds_softmax - 逐行 softmax（原地）：p_i = e^(x_i-max)/Σ e^(x_j-max)
- * 【为什么减 max】e^x 上溢极快（x>88 即 Inf）；减去行最大值后指数参数
- * ≤0，结果落在 (0,1]，且分子分母同乘 e^-max 相互约掉、分布不变。
+ * 【为什么减 max】e^x 上溢极快：F32 最大值 ~3.4e38，expf(89) 已经是 Inf。
+ *   反例：两个 logits 90 与 89，直接 exp 得 Inf/Inf = NaN——整个分布报废；
+ *   减去行最大值 90 后变 e^0=1 与 e^-1≈0.368，得 0.731/0.269，完全正常。
+ *   减 max 后指数参数 ≤0，结果落在 (0,1]；分子分母同乘 e^-max 相互约掉，
+ *   平移不改变 softmax 分布（数学恒等）。下溢方向无害：极小分数的 exp 项
+ *   下溢为 0 只是丢弃可忽略的概率尾巴，不会产生 NaN。
  * 【参数】x[rows, cols] 行主序；MoE 路由 64 列、编码器分类头等小规模场景
  * 使用；注意力的大行 softmax 内联在各 attention 内核里（online softmax）。
  * 【参考】docs/01 §5.2；PyTorch: torch.softmax(dim=-1)。 */
@@ -2365,23 +2422,32 @@ void ds_bidirectional_attention(float *out, const float *Q, const float *K,
             const float *q_row = Q + i * hidden + h * head_dim;
             float *o_row = out + i * hidden + h * head_dim;
 
-            /* Online softmax with full bidirectional attention */
+            /* Online softmax（流式）+ 双向注意力：普通 softmax 要先扫一遍求行
+             * 最大值、再扫一遍求 exp 和，还要物化 [seq,seq] 分数矩阵；online 版
+             * 单遍扫描同时维护三件运行状态——max_score（当前行最大，初值 -1e30
+             * 保证首个 score 必走"新最大"分支）、sum_exp（指数和）、o_row
+             * （未归一化的加权 V 累加器），O(1) 额外内存，无分数矩阵 */
             float max_score = -1e30f;
             float sum_exp = 0.0f;
             for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
 
+            /* 双向：j 遍历全部 seq 个 K/V——编码器无因果掩码，token 两两互看 */
             for (int j = 0; j < seq; j++) {
-                const float *k_row = K + j * hidden + h * head_dim;
+                const float *k_row = K + j * hidden + h * head_dim;   /* 行 = 位置 j×缓存行宽，列偏移 = 本 head 切片 */
                 const float *v_row = V + j * hidden + h * head_dim;
 
                 float score = ds_dot_f32(q_row, k_row, head_dim) * scale;
 
                 if (score > max_score) {
+                    /* 分支一（出现新的行最大）：旧权重基于旧 max，须统一换基准——
+                     * 以 correction=e^(m_old-m_new) 整体重缩放旧 Σ 与旧 o；
+                     * 当前行权重恰为 e^0=1（故 Σ 再 +1）。指数参数恒 ≤0，绝不溢出 */
                     float correction = ds_fast_expf(max_score - score);
                     sum_exp = sum_exp * correction + 1.0f;
                     ds_vec_scale_add(o_row, v_row, correction, head_dim);
                     max_score = score;
                 } else {
+                    /* 分支二（常见路径）：wt=e^(score-m) ∈ (0,1]，直接累加 */
                     float wt = ds_fast_expf(score - max_score);
                     sum_exp += wt;
                     ds_vec_axpy_inplace(o_row, v_row, wt, head_dim);
@@ -2413,12 +2479,17 @@ static void ds_causal_attention_heads(float *out, const float *Q, const float *K
     int kv_hidden = n_kv_heads * head_dim;
 
     for (int h = head_start; h < head_end; h++) {
-        int kv_h = h / heads_per_kv;
+        int kv_h = h / heads_per_kv;   /* GQA 映射：q_head ÷ heads_per_kv = kv_head
+                                          （本工程 V2 编码器 14 个 Q 头共享 2 个 KV 头，每 7 个 Q 头共用一份 K/V） */
 
         for (int i = 0; i < seq_q; i++) {
             const float *q_row = Q + i * q_hidden + h * head_dim;
             float *o_row = out + i * q_hidden + h * head_dim;
-            int global_pos = q_offset + i;
+            int global_pos = q_offset + i;   /* 本行 token 在整个序列中的绝对位置 */
+            /* 因果掩码（下三角判断）：允许的 K/V 下标 j 须满足 j ≤ global_pos，
+             * 即注意力矩阵的下三角（含对角线）。k_end=global_pos+1 把"逐 j 判断
+             * 掩码位"压缩成"循环上界"——被掩掉的右上角根本不访问。
+             * 超出缓存已有长度 seq_k 时截断（防御） */
             int k_end = global_pos + 1;
             if (k_end > seq_k) k_end = seq_k;
 
@@ -2426,6 +2497,8 @@ static void ds_causal_attention_heads(float *out, const float *Q, const float *K
             float sum_exp = 0.0f;
             for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
 
+            /* KV cache 读索引：行 = j·kv_hidden（位置 pos × 缓存行宽，即 pos*dim
+             * 线性索引），列 = kv_h·head_dim（本 KV 头切片；GQA 下多个 Q 头读同一 KV 头） */
             for (int j = 0; j < k_end; j++) {
                 const float *k_row = K + j * kv_hidden + kv_h * head_dim;
                 const float *v_row = V + j * kv_hidden + kv_h * head_dim;
@@ -2554,7 +2627,10 @@ void ds_causal_attention(float *out, const float *Q, const float *K, const float
             return;
         }
 
-        /* Single-threaded fused decode attention */
+        /* Single-threaded fused decode attention
+         * KV cache 读索引：第 j 行基址 = j·hidden（位置 pos × 缓存行宽，
+         * 即 pos*dim 的线性索引），列偏移 h·head_dim 取本 head 的切片；
+         * q/o 的行宽同为 hidden（seq_q=1，只有一行） */
         int hidden = n_heads * head_dim;
         for (int h = 0; h < n_heads; h++) {
             const float *q = Q + h * head_dim;
@@ -3022,7 +3098,7 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
     int n_groups = n_heads / n_kv_heads;
 
     for (int h = 0; h < n_heads; h++) {
-        int kv_h = h / n_groups;
+        int kv_h = h / n_groups;   /* GQA 映射：每 n_groups 个 Q 头共享一个 KV 头 */
         const float *q = Q + h * head_dim;
         const float *k_h = K_base + kv_h * head_dim;
         const float *v_h = V_base + kv_h * head_dim;
@@ -3133,7 +3209,9 @@ void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
  *     cos_out[s,d] = cos_out[s,d+half] = cos(pos·f_d)   （前后半重复）
  *     sin_out[s,d] = sin_out[s,d+half] = sin(pos·f_d)
  *   低维 f≈1 旋转快（区分相邻位置），高维 f≈0 旋转慢（区分远距位置）——
- *   多尺度"时钟组"（docs/01 §4.3）。
+ *   多尺度"时钟组"（docs/01 §4.3）。theta 取 10000^(-2i/d) 衰减的原因：
+ *   head_dim/2 个频率需在 [1, 1/theta) 内按几何级数铺开——频率太密则各维
+ *   冗余、太疏则远距位置在所有维上相位混叠，相对位置无法分辨。
  * 【为什么 split-half 重复】对齐 HF LlamaAttention 的缓存布局
  *   emb = cat(freqs, freqs)，apply 端才能用 rotate_half 公式逐位一致。
  * 【参数】positions[seq] 各 token 的绝对位置（decode 传当前位）；theta 为
@@ -3177,6 +3255,14 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
  *   ds_compute_rope_neox），故两个公式逐位一致。
  * 【关键性质】旋转后位置 m 的 Q 与位置 n 的 K 的点积只依赖 m-n——
  *   注意力天然感知相对位置（docs/01 §4.3）。只旋转 Q/K，V 不动。
+ * 【复数视角】把每个 head 内的一对 (x[d], x[d+half]) 看成复数
+ *   z = x[d] + i·x[d+half]，本函数的两行输出就是复数乘法 z·e^(iθ)：
+ *     实部' = 实部·cosθ − 虚部·sinθ（旋转保模长 |z|，只改相位）
+ *     虚部' = 实部·sinθ + 虚部·cosθ
+ *   θ = pos·f_d 由位置决定——"相位即位置"。配对方式这里是 split-half
+ *   （d 与 d+half 配对，跟随 HF Llama 布局）而非相邻偶奇对 (2d, 2d+1)：
+ *   两者只是同一组二维平面旋转的不同元素排列，配合对应布局的 cos/sin
+ *   缓存数学等价（详见 ds_compute_rope_neox 的 split-half 说明）。
  * 【参数】x: [seq, n_heads*head_dim] 原地修改；cos_vals/sin_vals: [seq, head_dim]；
  *   R-SWA 的 page 轴角度修正等场景调用方需自备 positions。
  * 【参考】docs/01 §4.3；PyTorch 等价: LlamaAttention.apply_rotary_pos_emb。 */

@@ -101,6 +101,15 @@ static void clip_layer_forward(float *out, const float *x,
      * 除以 √64 把 logit 方差归一到 O(1)，防止 softmax 饱和成 one-hot（docs/13 §1.5） */
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* 本层权重指针速查（checkpoint 张量名前缀 model.vision_model.transformer.layers.N.，
+     * 加载见 ds_ocr.c 的 CLIP_WEIGHT 宏；线性权重形状按 [out, in] 行主序）:
+     *   layer_norm1.weight/bias  [1024]                      Pre-LN1 的 γ/β
+     *   self_attn.qkv_proj.weight [3072,1024] + bias [3072]  融合 QKV（行内 [Q|K|V] 各 1024）
+     *   self_attn.out_proj.weight [1024,1024] + bias [1024]  注意力输出投影
+     *   layer_norm2.weight/bias  [1024]                      Pre-LN2 的 γ/β
+     *   mlp.fc1.weight [4096,1024] + bias [4096]             FFN 升维
+     *   mlp.fc2.weight [1024,4096] + bias [1024]             FFN 降维
+     */
     float *ln1_w = clip->layers[layer_idx].layer_norm1_weight;
     float *ln1_b = clip->layers[layer_idx].layer_norm1_bias;
     float *qkv_w = clip->layers[layer_idx].qkv_proj_weight;
@@ -138,8 +147,11 @@ static void clip_layer_forward(float *out, const float *x,
     free(qkv);
 
     /* Bidirectional attention (CLIP uses full attention)
-     * 双向 = 掩码矩阵全 0（没有任何 -inf 位置），softmax 分母含全部 257 个 token；
-     * 与因果版本（ds_causal_attention_aligned）的差别只在掩码，点积/softmax 数学相同 */
+     * 双向注意力的掩码即"全 1 可见"：若用 0/1 掩码表达，每个 query 对全部
+     * 257 个 KV 的掩码位都是 1（没有禁看位置）；换成加性掩码则全 0（没有
+     * 任何 -inf 位置），softmax 分母含全部 257 个 token——图像 patch 没有
+     * "未来"可言，谁也不该被遮挡。与因果版本（ds_causal_attention_aligned）
+     * 的差别只在掩码，点积/softmax 数学相同 */
     float *attn_out = (float *)malloc(seq_len * dim * sizeof(float));
     ds_bidirectional_attention(attn_out, Q, K, V, seq_len, n_heads, head_dim, scale);
     free(Q); free(K); free(V);
@@ -352,7 +364,7 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
          * C implementation: for V3 with total_len=257, position_embedding[257][1024] matches exactly.
          * For other sizes, we need to interpolate (both smaller and larger). */
         int src_size = (int)sqrtf(256.0f);  /* 16x16 for original CLIP position embedding */
-        int tgt_size = (int)sqrtf((float)clip_n_patches);
+        int tgt_size = (int)sqrtf((float)clip_n_patches);  /* 实际 patch 网格边长（如 10×10=100） */
         if (tgt_size == src_size && total_len <= 257) {
             /* Direct copy — no interpolation needed
              * 1024² 输入恰好 256 patch：逐行相加位置表即可（含第 0 行给 CLS）。
@@ -420,7 +432,9 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
         x = tmp;
     }
 
-    /* CLIP transformer layers (24 layers) */
+    /* CLIP transformer layers (24 layers)
+     * 每层产出写入新分配的 next 缓冲再交换——层内残差要同时读输入 x，
+     * 原地覆写会破坏未读完的输入（clip_layer_forward 的 out/x 是不同缓冲） */
     for (int l = 0; l < DS_CLIP_LAYERS; l++) {
         float *next = (float *)malloc(total_len * clip_dim * sizeof(float));
         clip_layer_forward(next, x, clip, l, total_len);
@@ -633,6 +647,14 @@ static void __attribute__((unused)) enc_linear_nobias_f64acc(float *y, const flo
  * 【为什么 θ=10⁶】V2 的 cfg->enc_rope_theta=1e6（ds_ocr.c），比常规 1e4 大——
  *   长波长的低频对衰减更慢，利于长序列外推（位置数 512 量级虽短，但与官方
  *   checkpoint 训练配置保持一致是硬要求）。
+ * 【本代码库没有 freq 缩放（NTK/YaRN）】这里只放大基频 θ 本身（1e4→1e6），
+ *   checkpoint 的 rope_scaling 为空。若模型带 rope_scaling，常见两种：
+ *   NTK-aware 把 θ 改成 θ·s^(d/(d−2))（整体拉伸频谱，高频维也变慢，
+ *   外推长上下文）；YaRN 再按波长分段——低频维纯外推、高频维纯内插
+ *   （inv_freq 除以 s）、中频斜坡过渡，并把注意力 softmax 温度乘
+ *   0.1·ln(s)+1 补偿。二者都会改变 inv_freq 的取值；本引擎两种都未实现
+ *   （V4 解码器的 page2d RoPE 是另一套坐标，同样无缩放），遇到带缩放的
+ *   checkpoint 必须在算 freq 处插入对应公式，否则长文位置全部错乱。
  * 【为什么 float64 算频率/角度/cos/sin】24 层逐层应用 RoPE，三角函数的 F32
  *   舍入会逐层累积漂移；f64 只增加这部分小循环的开销，主数据仍是 F32。
  * 【参数】q: [seq_len, n_q_heads×head_dim]；k: [seq_len, n_kv_heads×head_dim]；
@@ -656,6 +678,9 @@ static void enc_apply_rope(float *q, float *k, int seq_len, int n_q_heads,
         for (int h = 0; h < n_q_heads; h++) {
             float *qh = q + pos * n_q_heads * head_dim + h * head_dim;
             for (int i = 0; i < half; i++) {
+                /* 频率随维号几何衰减 inv_freq[i]=θ^(-2i/64)：i=0 → 1（最高频，
+                 * 转最快，区分相邻 token）；i=63 → ≈1/θ（最低频，转最慢，
+                 * 编码长程相对位置）——head 内 32 对"时钟"各走各的速档 */
                 double freq = 1.0 / pow(theta_d, (double)(2 * i) / (double)head_dim);
                 double angle = (double)pos * freq;
                 double cos_t = cos(angle);
@@ -882,8 +907,23 @@ static void enc_v2_layer_forward(float *out, const float *x,
     int n_kv_heads = cfg->enc_kv_heads;
     int head_dim = cfg->enc_head_dim;
     int intermediate = cfg->enc_intermediate;
-    int kv_dim = n_kv_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;   /* K/V 每行宽 = 2 头×64 = 128（Q 行宽 896 的 1/7） */
 
+    /* 本层权重指针速查（checkpoint 前缀 model.qwen2_model.model.model.layers.N.，
+     * 加载见 ds_ocr.c 的 ENC_WEIGHT 宏；线性权重形状按 [out,in] 行主序，与 ds_linear 约定一致）:
+     *   input_layernorm.weight [896]                        注意力前 RMSNorm γ
+     *   self_attn.q_proj.weight [896,896] + bias [896]      Q 投影（14 头×64 维）
+     *   self_attn.k_proj.weight [128,896] + bias [128]      K 投影（2 KV 头×64 维，GQA）
+     *   self_attn.v_proj.weight [128,896] + bias [128]      V 投影（同上）
+     *   self_attn.o_proj.weight [896,896]（无 bias）         注意力输出投影
+     *   post_attention_layernorm.weight [896]               FFN 前 RMSNorm γ
+     *   mlp.gate_proj.weight [4864,896]（无 bias）           SwiGLU gate 分支
+     *   mlp.up_proj.weight   [4864,896]（无 bias）           SwiGLU up 分支
+     *   mlp.down_proj.weight [896,4864]（无 bias）           SwiGLU 降维
+     * 最终 norm 在 model.qwen2_model.model.model.norm.weight [896]；
+     * 因果流查询嵌入在 model.qwen2_model.query_1024.weight [256,896] /
+     * query_768.weight [144,896]（加载进 ctx->vis_tokenizer，由调用方传入）。
+     */
     float *ln1_w = enc->layers[layer_idx].layer_norm1_weight;
     float *wq_w = enc->layers[layer_idx].wq_weight;
     float *wk_w = enc->layers[layer_idx].wk_weight;
@@ -944,6 +984,7 @@ static void enc_v2_layer_forward(float *out, const float *x,
     /* Output projection + residual */
     float *proj_out = (float *)malloc(total_len * hidden * sizeof(float));
     ds_linear_nobias(proj_out, attn_out, wo_w, total_len, hidden, hidden);
+    /* 残差一：注意力分支输出加回主路（out 与 x 是不同缓冲，此处首写 out） */
     for (int i = 0; i < total_len * hidden; i++) out[i] = x[i] + proj_out[i];
 
     /* Pre-FFN RMSNorm + SwiGLU MLP */
@@ -993,9 +1034,9 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
     ds_deep_encoder_t *enc = &ctx->encoder;
     ds_config_t *cfg = &ctx->config;
 
-    int visual_len = n_tokens;
-    int total_len = visual_len + n_causal_queries;
-    int hidden = cfg->enc_hidden;
+    int visual_len = n_tokens;                    /* 双向段长度（前 visual_len 行视觉 token） */
+    int total_len = visual_len + n_causal_queries; /* 1024² 输入 = 256+256 = 512 */
+    int hidden = cfg->enc_hidden;                  /* 896 */
 
     if (ds_verbose >= 1)
         fprintf(stderr, "DeepEncoder V2: %d visual + %d causal flow = %d total\n",
@@ -1007,6 +1048,8 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
     float *x = (float *)calloc(total_len * hidden, sizeof(float));
     memcpy(x, visual_tokens, visual_len * hidden * sizeof(float));
 
+    /* 无查询的退化调用（n_causal_queries=0）直接跳过拷贝——序列只剩视觉段，
+     * 全员双向注意力，输出段为空 */
     if (n_causal_queries > 0 && causal_queries) {
         memcpy(x + visual_len * hidden,
                causal_queries,
@@ -1036,7 +1079,8 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
         }
     }
 
-    /* Transformer layers */
+    /* Transformer 层循环（cfg->enc_layers=24）：每层输出写新缓冲 next——
+     * 层内残差要同时读输入 x，不能原地覆写（与 CLIP 循环同一模式） */
     for (int l = 0; l < cfg->enc_layers; l++) {
         float *next = (float *)malloc(total_len * hidden * sizeof(float));
         enc_v2_layer_forward(next, x, ctx, l, visual_len, total_len);
@@ -1085,7 +1129,9 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
 
     if (ds_verbose >= 1) {
         fprintf(stderr, "DeepEncoder V2: %d in -> %d out\n", total_len, output_len);
-        /* Debug: print first few values of encoder output */
+        /* Debug: print first few values of encoder output
+         * 输出健康检查：mean_abs/max_abs 异常（全 0 或量级爆炸）通常意味着
+         * 上游 SAM/projector 数值坏了，先看这行日志再谈精度 */
         float sum = 0, max_val = 0;
         for (int i = 0; i < output_len * cfg->dec_hidden; i++) {
             float v = encoder_output[i] < 0 ? -encoder_output[i] : encoder_output[i];

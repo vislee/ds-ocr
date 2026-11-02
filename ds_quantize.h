@@ -50,15 +50,17 @@ int ds_int4_quantize_bf16(ds_int4_block_t *block,
                            const uint16_t *W_bf16,
                            int out_dim, int in_dim);
 
-/* Quantize an F32 weight matrix to per-row INT8. */
+/* Quantize an F32 weight matrix to per-row INT8.
+ * 与 BF16 版只差输入格式（省去 BF16→F32 转换步）；返回 0 成功 / -1 失败。 */
 int ds_int4_quantize_f32(ds_int4_block_t *block,
                           const float *W_f32,
                           int out_dim, int in_dim);
 
-/* Free quantized block resources. */
+/* Free quantized block resources. NULL 安全、可重复调用（指针置空防 double-free）。 */
 void ds_int4_block_free(ds_int4_block_t *block);
 
-/* Dequantize INT8 → F32 (full matrix, for verification) */
+/* Dequantize INT8 → F32 (full matrix, for verification)
+ * out 需预分配 out_dim*in_dim 个 float，行主序与原矩阵一致。 */
 void ds_int4_dequantize_f32(float *out, const ds_int4_block_t *block);
 
 /* INT8 matvec: y[out_dim] = INT8(W) * x[in_dim]

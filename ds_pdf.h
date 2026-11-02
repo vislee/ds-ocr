@@ -7,11 +7,12 @@
  * 引擎本身只认像素，PDF 是输入端的"翻译层"——与 ds_image.c（图片解码）同级。
  *
  * 【设计决策】
- * - macOS: CoreGraphics CGPDFDocument（系统框架，零外部依赖）
- * - 非 macOS: 桩实现（返回失败），保持项目零依赖原则
+ * - macOS: CoreGraphics CGPDFDocument（系统框架，零外部依赖）——实现在 ds_pdf.m
+ * - 非 macOS: 桩实现（返回失败），保持项目零依赖原则——实现在 ds_pdf.c
  * - 渲染分辨率: 2.0×页面点阵（≈144 DPI），长边上限 2048px
  *   A4 页面 (612×792pt) → 约 1224×1584px，小字号文档仍保留足够细节
  * - 输出统一为 3 通道 RGB 行主序，与 ds_image_t 的布局约定一致
+ * 两份实现同名同签名，调用方（main.c -i file.pdf）无平台分支。
  */
 
 #ifndef DS_PDF_H
