@@ -1199,6 +1199,7 @@ int main(int argc, char **argv) {
     float temperature = 0.0f;           /* 采样温度: 0=贪心(确定性) */
     float repeat_penalty = 1.0f;        /* 重复惩罚: 1.0=无惩罚 */
     int no_repeat_ngram_size = 0;       /* N-gram阻断: 0=禁用（V3 缺省会在加载后自动置 35） */
+    int ngram_specified_explicitly = 0; /* 用户是否显式传了 --ngram（区分"默认 0"与"显式 0"） */
     int min_new_tokens = -1;            /* 最少token数: -1=沿用 ctx 内置默认
                                          * （ds_load: V3/V4=32、V1/V2=0）；--min-tokens 覆盖 */
     int use_platform_ocr = 0;           /* 使用macOS Vision OCR后端 */
@@ -1228,6 +1229,7 @@ int main(int argc, char **argv) {
             repeat_penalty = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--ngram") == 0 && i + 1 < argc) {
             no_repeat_ngram_size = atoi(argv[++i]);
+            ngram_specified_explicitly = 1;
         } else if (strcmp(argv[i], "--min-tokens") == 0 && i + 1 < argc) {
             min_new_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--vision") == 0) {
@@ -1352,7 +1354,11 @@ int main(int argc, char **argv) {
      * 这防止V3在长文档解析时产生重复的n-gram。
      * V4 (Unlimited-OCR-2) 官方 infer() 默认 no_repeat_ngram_size=0（纯贪心，
      * ngram 是可选项），保持一致避免干扰 DASH 路由下的正常生成。*/
-    if (ctx->config.model_version == 3 && no_repeat_ngram_size == 0) {
+    if (ctx->config.model_version == DS_MODEL_VERSION_UNLIMITED && no_repeat_ngram_size == 0) {
+        /* 用户显式传 --ngram 0 想禁用，但 V3 循环退化的教训是禁用会复发，
+         * 这里仍强制 35 并打警告，避免静默覆盖让人困惑 */
+        if (ngram_specified_explicitly)
+            fprintf(stderr, "警告: V3 不支持 --ngram 0（循环退化风险），已强制为 35\n");
         ctx->no_repeat_ngram_size = 35;
     }
 

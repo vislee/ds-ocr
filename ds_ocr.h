@@ -121,9 +121,8 @@
 #define DS_MODEL_VERSION_V1     1       /* DeepSeek-OCR (原始版, SAM+CLIP双编码器) */
 #define DS_MODEL_VERSION_V2     2       /* DeepSeek-OCR-2 (DeepEncoder V2, 因果流查询) */
 #define DS_MODEL_VERSION_UNLIMITED 3    /* Unlimited-OCR (SAM+CLIP+2D网格+R-SWA滑动窗口) */
-                                        /* 4 = Unlimited-OCR-2（DASH 块稀疏注意力）无专用
-                                           宏；ds_ocr.c 以字面量 4 判定（ds_dash.h 提供其
-                                           专属常量，如 DS_TOKEN_PAGE_MARKER=128827） */
+#define DS_MODEL_VERSION_UNLIMITED2 4   /* Unlimited-OCR-2 (V4: DASH 块稀疏注意力 + page2d RoPE；
+                                         * 专属常量见 ds_dash.h，如 DS_TOKEN_PAGE_MARKER=128827) */
 
 /* Maximum layer counts (for static array sizing) — 静态数组尺寸上限 */
 #define DS_MAX_ENC_LAYERS       24

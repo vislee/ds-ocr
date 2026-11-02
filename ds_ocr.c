@@ -624,10 +624,13 @@ static int detect_model_version(const char *model_dir) {
     fclose(f);
 
     /* V4 (Unlimited-OCR-2): 训练阶段标记 "dash" + YaRN rope_scaling。
-     * 必须在 V3 之前检测——V4 同样含 "UnlimitedOCR"/"sliding_window_size"。*/
-    if (strstr(buf, "\"dash\"") || strstr(buf, "training_stage") ||
-        strstr(buf, "sparse_attention_config")) {
-        return 4;
+     * 必须在 V3 之前检测——V4 同样含 "UnlimitedOCR"/"sliding_window_size"。
+     * 三个关键词全部带引号精确匹配（已对照真 V4 config：三处均为
+     * "training_stage": "dash" 与裸键 "sparse_attention_config"），
+     * 裸子串会被 release-note 类字符串字段误触发，把 V3 误判成 V4。 */
+    if (strstr(buf, "\"dash\"") || strstr(buf, "\"training_stage\"") ||
+        strstr(buf, "\"sparse_attention_config\"")) {
+        return DS_MODEL_VERSION_UNLIMITED2;
     }
 
     /* Check for Unlimited-OCR (V3) first (has sliding_window_size in config) */
@@ -2714,8 +2717,11 @@ prompt_construction:
          * ds_dash_build_coords 以 seq_ids 构建 page2d (tok,page) 坐标：
          * <PAGE> 做 1-based 页计数，最后一张图之后的指令文本回"保留桶 0"
          * ——保证指令与任何真实页 Δpage≥1 不被误判同页（docs/14 §3） */
-        if (cfg->model_version == 4) {
-            ctx->dash_prompt_ids = (const int *)seq_ids;   /* 在 ctx 释放前保持有效 */
+        if (cfg->model_version == DS_MODEL_VERSION_UNLIMITED2) {
+            /* seq_ids 所指缓冲在本函数栈/堆内，生命周期 = 本次识别调用；
+             * 跨识别时 ds_recognize_image 入口会 ds_dash_reset_run 重建，
+             * 旧指针不会泄漏到下一次调用（勿写"ctx 释放前有效"——作用域是本函数） */
+            ctx->dash_prompt_ids = (const int *)seq_ids;
             ctx->dash_prompt_len = prefix_len;
             ds_dash_init(ctx);
             ds_dash_build_coords(ctx, seq_ids, prefix_len);
