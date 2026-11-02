@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
 
 /* ── 运行时状态（挂在 ctx 上） ───────────────────────────────────────────
  * ds_dash_state_t - DASH 全部跨调用状态；官方对应 _page_rope_meta +
@@ -98,14 +99,17 @@ int ds_dash_init(ds_ctx_t *ctx) {
     if (!st) return -1;
     st->max_pages = DS_DASH_MAX_PAGES;
     st->n_layers = ctx->config.dec_layers > 0 ? ctx->config.dec_layers : 12;
+    /* 提前挂到 ctx：逐层 calloc 失败时 ds_dash_free 才能真正释放已分配层。
+     * st 由 calloc 清零（free 对 NULL 字段安全），失败路径返回 -1 后
+     * ctx 处于一致的无 DASH 状态（free 末尾会把 dash_state 置回 NULL）。 */
+    ctx->dash_state = st;
     st->idx_k_hist = (float **)calloc((size_t)st->n_layers, sizeof(float *));
-    if (!st->idx_k_hist) { free(st); ctx->dash_state = NULL; return -1; }
+    if (!st->idx_k_hist) { ds_dash_free(ctx); return -1; }
     for (int l = 0; l < st->n_layers; l++) {
         st->idx_k_hist[l] = (float *)calloc((size_t)ctx->kv_cache_max * DS_DASH_INDEX_DIM,
                                             sizeof(float));
         if (!st->idx_k_hist[l]) { ds_dash_free(ctx); return -1; }
     }
-    ctx->dash_state = st;
     return 0;
 }
 
@@ -192,18 +196,20 @@ int ds_dash_build_coords(ds_ctx_t *ctx, const int *token_ids, int seq_len) {
     int hd = ctx->config.dec_head_dim;
     size_t rows = (size_t)ctx->kv_cache_max;
 
-    if (!st->cos2d) {
-        st->cos2d   = (float *)malloc(rows * hd * sizeof(float));
-        st->sin2d   = (float *)malloc(rows * hd * sizeof(float));
-        st->tok_pos = (int *)malloc(rows * sizeof(int));
-        st->page_pos= (int *)malloc(rows * sizeof(int));
-        st->cand_page=(int *)malloc(rows * sizeof(int));
-        int nblk_max = (int)(ctx->kv_cache_max / DS_DASH_BLOCK_SIZE) + 2;
-        st->blk_bmin = (int *)malloc((size_t)nblk_max * sizeof(int));
-        st->blk_bmax = (int *)malloc((size_t)nblk_max * sizeof(int));
-        if (!st->cos2d || !st->sin2d || !st->tok_pos || !st->page_pos ||
-            !st->cand_page || !st->blk_bmin || !st->blk_bmax) return -1;
-    }
+    /* 懒分配（逐资源判断）：部分失败只缺缺的那个，下次重试补齐即可。
+     * 旧写法七个一起 malloc 后一个 if 全查——任一失败后 cos2d 已非 NULL，
+     * 门被永久跳过，下次调用直接解引用 NULL tok_pos（OOM 后重试即崩溃）。
+     * rows/nblk_max 每 ctx 恒定，已分配的缓冲不用重分，幂等安全。 */
+    int nblk_max = (int)(ctx->kv_cache_max / DS_DASH_BLOCK_SIZE) + 2;
+    if (!st->cos2d)     st->cos2d    = (float *)malloc(rows * hd * sizeof(float));
+    if (!st->sin2d)     st->sin2d    = (float *)malloc(rows * hd * sizeof(float));
+    if (!st->tok_pos)   st->tok_pos  = (int *)malloc(rows * sizeof(int));
+    if (!st->page_pos)  st->page_pos = (int *)malloc(rows * sizeof(int));
+    if (!st->cand_page) st->cand_page= (int *)malloc(rows * sizeof(int));
+    if (!st->blk_bmin)  st->blk_bmin = (int *)malloc((size_t)nblk_max * sizeof(int));
+    if (!st->blk_bmax)  st->blk_bmax = (int *)malloc((size_t)nblk_max * sizeof(int));
+    if (!st->cos2d || !st->sin2d || !st->tok_pos || !st->page_pos ||
+        !st->cand_page || !st->blk_bmin || !st->blk_bmax) return -1;
 
     /* 第一遍: last_img 与 1-based marker 累计 cum1、pp
      * last_img = 最后一个 <image> 的位置（in_prefill 的边界）；cum1[s] =
@@ -434,7 +440,7 @@ static int router_qk(ds_ctx_t *ctx, int layer_idx,
  * 【参数】seq_len: 本批 query 数；nblk: KV 总块数；total_kv: KV 总 token 数；
  *   z: [seq_len, nblk] 输出。
  */
-static void block_scores_headcls(ds_ctx_t *ctx, ds_dash_state_t *st,
+static int block_scores_headcls(ds_ctx_t *ctx, ds_dash_state_t *st,
                                  int layer_idx, int seq_len, int nblk,
                                  int total_kv, float *z) {
     const ds_dec_layer_t *layer = &ctx->decoder.layers[layer_idx];
@@ -446,11 +452,13 @@ static void block_scores_headcls(ds_ctx_t *ctx, ds_dash_state_t *st,
     int base = ctx->kv_cache_len;
 
     /* k_bar[nblk, d]：块内 token 对 head_cls 的 softmax 加权平均（每块一次）。
-     * 两遍法：先算全部分数找块内最大值 mx（数值稳定），再指数累加 k_bar */
+     * 两遍法：先算全部分数找块内最大值 mx（数值稳定），再指数累加 k_bar。
+     * OOM 时返回 -1 由调用方上报失败，绝不填 0 静默退化——
+     * 全零分数经 entmax 后路由貌似合理实则跨页乱选。 */
     float *kbar = (float *)malloc((size_t)nblk * d * sizeof(float));
-    if (!kbar) { for (size_t i = 0; i < (size_t)seq_len * nblk; i++) z[i] = 0.0f; return; }
+    if (!kbar) return -1;
     float *aw = (float *)malloc((size_t)bs * sizeof(float));
-    if (!aw) { free(kbar); for (size_t i = 0; i < (size_t)seq_len * nblk; i++) z[i] = 0.0f; return; }
+    if (!aw) { free(kbar); return -1; }
 
     for (int b = 0; b < nblk; b++) {
         /* 末块可能不满 32 个 token：s1 夹到 total_kv */
@@ -478,7 +486,8 @@ static void block_scores_headcls(ds_ctx_t *ctx, ds_dash_state_t *st,
             const float *kt = idx_k_all + (size_t)(s0 + t) * d;
             for (int i = 0; i < d; i++) kb[i] += e * kt[i];
         }
-        /* 除以指数和 → softmax 权重平均；下限 1e-6 防除零（全 clamp 行） */
+        /* 除以指数和 → softmax 权重平均。esum ≥ exp(0)=1 恒成立（减去块内
+         * 最大分后必有元素贡献 1），fmaxf 纯防御，非除零所需 */
         float inv_es = 1.0f / fmaxf(esum, 1e-6f);
         for (int i = 0; i < d; i++) kb[i] *= inv_es;
     }
@@ -502,6 +511,7 @@ static void block_scores_headcls(ds_ctx_t *ctx, ds_dash_state_t *st,
         }
     }
     free(kbar);
+    return 0;
 }
 
 /* ── entmax15 (α=1.5, 官方 _Entmax15.forward + _entmax_threshold_and_support)
@@ -733,7 +743,10 @@ static void attn_head_range(ds_ctx_t *ctx, int layer_idx, const float *Qbuf,
 
     /* 只清自己的 head 区间——decode 按 head 并行时各线程写互不相交 */
     memset(O_row + (size_t)h0 * hd, 0, (size_t)nh * hd * sizeof(float));
-    /* 在线 softmax 状态（FA 三元组）: run_m=行最大分、run_s=exp 和；O 在 O_row */
+    /* 在线 softmax 状态（FA 三元组）: run_m=行最大分、run_s=exp 和；O 在 O_row。
+     * 数组按最大 64 头开（V4 实际 10 头）；h1−h0 超限说明 config 头数被改坏，
+     * 直接 abort 而非栈溢出。 */
+    assert(nh <= 64 && "run_m/run_s sized for max 64 heads; check dec_heads config");
     float run_m[64], run_s[64];
     for (int i = 0; i < nh; i++) { run_m[i] = -1e30f; run_s[i] = 0.0f; }
 
@@ -897,7 +910,9 @@ int ds_dash_attention_prefill(ds_ctx_t *ctx, int layer_idx,
     }
     float *z = (float *)malloc((size_t)seq_len * nblk * sizeof(float));
     if (!z) return -1;
-    block_scores_headcls(ctx, st, layer_idx, seq_len, nblk, total_kv, z);
+    if (block_scores_headcls(ctx, st, layer_idx, seq_len, nblk, total_kv, z) != 0) {
+        free(z); return -1;   /* OOM：上报失败，不静默降级 */
+    }
     /* prefill 的每个 query 独立路由（页候选/远程域都可能不同） */
     for (int q = 0; q < seq_len; q++)
         route_select(ctx, z, nblk, q, &st->routes[q]);
@@ -926,7 +941,9 @@ int ds_dash_attention_decode(ds_ctx_t *ctx, int layer_idx,
     /* decode 的 z 只有 1 行（单 query 对全部块的分数） */
     float *z = (float *)malloc((size_t)nblk * sizeof(float));
     if (!z) return -1;
-    block_scores_headcls(ctx, st, layer_idx, 1, nblk, total_kv, z);
+    if (block_scores_headcls(ctx, st, layer_idx, 1, nblk, total_kv, z) != 0) {
+        free(z); return -1;   /* OOM：上报失败，不静默降级 */
+    }
     ds_dash_route_t rt;
     route_select(ctx, z, nblk, 0, &rt);
     free(z);
@@ -950,8 +967,9 @@ int ds_dash_attention_decode(ds_ctx_t *ctx, int layer_idx,
  * indexer.rotary_emb_2d 同参数）；tok/page 坐标来自本模块的坐标表。
  * 【fallback】状态未就绪（未 init/未 build_coords）时退回 1D rope_cache——
  * 不应用于 V4 正常路径，仅防未初始化崩溃。
- * which: 0=cos, 1=sin。返回 [head_dim] 行指针（内部缓冲，勿释放）。*/
-void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which) {
+ * which: 0=cos, 1=sin。返回 [head_dim] 行只读指针（内部缓冲，勿释放）。
+ * 原型在 ds_dash.h（曾被 ds_moe_decoder.c 用局部 extern 调用，签名漂移即静默 UB）。 */
+const float *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which) {
     ds_dash_state_t *st = (ds_dash_state_t *)ctx->dash_state;
     if (!st || !st->cos2d || pos < 0) {
         /* 状态未就绪时退回 1D 表（不应用于 V4 正常路径） */

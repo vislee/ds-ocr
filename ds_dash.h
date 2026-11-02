@@ -182,4 +182,10 @@ int  ds_dash_attention_decode(ds_ctx_t *ctx, int layer_idx,
  * 【参考】官方 _infer_prefill_attend/_forward_dense 与 _dash_decode_forward/_decode_attend；
  * V4 的 Q/K 主分支旋转也用本模块的 page2d 表（ds_moe_decoder.c 经 ds_dash_rope_row 取行）。 */
 
+/* ds_dash_rope_row - 主分支 Q/K 旋转的 page2d cos/sin 行入口（ds_moe_decoder.c 调用）。
+ * 返回 st->cos2d/sin2d 第 pos 行的只读指针（which: 0=cos, 1=sin）；行由
+ * ds_dash_build_coords/ds_dash_advance_coords 维护，pos 必须 < kv_cache_max。
+ * 返回 NULL = 未初始化/越界（调用方应回退到 1D RoPE 或报错，勿解引用）。 */
+const float *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which);
+
 #endif /* DS_DASH_H */

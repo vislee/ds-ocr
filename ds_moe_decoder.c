@@ -824,7 +824,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      * tok 轴页内计数 + page 轴页号 mod 2，是官方 sparse_main_rope_mode="page2d"。*/
     float *cos_vals, *sin_vals;
     if (cfg->model_version == 4) {
-        extern void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which); /* 0=cos,1=sin */
+        /* ds_dash_rope_row 原型在 ds_dash.h（const float *）；此处只读，无需强转 */
         int pos_v4 = ctx->kv_cache_len;
         cos_vals = (float *)ds_dash_rope_row(ctx, pos_v4, 0);
         sin_vals = (float *)ds_dash_rope_row(ctx, pos_v4, 1);
@@ -1100,8 +1100,7 @@ int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
             int base = ctx->kv_cache_len;
             float *cos_p, *sin_p;
             if (cfg->model_version == 4) {
-                extern void *ds_dash_rope_row(ds_ctx_t *ctx, int pos, int which);
-                cos_p = (float *)ds_dash_rope_row(ctx, base, 0);
+                cos_p = (float *)ds_dash_rope_row(ctx, base, 0); /* 原型在 ds_dash.h */
                 sin_p = (float *)ds_dash_rope_row(ctx, base, 1);
             } else {
                 cos_p = ctx->rope_cache_cos + base * head_dim;

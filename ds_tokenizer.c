@@ -371,11 +371,13 @@ typedef struct {
 } str_int_entry_t;
 
 /* fnv1a_hash - FNV-1a 64 位哈希
- * 偏移基数 1469598103934665603、素数 1099511628211（FNV 官方常数）。
+ * 偏移基数 14695981039346656037 (=0xcbf29ce484222325)、素数 1099511628211
+ * (=0x100000001b3)——均为 Fowler–Noll–Vo FNV-1a 官方常数（public domain，
+ * 参见 IETF draft-eastlake-fnv）。
  * 选它因为：逐字节处理对"载体字符"UTF-8 串天然友好；实现 6 行；
  * 分布均匀性对本场景足够——负载因子压在 ≤0.5 时线性探查期望 O(1)。 */
 static uint64_t fnv1a_hash(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
+    uint64_t h = 14695981039346656037ULL;
     while (*s) {
         h ^= (unsigned char)*s++;
         h *= 1099511628211ULL;
