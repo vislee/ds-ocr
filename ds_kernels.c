@@ -55,6 +55,10 @@
 #endif
 
 /* Helper: truncate F32 to BF16 precision and back (matches Python BF16 intermediate precision)
+ * 【BF16 位级原理】BF16 = F32 截掉低 16 位：两者共用 1 位符号 + 8 位指数，BF16 只留高 7 位尾数。
+ *   F32→BF16：给低 16 位加上"半个最低保留位" 0x8000 再清零低 16 位——进位即入舍入
+ *   （tie 时向绝对值增大方向舍入，与 IEEE 就近偶数舍入仅在恰好 tie 时不同）；
+ *   BF16→F32：位模式 <<16 低位补零，这一步是【精确】的，只还原不损失。
  * Scalar reference for the SIMD rounding paths (e.g. the vaddq/vandq BF16 conversion);
  * kept even when unused so numerical debugging can call it directly. */
 static __attribute__((unused)) inline float ds_f32_to_bf16_to_f32(float x) {
@@ -99,6 +103,16 @@ ds_argmax_bf16_range_fn_t ds_argmax_bf16_range_impl_ptr = ds_argmax_bf16_range_g
 
 static int ds_dispatch_initialized = 0;
 
+/* ds_kernels_dispatch_init - 运行时探测 CPU 能力，把 matvec/argmax 函数指针切到最优实现
+ * 【算法】ARM 上读 hw.optional.arm.FEAT_BF16（macOS sysctl）或 AT_HWCAP2 的
+ *   HWCAP2_BF16 位（Linux getauxval）：支持 FEAT_BF16 则选 bfdot 路径
+ *   （一条指令 8 个 BF16 MAC，吞吐约为 vshll+vfma 路径的 2×），否则回退 vshll 加宽；
+ *   x86 由 -march 在编译期定死 AVX2/AVX-512，无运行时探测需求。
+ * 【为什么】同一份 Apple 二进制要同时跑 M1（无 bfdot）与 M2+（有），编译期无法
+ *   二选一，只能把两份内核都编入、启动时切指针（"编译期定候选、运行时定人选"，
+ *   详见 ds_kernels_impl.h 顶部注释）。
+ * 【线程安全】初始化标志非原子，但各线程探测结果恒相同（写同值），实践无害。
+ * 【参考】docs/03-推理引擎实战篇 §4（三级内核）；docs/09-量化与部署篇 §6。 */
 void ds_kernels_dispatch_init(void) {
     if (ds_dispatch_initialized) return;
     ds_dispatch_initialized = 1;
@@ -148,7 +162,10 @@ void ds_kernels_dispatch_init(void) {
 #endif
 }
 
-/* Auto-initialize on first matvec call (thread-safe via simple flag). */
+/* Auto-initialize on first matvec call (thread-safe via simple flag).
+ * 惰性初始化：上层（ds_load 等）可显式提前调用，也可完全不调——第一次
+ * matvec 经 bf16_matvec_fused → ds_dispatch_ensure_init 自动完成探测，
+ * 保证任何路径都不会用到未初始化的函数指针。 */
 void ds_dispatch_ensure_init(void) {
     if (!ds_dispatch_initialized) ds_kernels_dispatch_init();
 }
@@ -184,6 +201,15 @@ static struct {
     .cond_done = PTHREAD_COND_INITIALIZER,
 };
 
+/* ds_worker_loop - 常驻 worker 线程主循环（pthread 版 fork-join 的 worker 半边）
+ * 【参数】arg 指向 tp.tids[i]（i∈[1,n_threads)），即本线程的 tid；主线程固定 tid=0。
+ * 【协议】① 在 cond_work 上等 generation 前进（拿锁轮询→睡）；② 被唤醒后领取
+ *   本轮代数/函数/参数并解锁执行 fn(tid, nt, arg)；③ 完成后 n_done++，最后一个
+ *   完成者 signal cond_done 唤醒主线程（见 ds_parallel_for）。
+ * 【为什么常驻】线程创建/销毁 ~几十 μs，而单次 matvec 并行区只有百 μs 级——
+ *   复用线程把摊销成本降为 0。generation 代数计数让旧广播信号自然失效，
+ *   替代了"每轮锁/解锁整套任务数组"的复杂簿记。
+ * 【参考】docs/03-推理引擎实战篇 §8；qwen-asr 同名模式。 */
 static void *ds_worker_loop(void *arg) {
     /* 【理论】常驻 worker 的 fork-join 模式（消除线程创建开销）：
      * - generation 计数器区分"第几轮任务"，worker 醒来后比对代数，
@@ -221,18 +247,48 @@ static void *ds_worker_loop(void *arg) {
  * MoE Operations
  * ======================================================================== */
 
+/* ds_moe_router - MoE 路由器：gate 线性层（F32 权重版，测试/对照用）
+ * 【算法/数学】scores[e] = Σ_i W_gate[e][i]·x[i]，即 y = x @ W_gateᵀ；
+ *   W_gate: [n_experts, hidden]（本模型 [64, 1280]）→ scores: [n_experts]。
+ * 【注意】本函数【只做线性层，不含 softmax】——softmax 在调用方完成
+ *   （解码器真实路径 ds_moe_decoder.c 的 moe_forward 内联做"全体 64 专家
+ *   softmax 后再选 top-6"，与 Python/DeepSeek-V2 语义一致）。
+ *   docs/02-MoE混合专家篇 §3.3 把 softmax 写进了 router 描述，与代码不符，以代码为准。
+ * 【参数】scores[n_experts] 输出；x[hidden] 输入；gate_weight 行主序 F32 权重。
+ * 【参考】docs/02 §3（路由机制）；PyTorch 等价: nn.Linear(hidden, n_experts, bias=False)。 */
 void ds_moe_router(float *scores, const float *x, const float *gate_weight,
                    int hidden, int n_experts) {
     /* scores[e] = gate_weight[e, hidden] @ x[hidden] */
     ds_linear_nobias(scores, x, gate_weight, 1, hidden, n_experts);
 }
 
+/* ds_moe_router_bf16 - MoE 路由器（BF16 权重版，解码器真实路径使用）
+ * 【算法】同 ds_moe_router，但权重为 BF16、matvec 时在线转 F32。
+ * 【为什么用 BF16】路由决策必须与 Python 的 BF16 精度逐位对齐：两个排名相近的
+ *   专家在 F32/BF16 下得分次序可能互换，一旦选错专家，输出就系统性偏离
+ *   （docs/02 §3.4"精度细节"）。范围无损（8 位指数同 F32），只牺牲尾数。
+ * 【参数】scores[n_experts] 输出原始得分（未 softmax）；x[hidden] F32 输入；
+ *   gate_weight_bf16: [n_experts, hidden] 行主序 BF16。
+ * 【参考】docs/02 §3.4；ds_moe_decoder.c moe_forward Step 1-2。 */
 void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weight_bf16,
                           int hidden, int n_experts) {
     /* scores[e] = gate_weight_bf16[e, hidden] @ x[hidden] (BF16 weights for precision matching) */
     ds_linear_nobias_bf16(scores, x, gate_weight_bf16, 1, hidden, n_experts);
 }
 
+/* ds_moe_top_k - 从专家得分中选 top-K 并做重归一化（独立工具函数）
+ * 【算法/数学】① 无放回地选出得分最高的 top_k 个专家（选择法，K 轮扫描）；
+ *   ② 对选中的 K 个分数再做一次 max-subtract softmax：w_k = e^(s_k-max)/Σe^(s_j-max)
+ *   ——因为 exp 单调，这等价于"把已 softmax 过的概率在 top-K 子集内重归一化"，
+ *   保证 Σw_k = 1 且未选中专家权重为 0。
+ * 【参数】top_indices[top_k] 输出专家编号；top_weights[top_k] 输出归一化权重；
+ *   scores[n_experts] 为输入得分（本工程用 softmax 后的概率，原始 logits 亦可，
+ *   softmax 内部自带 max-subtract 对平移不变）；n_experts=64、top_k=6（典型值）。
+ * 【注意】解码器真实路径（ds_moe_decoder.c）为对齐 Python/DeepSeek-V2 语义，
+ *   改为"全体 64 专家 softmax 后直接取概率、不再 renorm"，未走本函数；
+ *   本函数保留供测试（test_unit/test.c）与未来切换 renorm 语义使用。
+ * 【复杂度】O(top_k × n_experts) = 6×64=384 次比较，<1μs，无需堆/partial sort。
+ * 【参考】docs/02 §3.2（top-K 伪代码）。 */
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
                   int n_experts, int top_k) {
     /* 选择 top-K 路由专家（n_experts=64, top_k=6）
@@ -276,6 +332,8 @@ void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
     }
 
     /* Softmax over top-K scores */
+    /* max-subtract：先减最大值再 exp，防止 e^s 上溢（s-e^max ≤ 0，结果落在 [0,1]），
+     * 平移不改变 softmax 结果（分子分母同乘 e^-max 被约掉） */
     float max_score = -1e30f;
     for (int k = 0; k < n_selected; k++) {
         if (selected_scores[k] > max_score) max_score = selected_scores[k];
@@ -290,14 +348,23 @@ void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
     for (int k = 0; k < top_k; k++) {
         if (k < n_selected) {
             top_indices[k] = selected[k];
-            top_weights[k] = selected_scores[k] * inv_sum;
+            top_weights[k] = selected_scores[k] * inv_sum;   /* 乘 1/Σ 比除法快且省一次除法 */
         } else {
+            /* n_experts < top_k 的防御分支：多余槽位填权重 0（combine 时乘 0 无贡献） */
             top_indices[k] = 0;
             top_weights[k] = 0.0f;
         }
     }
 }
 
+/* ds_expert_forward - 单个路由专家的 SwiGLU 前向（gate/up 权重分离版，CPU decode 路径）
+ * 【参数】out[hidden] 输出；x[hidden] 输入；gate_bf16/up_bf16: [intermediate, hidden]、
+ *   down_bf16: [hidden, intermediate] 均为行主序 BF16（本模型 hidden=1280、
+ *   intermediate=moe_inter=896）；四个 buf 为调用方预分配的复用缓冲
+ *   （gate_buf/up_buf/hidden_buf 各 [intermediate]，gate_up_buf 当前未用，仅保签名兼容）。
+ * 【为什么复用缓冲】MoE 串行处理各专家，同一缓冲可跨专家复用，避免每专家
+ *   malloc/free（docs/02 §8.2）。
+ * 【参考】docs/02 §4（专家=小型 SwiGLU FFN）；docs/05 §4.5。 */
 void ds_expert_forward(float *out, const float *x,
                        const uint16_t *gate_bf16, const uint16_t *up_bf16,
                        const uint16_t *down_bf16,
@@ -336,7 +403,7 @@ void ds_expert_forward(float *out, const float *x,
      * Previously: gate_up_buf[2*i] = gate[i], gate_up_buf[2*i+1] = up[i],
      * then ds_swiglu_multiply. The interleaving is cache-unfriendly.
      * ds_swiglu_direct computes SiLU(gate[i]) * up[i] directly. */
-    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);
+    ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);   /* SiLU(gate)⊙up [896] */
 
     /* Truncate SwiGLU output to BF16 (Python's down projection input is BF16) */
     if (ds_bf16_simulate_python) {
@@ -352,7 +419,10 @@ void ds_expert_forward(float *out, const float *x,
     }
 }
 
-/* Backward-compatible wrapper that allocates internally */
+/* Backward-compatible wrapper that allocates internally
+ * ds_expert_forward_legacy - ds_expert_forward 的自分配包装（遗留接口）
+ * 每次 4 次 malloc/free，仅供离线调试/脚本调用；真实推理请用外部
+ * 预分配缓冲的 ds_expert_forward / ds_expert_forward_fused。 */
 void ds_expert_forward_legacy(float *out, const float *x,
                        const uint16_t *gate_bf16, const uint16_t *up_bf16,
                        const uint16_t *down_bf16,
@@ -387,7 +457,12 @@ void ds_expert_forward_legacy(float *out, const float *x,
  *   5. BF16 truncate swiglu
  *   6. out = down_bf16 @ swiglu            [896 → 1280]
  *   7. BF16 truncate out
- */
+ *
+ * 【为什么融合】x[1280] 在两次 matvec 间常驻 L1，一次读入喂 1792 行输出，
+ *   且线程池只派发 1 个并行区（分离版要 2 个），减少 barrier 次数。
+ * 【参数】out[hidden]；x[hidden]；gate_up_fused_bf16: [2*intermediate, hidden]
+ *   （前 intermediate 行 = gate_W，后 = up_W）；其余同 ds_expert_forward。
+ * 【参考】docs/05 §4.5（Fused Expert Forward）。 */
 void ds_expert_forward_fused(float *out, const float *x,
                               const uint16_t *gate_up_fused_bf16,
                               const uint16_t *down_bf16,
@@ -425,6 +500,15 @@ void ds_expert_forward_fused(float *out, const float *x,
     }
 }
 
+/* ds_expert_combine - 用路由权重加权合并 top-K 个专家的输出（MoE 最后一步）
+ * 【算法/数学】output[i] = Σ_k top_weights[k] · expert_outputs[k][i]，
+ *   即 MoE(x) = Σ w_k·Expert_k(x)；expert_outputs 按 [top_k, hidden] 排布
+ *   （本模型 top_k=6、hidden=1280）。
+ * 【参数】output[hidden] 输出（先清零再累加）；top_indices 未用——top_weights
+ *   中未选中槽位已置 0，乘 0 自然消去。
+ * 【为什么先 memset】专家输出是"加法贡献"而非覆盖，必须从 0 起步；
+ *   外层 k 内层 i 的顺序保证对 expert_outputs 的读取连续（cache 友好）。
+ * 【参考】docs/02 §3.2（output = Σ top_k_probs·Expert(x)）。 */
 void ds_expert_combine(float *output, const float *expert_outputs,
                        const int *top_indices, const float *top_weights,
                        int top_k, int hidden) {
@@ -444,13 +528,29 @@ void ds_expert_combine(float *output, const float *expert_outputs,
  * Mixed Attention (DeepEncoder V2: bidirectional for visual, causal for flow queries)
  * ======================================================================== */
 
+/* ds_mixed_attention - DeepEncoder V2 混合注意力：视觉 token 双向 + 因果流查询因果
+ * 【算法/数学】同一组 K/V 上按行施加两种掩码：
+ *   - 行 i∈[0, visual_len)：双向——Q_i 与【全部】visual_len 个 K/V 做注意力；
+ *   - 行 i∈[visual_len, total_len)：因果——Q_i 只看 [0, i]（全部视觉 token
+ *     + 之前的流查询，k_end=i+1）。
+ *   每行用 online softmax（O(1) 额外内存）：维护运行最大值 m 与指数和 Σ，
+ *   遇到更大 score 时以 correction=e^(m_old-m_new) 整体重缩放已累加输出——
+ *   数学恒等，无需物化 [total_len,total_len] 注意力矩阵（docs/01 §5）。
+ * 【为什么 F64】V2 编码输出对浮点扰动极敏感：近并列 argmax 一旦翻转即级联
+ *   放大，回归门控实测后定为红线"编码侧注意力权重精度不可妥协"
+ *   （docs/05 §10.2），故 QK 点积与 V 累加全程 double、最后一步才舍入 F32。
+ * 【参数】out/Q/K/V 均为 [total_len, n_heads*head_dim] 行主序；每 head 切片
+ *   独立计算；scale=1/sqrt(head_dim) 由调用方传入（稳定 softmax 梯度）。
+ * 【参考】docs/01 §9.3（混合注意力）；PyTorch 等价: 双向/因果两次 attention 的逐行拼合。 */
 void ds_mixed_attention(float *out, const float *Q, const float *K, const float *V,
                         int visual_len, int total_len, int n_heads,
                         int head_dim, float scale) {
     int hidden = n_heads * head_dim;
     double dscale = (double)scale;
 
-    /* Allocate double buffers for V accumulation (float64 precision) */
+    /* Allocate double buffers for V accumulation (float64 precision)
+     * o_row_d: 当前 (head, 行) 的加权 V 累加器 [head_dim]；v_buf: 供重缩放
+     * 的临时行。仅 head_dim×8B×2，栈外小分配，换取整行 F64 精度。 */
     double *o_row_d = (double *)malloc(head_dim * sizeof(double));
     double *v_buf = (double *)malloc(head_dim * sizeof(double));
 
@@ -464,6 +564,7 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
             double sum_exp = 0.0;
             for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
 
+            /* 双向注意力：j 遍历全部视觉 token，无掩码（docs/01 §9.1） */
             for (int j = 0; j < visual_len; j++) {
                 const float *k_row = K + j * hidden + h * head_dim;
                 const float *v_row = V + j * hidden + h * head_dim;
@@ -472,8 +573,14 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
                 double score = 0.0;
                 for (int d = 0; d < head_dim; d++)
                     score += (double)q_row[d] * (double)k_row[d];
-                score *= dscale;
+                score *= dscale;   // 缩放 1/sqrt(head_dim)：把 QKᵀ 方差压回 ~1，防 softmax 饱和
 
+                /* online softmax 分支一：出现新的行最大值。
+                 * 以 correction=e^(m_old-m_new) 把旧累加器与旧 Σ 整体重缩放
+                 * （Σ 还要 +1 计入当前行，其 exp 权重恰为 1）；
+                 * 本行 V 也乘同一 correction 后并入——展开即
+                 * o = (Σ旧·e^旧 + v·e^新)，与直接算 e^(score-m) 数学恒等，
+                 * 却保证指数参数永远 ≤ 0，不会溢出。 */
                 if (score > max_score) {
                     double correction = exp(max_score - score);
                     sum_exp = sum_exp * correction + 1.0;
@@ -483,6 +590,8 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
                     }
                     max_score = score;
                 } else {
+                    /* online softmax 分支二（常见路径）：score ≤ 当前最大值，
+                     * 权重 wt=e^(score-m) ∈ (0,1]，直接累加即可 */
                     double wt = exp(score - max_score);
                     sum_exp += wt;
                     for (int d = 0; d < head_dim; d++)
@@ -490,6 +599,7 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
                 }
             }
 
+            /* 收尾：除以 Σ 得到归一化输出（未除前 o 是"未归一的指数加权和"） */
             if (sum_exp > 0.0) {
                 double inv_sum = 1.0 / sum_exp;
                 for (int d = 0; d < head_dim; d++)
@@ -508,6 +618,9 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
             double sum_exp = 0.0;
             for (int d = 0; d < head_dim; d++) o_row_d[d] = 0.0;
 
+            /* 因果掩码：流查询 i 只能看 [0, i]——k_end=i+1 覆盖全部视觉 token
+             * 与此前到达的流查询（"按序收集信息"，docs/01 §9.3）。
+             * 下面 j 循环内的 online softmax 与视觉段逐行相同，不再重复注释 */
             int k_end = i + 1;
             if (k_end > total_len) k_end = total_len;
 
@@ -555,6 +668,17 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
  * 2D Position Embeddings for vision tokens
  * ======================================================================== */
 
+/* ds_compute_2d_position_embeddings - 视觉 token 的 2D 正弦位置编码（行/列两半拼接）
+ * 【算法/数学】embed_dim 对半拆：前半编码行号 row、后半编码列号 col，
+ *   每半用 1D 正弦公式（docs/01 §4.2）：
+ *     PE(pos, 2i)   = sin(pos · f_i)      f_i = 10000^(-2i/half),  half=embed_dim/2
+ *     PE(pos, 2i+1) = cos(pos · f_i)
+ *   频率随维度指数衰减：低维高频区分相邻行/列，高维低频区分远距位置。
+ * 【参数】pos_embed[n_rows*n_cols, embed_dim] 输出，token 顺序 = patch 网格
+ *   行优先展平（row = i/n_cols，col = i%n_cols）。
+ * 【为什么 2D】图像 token 有 (row,col) 两个正交坐标，1D 序号表达不了
+ *   "同行/同列"邻接关系；SAM/DeepEncoder 均为行列分别编码再拼接。
+ * 【参考】docs/01 §4.4；docs/06-视觉编码器篇。 */
 void ds_compute_2d_position_embeddings(float *pos_embed, int n_rows, int n_cols,
                                          int embed_dim) {
     /* Split embedding dimension in half: row position + column position */
@@ -568,6 +692,8 @@ void ds_compute_2d_position_embeddings(float *pos_embed, int n_rows, int n_cols,
 
         /* Row position encoding (first half) */
         for (int d = 0; d < half; d++) {
+            // f_d = 10000^(-2⌊d/2⌋/half)：偶 d 与奇 d+1 共用同一频率，
+            // 构成一对 sin/cos（旋转正交基的经典写法）
             float freq = 1.0f / powf(10000.0f, (float)(2 * (d / 2)) / (float)half);
             float angle = (float)row * freq;
             if (d % 2 == 0) emb[d] = sinf(angle);
@@ -584,11 +710,21 @@ void ds_compute_2d_position_embeddings(float *pos_embed, int n_rows, int n_cols,
     }
 }
 
+/* ds_set_threads - 设置线程池线程数（含旧线程池的销毁重建）
+ * 【参数】n∈[1, DS_MAX_THREADS=16]，越界截断；n=1 为纯串行模式
+ *   （ds_parallel_for 直接在主线程执行，零同步开销）。
+ * 【协议】已有 >1 线程时：置 shutdown → broadcast 唤醒全部 worker →
+ *   逐个 join → 按 n 重建（tid=1..n-1，主线程恒为 tid=0）。
+ * 【为什么整池重建】pthread 线程数无法原地增减；推理期通常只调一次，
+ *   重建成本可忽略。
+ * 【参考】docs/03 §8（线程池与并行计算）。 */
 void ds_set_threads(int n) {
     if (n < 1) n = 1;
     if (n > DS_MAX_THREADS) n = DS_MAX_THREADS;
 
-    /* Shutdown existing workers */
+    /* Shutdown existing workers
+     * shutdown=1 + broadcast：worker 在 cond_work 醒来后看到 shutdown 即退出
+     * （见 ds_worker_loop），join 保证资源完全回收后再重建，避免句柄泄漏 */
     if (tp.n_threads > 1) {
         pthread_mutex_lock(&tp.mutex);
         tp.shutdown = 1;
@@ -603,6 +739,7 @@ void ds_set_threads(int n) {
     tp.n_threads = n;
     if (n <= 1) return;
 
+    /* 只创建 n-1 个 worker：主线程自己充当 tid=0，并行区少一次线程切换 */
     for (int i = 0; i < n - 1; i++) {
         tp.tids[i] = i + 1;
         pthread_create(&tp.threads[i], NULL, ds_worker_loop, &tp.tids[i]);
@@ -612,10 +749,13 @@ void ds_set_threads(int n) {
         fprintf(stderr, "Thread pool: %d threads\n", n);
 }
 
+/* ds_get_threads - 读取当前线程池线程数（含主线程；1 = 纯串行模式） */
 int ds_get_threads(void) {
     return tp.n_threads;
 }
 
+/* ds_get_num_cpus - 查询可用 CPU 核数（macOS sysctl hw.ncpu / Linux sysconf），
+ * 供 main/ds_load 决定 ds_set_threads 的默认值；查询失败回退 1。 */
 int ds_get_num_cpus(void) {
 #ifdef __APPLE__
     int n = 0;
@@ -628,7 +768,16 @@ int ds_get_num_cpus(void) {
 #endif
 }
 
-/* Dispatch work to all threads; main thread is tid=0 */
+/* Dispatch work to all threads; main thread is tid=0
+ * ds_parallel_for - fork-join 并行区入口：全部线程执行同一 fn(tid, n_threads, arg)
+ * 【协议】主线程：锁 → 发布 fn/arg、n_done=0、generation++ → broadcast 唤醒
+ *   worker → 解锁 → 自己跑 fn(0,...) → 等 n_done 达 n_threads-1（出口 barrier）。
+ *   worker 侧协议见 ds_worker_loop；generation++ 使上一轮的迟到唤醒自然失效。
+ * 【分片约定】fn 内部按 tid 自行切分数据（惯用 chunk=ceil(N/n_threads)），
+ *   各分片写区间互不相交 → 执行期不持锁；同步开销仅入口广播 + 出口 barrier。
+ * 【为什么主线程也干活】避免主线程空转等 barrier；n_threads≤1 时退化为
+ *   直接调用 fn(0,1,arg)，完全零同步开销。
+ * 【参考】docs/03 §8；docs/05 §10.3（按输出维度切分的"逐位一致"并行原则）。 */
 void ds_parallel_for(ds_parallel_fn_t fn, void *arg) {
     if (tp.n_threads <= 1) {
         fn(0, 1, arg);
@@ -646,6 +795,7 @@ void ds_parallel_for(ds_parallel_fn_t fn, void *arg) {
     fn(0, tp.n_threads, arg);
 
     pthread_mutex_lock(&tp.mutex);
+    /* 出口 barrier：while（非 if）防虚假唤醒；最后一个完成的 worker 负责唤醒 */
     while (tp.n_done < tp.n_threads - 1)
         pthread_cond_wait(&tp.cond_done, &tp.mutex);
     pthread_mutex_unlock(&tp.mutex);
@@ -655,18 +805,22 @@ void ds_parallel_for(ds_parallel_fn_t fn, void *arg) {
  * Basic Element-wise Operations
  * ======================================================================== */
 
+/* ds_add_inplace - 原地逐元素加 a[i] += b[i]（残差累加，省一份输出缓冲） */
 void ds_add_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) a[i] += b[i];
 }
 
+/* ds_mul_inplace - 原地逐元素乘 a[i] *= b[i]（如按位掩码/门控） */
 void ds_mul_inplace(float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) a[i] *= b[i];
 }
 
+/* ds_scale - 原地标量缩放 x[i] *= s（如注意力输出乘 1/Σexp） */
 void ds_scale(float *x, float s, int n) {
     for (int i = 0; i < n; i++) x[i] *= s;
 }
 
+/* ds_copy - memcpy 包装：dst ← src（n 个 F32，编译器可向量化） */
 void ds_copy(float *dst, const float *src, int n) {
     memcpy(dst, src, n * sizeof(float));
 }
@@ -675,6 +829,15 @@ void ds_copy(float *dst, const float *src, int n) {
  * Matrix Operations
  * ======================================================================== */
 
+/* ds_matmul_t - C = A @ Bᵀ 的批量矩阵乘（prefill 阶段的主力原语）
+ * 【算法/数学】C[m,n] = Σ_k A[m,k]·B[n,k]；A[M,K]、B[N,K] 均行主序，
+ *   B 以"转置参与乘法"的布局存储 → C[M,N]。prefill 的 QKV/Out 投影、
+ *   共享专家 gate/up/down 全部收敛到这里。
+ * 【为什么 B 存 [N,K]】权重天然按"每个输出元素一行"排布（与 matvec 通用），
+ *   CblasTrans 让 BLAS 内部挑最优微内核，用户无需物化转置副本。
+ * 【为什么 BLAS 快 5-10×】Accelerate/OpenBLAS 做了 cache 分块 + 寄存器分块
+ *   + 指令级并行（docs/03 §4.3）；naive 三重循环仅为无 BLAS 平台保底。
+ * 【参考】docs/05 §3（prefill 批量 sgemm，30s→0.93s 的关键）。 */
 void ds_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -692,6 +855,11 @@ void ds_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) 
 #endif
 }
 
+/* ds_linear - 全连接 y = x @ Wᵀ + b（F32 权重，编码器/共享专家批量路径用）
+ * 【参数】x[seq_len,in_dim]、W[out_dim,in_dim] 行主序、b[out_dim] 可 NULL、
+ *   y[seq_len,out_dim]。BLAS 路径：sgemm 算完再逐行加 bias——sgemm 的 β 语义
+ *   要求先把 b 广播进 C（多一趟写），不如算完一遍加干净。
+ * 【参考】PyTorch: nn.Linear(in_dim, out_dim, bias)。 */
 void ds_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
 #ifdef USE_BLAS
@@ -722,6 +890,9 @@ void ds_linear(float *y, const float *x, const float *W, const float *b,
 #endif
 }
 
+/* ds_linear_nobias - ds_linear 的 b=NULL 版；Transformer 的 QKV/FFN 投影
+ * 均不带 bias（RMSNorm/LayerNorm 已含可学习偏移，extra bias 冗余，
+ * 见 docs/01 §3.5）。F32 权重版路由器/专家也走这里。 */
 void ds_linear_nobias(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim) {
     ds_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
@@ -737,9 +908,12 @@ typedef struct {
     size_t n;
 } ds_bf16_conv_task_t;
 
+/* ds_bf16_conv_worker - BF16→F32 转换的线程体：按 tid 切连续区间，写互不相交
+ * 【核心一行】dst[i] = src[i] << 16 —— BF16 位模式就是 F32 的高 16 位，
+ *   左移补零即得精确 F32（无舍入、无查表，1 条移位指令完成"转换"）。 */
 static void ds_bf16_conv_worker(int tid, int n_threads, void *arg) {
     ds_bf16_conv_task_t *t = (ds_bf16_conv_task_t *)arg;
-    size_t chunk = (t->n + n_threads - 1) / n_threads;
+    size_t chunk = (t->n + n_threads - 1) / n_threads;   // 每线程均分，向上取整
     size_t start = (size_t)tid * chunk;
     size_t end = start + chunk;
     if (end > t->n) end = t->n;
@@ -747,6 +921,9 @@ static void ds_bf16_conv_worker(int tid, int n_threads, void *arg) {
         t->dst[i] = ((uint32_t)t->src[i]) << 16;
 }
 
+/* ds_bf16_to_f32_buf - BF16→F32 缓冲转换的统一入口（大缓冲并行、小缓冲串行）
+ * 【为什么 64K 阈值】65536 元素 = 256KB，此时转换耗时（内存带宽受限）才
+ *   值得付一次 barrier 的同步开销；小转换进线程池反而被调度拖慢。 */
 static void ds_bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     uint32_t *d = (uint32_t *)(void *)dst;
     if (n >= (size_t)1 << 16) {
@@ -758,10 +935,16 @@ static void ds_bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
         d[i] = ((uint32_t)src[i]) << 16;
 }
 
-/* Reusable scratch buffer for bf16->f32 conversion */
+/* Reusable scratch buffer for bf16->f32 conversion
+ * 进程级单例暂存区：cap 只增不减（几何扩容），prefill 每层反复转换
+ * 同一批权重时避免反复 malloc/free MB 级缓冲。
+ * 注意：无锁单例，依赖调用方串行使用（当前调用点均在单线程 prefill /
+ * DS_USE_F32_EXPERTS 实验路径）。 */
 static float *ds_bf16_scratch = NULL;
 static size_t ds_bf16_scratch_cap = 0;
 
+/* ds_bf16_get_scratch - 取能容纳 n 个 F32 的暂存区；不足时换更大的，
+ * malloc 失败返回 NULL（调用方需回退到非转换路径）。 */
 static float *ds_bf16_get_scratch(size_t n) {
     if (n > ds_bf16_scratch_cap) {
         free(ds_bf16_scratch);
@@ -784,6 +967,9 @@ static size_t bf16_cache_bytes = 0;
 static size_t bf16_cache_limit_bytes = 0;
 static int bf16_cache_limit_init = 0;
 
+/* bf16_cache_init_limit - 读取 DS_BF16_CACHE_MB 环境变量，设定 F32 缓存字节上限
+ * 【策略】默认 0 = 关闭（省内存优先）；显式设 DS_BF16_CACHE_MB=<n> 后，
+ *   缓存至多 n MB 的"已转换 F32 权重视图"。惰性执行一次。 */
 static void bf16_cache_init_limit(void) {
     if (bf16_cache_limit_init) return;
     bf16_cache_limit_init = 1;
@@ -803,6 +989,13 @@ static void bf16_cache_init_limit(void) {
     }
 }
 
+/* ds_bf16_get_cached_f32 - BF16 权重的 F32 副本缓存（命中免重复转换）
+ * 【命中策略】以 (src 指针, n) 二元组线性查找——mmap 权重地址在进程生命周期
+ *   内稳定，指针等值即同一张量，无需哈希。
+ * 【淘汰策略】没有淘汰：总字节超限即拒绝新条目（返回 NULL，调用方走 scratch
+ *   或 matvec 路径）。权重访问是周期性的（12 层轮流），全量缓存价值有限，
+ *   简单"满了就不存"避免 LRU 的簿记开销。
+ * 【线程安全】同 scratch：无锁，依赖串行调用路径。 */
 static const float *ds_bf16_get_cached_f32(const uint16_t *src, size_t n) {
     bf16_cache_init_limit();
 
@@ -842,6 +1035,10 @@ static const float *ds_bf16_get_cached_f32(const uint16_t *src, size_t n) {
     return dst;
 }
 
+/* ds_bf16_get_f32_view - 返回 BF16 权重的可读 F32 视图：缓存命中 → 缓存；
+ * 未命中/未启用 → 一次性转入 scratch 返回（下次调用会覆盖）。
+ * 【为什么需要 F32 视图】sgemm 只吃 F32：prefill（seq_len>1）时先把权重
+ *   转成 F32 再进 cblas_sgemm，转换成本被多行输出摊薄（docs/05 §3）。 */
 static const float *ds_bf16_get_f32_view(const uint16_t *src, size_t n) {
     const float *cached = ds_bf16_get_cached_f32(src, n);
     if (cached) return cached;
@@ -853,7 +1050,13 @@ static const float *ds_bf16_get_f32_view(const uint16_t *src, size_t n) {
 }
 
 /* Expert forward using F32 weights + BLAS sgemm (high precision, slower).
- * Used for prefill when DS_USE_F32_EXPERTS is set. */
+ * Used for prefill when DS_USE_F32_EXPERTS is set.
+ * ds_expert_forward_f32 - 专家前向的 F32/sgemm 实验路径（DS_USE_F32_EXPERTS 启用）
+ * 【差异】三个权重经 ds_bf16_get_f32_view 转 F32 后走 ds_linear_nobias（BLAS
+ *   sgemm），数值与 matvec 路径的舍入序列不同（各输出行独立全精度累加）；
+ *   任一视图取不到（缓存关闭且 scratch 不足）则整体回退 ds_expert_forward。
+ * 【为什么单 token 不用】decode 的 matvec 是带宽受限，转 F32 反而多一倍
+ *   读流量；仅 prefill 的批量 sgemm 能赚回转换成本（见 ds_linear_nobias_bf16）。 */
 void ds_expert_forward_f32(float *out, const float *x,
                             const uint16_t *gate_bf16, const uint16_t *up_bf16,
                             const uint16_t *down_bf16,
@@ -881,13 +1084,24 @@ void ds_expert_forward_f32(float *out, const float *x,
  * Fused BF16 matvec: y[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim] + bias
  * Processes 2 output rows at a time to amortize x vector loads.
  */
+/*
+ * Fused BF16 matvec: y[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim] + bias
+ * Processes 2 output rows at a time to amortize x vector loads.
+ * bf16_matvec_fused - BF16 matvec 的统一入口：经函数指针跳到运行时选定的
+ * 平台内核（bfdot / vshll+vfma / AVX / generic，见 ds_kernels_impl.h）。
+ * 【为什么融合】BF16→F32 在线转换 + 点积 + bias 一趟完成，权重保持 BF16
+ *   流式读取——decode 的 matvec 是内存带宽受限（算术强度≈1 FLOP/B），
+ *   省下的就是赚到的（docs/03 §4.4、docs/09 §1）。
+ * 【首次调用】经 ds_dispatch_ensure_init 惰性完成 CPU 能力探测。 */
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
     ds_dispatch_ensure_init();
     ds_bf16_matvec_fused_impl_ptr(y, x, W_bf16, bias, in_dim, out_dim);
 }
 
-/* Threaded matvec: split output rows across threads */
+/* Threaded matvec: split output rows across threads
+ * 按【输出行】切分是多线程 matvec 的标准姿势：每线程处理一段连续行
+ * （W 偏移 + 行数），x 向量只读、天然共享，无任何写冲突。 */
 typedef struct {
     float *y;
     const float *x;
@@ -897,6 +1111,8 @@ typedef struct {
     int out_dim;
 } ds_matvec_task_t;
 
+/* ds_matvec_worker - matvec 线程体：tid 号线程算输出行 [start, end)，
+ * 权重指针偏移 start*in_dim 对齐到自己的首行，bias 同步偏移 */
 static void ds_matvec_worker(int tid, int n_threads, void *arg) {
     ds_matvec_task_t *t = (ds_matvec_task_t *)arg;
     int chunk = (t->out_dim + n_threads - 1) / n_threads;
@@ -911,6 +1127,8 @@ static void ds_matvec_worker(int tid, int n_threads, void *arg) {
                       t->in_dim, end - start);
 }
 
+/* ds_bf16_matvec_threaded - 单/多线程 matvec 分派：n_threads≤1 直接调内核，
+ * 否则把 out_dim 行按线程均分进并行区（decode 每步十几次 matvec 共用此入口） */
 static void ds_bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf16,
                                   const float *bias, int in_dim, int out_dim) {
     if (tp.n_threads <= 1) {
@@ -934,12 +1152,15 @@ typedef struct {
     int in_dim;
 } ds_grouped_matvec_task_t;
 
+/* ds_grouped_matvec_worker - grouped matvec 线程体：把 n_units×rows_per_unit
+ * 的总行数折叠成"行对序列"后按 tid 均分；跨 unit 边界的线程块被 while 循环
+ * 拆成逐 unit 的子调用（每次调用保证 unit 内行对连续、输出指针正确偏移） */
 static void ds_grouped_matvec_worker(int tid, int n_threads, void *arg) {
     ds_grouped_matvec_task_t *t = (ds_grouped_matvec_task_t *)arg;
     int pairs_per_unit = t->rows_per_unit / 2;
     int total_pairs = t->n_units * pairs_per_unit;
     int chunk = (total_pairs + n_threads - 1) / n_threads;
-    int p = tid * chunk;
+    int p = tid * chunk;                 // 本线程的起始行对（全局行对编号）
     int p_end = p + chunk;
     if (p_end > total_pairs) p_end = total_pairs;
 
@@ -957,6 +1178,9 @@ static void ds_grouped_matvec_worker(int tid, int n_threads, void *arg) {
 
 void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *const *W,
                              int n_units, int rows_per_unit, int in_dim) {
+    /* 实现 = 一个并行区跑完所有单元（契约见 ds_kernels.h 顶部长注释）：
+     * 旧实现每专家独立 matvec → 每层 ~19 个微并行区，barrier 开销淹没矩阵
+     * 本身；合并后 barrier 次数 O(1)，且行对粒度保证与串行版逐位一致 */
     ds_grouped_matvec_task_t task = { out, X, W, n_units, rows_per_unit, in_dim };
     ds_parallel_for(ds_grouped_matvec_worker, &task);
 }
@@ -975,6 +1199,11 @@ typedef struct {
     int total_dim;
 } qkv_ds_matvec_task_t;
 
+/* qkv_ds_matvec_worker - QKV 融合 matvec 线程体
+ * 【分片方式】把 q_dim + 2*kv_dim 三段输出折叠成一个 [0, total_dim) 全局行号
+ *   空间按 tid 均分，再由每线程把 [start,end) 拆解为落在 Q/K/V 三块权重里的
+ *   子区间——一个并行区同时喂三张权重表，barrier 从 3 次降到 1 次；
+ *   三块写缓冲（q/k/v）互不相交，无写冲突。 */
 static void qkv_ds_matvec_worker(int tid, int n_threads, void *arg) {
     qkv_ds_matvec_task_t *t = (qkv_ds_matvec_task_t *)arg;
     int chunk = (t->total_dim + n_threads - 1) / n_threads;
@@ -1020,6 +1249,12 @@ static void qkv_ds_matvec_worker(int tid, int n_threads, void *arg) {
     }
 }
 
+/* ds_linear_nobias_bf16_qkv - Q/K/V 三投影融合 matvec（decode 单 token 快路径）
+ * 【算法】q = Wq@x、k = Wk@x、v = Wv@x（各 [in_dim]→[q_dim]/[kv_dim]，无 bias）；
+ *   本模型 in_dim=1280、q_dim=1280（10 头×128）、kv_dim=1280（MHA）。
+ * 【为什么融合派发】x[1280] 在三次 matvec 间常驻 L1，且 3 次并行区合并为
+ *   1 次（省 2 个 barrier）；多线程时行号空间折叠见 qkv_ds_matvec_worker。
+ * 【参考】docs/01 §5.5（QKV 投影与 kernel fusion）。 */
 void ds_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wq_bf16,
                                  const uint16_t *Wk_bf16,
@@ -1048,6 +1283,17 @@ void ds_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
     ds_parallel_for(qkv_ds_matvec_worker, &task);
 }
 
+/* ds_linear_nobias_bf16 - BF16 权重线性层 y = x @ Wᵀ 的统一入口（按 seq_len 分派）
+ * 【契约】y[seq_len,out_dim]、x[seq_len,in_dim]、W_bf16[out_dim,in_dim] 行主序。
+ * 【两条路径】
+ *   seq_len==1（decode）：NEON/AVX BF16 matvec 流式点积。单 token 时这是
+ *     内存带宽问题——权重读一次用一次，先转 F32 再 sgemm 要多付出"写出+读回"
+ *     两倍流量，反而更慢。
+ *   seq_len>1（prefill）：先转 F32（并行，见 ds_bf16_get_f32_view），再进
+ *     cblas_sgemm。多 token 时算术强度上升为吞吐问题，sgemm 的寄存器分块
+ *     远胜逐 token matvec（实测 prefill 30s→0.93s，docs/05 §3）。
+ * 【参数】y/x 见契约；W_bf16 指向 mmap 的 BF16 权重（零拷贝）。
+ * 【参考】docs/03 §3.3、§6（Prefill vs Decode）；docs/05 §3。 */
 void ds_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
     /* BF16 权重线性层 y = x @ Wᵀ 的统一入口，按 seq_len 分派：
@@ -1068,6 +1314,8 @@ void ds_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
     ds_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
+/* ds_linear_bf16 - ds_linear 的 BF16 权重版（y = x@Wᵀ + b，b 可 NULL）：
+ * 分派逻辑与 ds_linear_nobias_bf16 相同，仅 decode 路径多传一个 bias 指针 */
 void ds_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                       const float *b, int seq_len, int in_dim, int out_dim) {
     if (seq_len == 1) {
@@ -1080,14 +1328,19 @@ void ds_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
     ds_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
 }
 
-/* Public wrapper: compute logits = W_bf16 @ x + bias (single token, full output vector) */
+/* Public wrapper: compute logits = W_bf16 @ x + bias (single token, full output vector)
+ * ds_bf16_matvec_pub - 对外暴露的完整 matvec（物化全部 out_dim 个输出）。
+ * 与 ds_argmax_matvec_bf16 的区别：后者只回传 argmax 不物化 logits；
+ * 需要完整 logits（重复惩罚/n-gram 阻断/温度采样）时用本函数。
+ * decode 的 LM head 调用点在 ds_moe_decoder.c（lm_head 或 tied embeddings）。 */
 void ds_bf16_matvec_pub(float *y, const float *x, const uint16_t *W_bf16,
                          const float *b, int in_dim, int out_dim) {
     ds_bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
 }
 
 /* Find argmax over a range of output rows [start, end).
- * Uses 2-row processing to amortize x vector loads (same as bf16_matvec_fused). */
+ * Uses 2-row processing to amortize x vector loads (same as bf16_matvec_fused).
+ * argmax_bf16_range - 行区间流式 argmax 入口（转平台内核，区间接口供线程分块） */
 static void argmax_bf16_range(const float *x, const uint16_t *W_bf16,
                                int in_dim, int start, int end,
                                int *best_out, float *best_val_out) {
@@ -1104,6 +1357,9 @@ typedef struct {
     float best_val[DS_MAX_THREADS];
 } ds_argmax_task_t;
 
+/* ds_argmax_worker - argmax 线程体：把 out_dim 行按 tid 均分，各自扫出区间内
+ * 最大值写入 best_idx/best_val[tid]，主线程归约（见
+ * ds_argmax_matvec_bf16_excluding）。区间空时填 (0, -1e30f) 保证归约正确 */
 static void ds_argmax_worker(int tid, int n_threads, void *arg) {
     ds_argmax_task_t *t = (ds_argmax_task_t *)arg;
     int chunk = (t->out_dim + n_threads - 1) / n_threads;
@@ -1119,7 +1375,15 @@ static void ds_argmax_worker(int tid, int n_threads, void *arg) {
                       &t->best_idx[tid], &t->best_val[tid]);
 }
 
-/* Compute single-row BF16 dot product: logit = W_bf16[tok_id * in_dim ..] · x */
+/* ds_bf16_dot_row - 计算单个 token 行的点积 logit = W[tok_id]·x（选择性 logit）
+ * 【算法】定点取出 lm_head 的第 tok_id 行做 BF16×F32 点积；
+ *   NEON 路径：vshll_n_u16 把 4 个 BF16 左移加宽成 F32 位模式（精确转换），
+ *   vfmaq_f32 乘加，双累加器 acc0/acc1 打破 FMA 依赖链；行尾标量收尾。
+ * 【为什么存在】Selective Repetition Penalty（docs/05 §4.2）只需重算历史中
+ *   出现过的 ~100 个 token 的 logit（vs 全词表 129280 个），每步省一次
+ *   全量 LM head 扫描。
+ * 【参数】x[in_dim]；W_bf16[out_dim,in_dim]；tok_id 为行号（token ID）。
+ * 【参考】docs/05 §4.2；HF 语义: logits[tid]。 */
 float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
                       int in_dim, int tok_id) {
     const uint16_t *w_row = W_bf16 + (size_t)tok_id * in_dim;
@@ -1128,6 +1392,8 @@ float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
     float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
     int k = 0;
     for (; k + 8 <= in_dim; k += 8) {
+        // 一次载 8 个 BF16：低/高半各 4 个经 vshll 左移 16 位加宽成精确 F32，
+        // 再与 x 的对应 4 元素 FMA；两个累加器交替填 FMA 的延迟气泡
         uint16x8_t bf = vld1q_u16(w_row + k);
         acc0 = vfmaq_f32(acc0, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16)),
                          vld1q_f32(x + k));
@@ -1152,6 +1418,11 @@ float ds_bf16_dot_row(const float *x, const uint16_t *W_bf16,
     return sum;
 }
 
+/* ds_argmax_matvec_bf16 - 流式 argmax：找 argmax(W_bf16 @ x) 但【不物化 logits】
+ * 【算法】逐行点积 + 边算边比较，只留当前最大值（见 *_excluding 完整注释）。
+ * 【为什么】129280×1280 的 lm_head ≈ 331MB BF16，贪心解码只需要 argmax；
+ *   物化 logits 还要额外 129280×4B 缓冲与一遍写读（docs/03 §3.4、docs/05 §4.1，
+ *   v0.5→v0.9 单步 ~63ms→8ms 的主要来源）。 */
 int ds_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                              int in_dim, int out_dim) {
     return ds_argmax_matvec_bf16_excluding(x, W_bf16, in_dim, out_dim, NULL, 0);
@@ -1175,9 +1446,12 @@ static int ds_argmax_rescan_excluding(const float *x, const uint16_t *W_bf16,
                                       int in_dim, int out_dim,
                                       const int *exclude_ids, int n_exclude) {
     int ex[64];
-    int n = n_exclude < 64 ? n_exclude : 64;
+    int n = n_exclude < 64 ? n_exclude : 64;   // 禁用表极小（n-gram/EOS ban），截断保安全
     for (int i = 0; i < n; i++) ex[i] = exclude_ids[i];
-    /* Insertion sort + dedupe (n is tiny) */
+    /* Insertion sort + dedupe (n is tiny)
+     * 排序去重是为了把禁用 ID 转成一组"要跳过的行号区间"，从而把词表切成
+     * 若干连续段逐段调用快速 range 内核——每段的行内累加顺序与全量扫描
+     * 完全一致，保证拿到的是真正的次优 token（见函数头注释） */
     for (int i = 1; i < n; i++) {
         int v = ex[i], j = i - 1;
         while (j >= 0 && ex[j] > v) { ex[j + 1] = ex[j]; j--; }
@@ -1189,12 +1463,13 @@ static int ds_argmax_rescan_excluding(const float *x, const uint16_t *W_bf16,
 
     int best = -1;
     float best_val = -1e30f;
-    int start = 0;
+    int start = 0;                       // 当前尚未扫描段的左端
     for (int k = 0; k < m; k++) {
         int e = ex[k];
         if (e < start) continue;         /* duplicate or unsorted leftover */
         if (e > out_dim - 1) break;      /* beyond vocab */
         if (e > start) {
+            // 扫 [start, e)：禁用行 e 之前的连续段；e 本身被跳过（不参与比较）
             int chunk_best;
             float chunk_val;
             argmax_bf16_range(x, W_bf16, in_dim, start, e, &chunk_best, &chunk_val);
@@ -1213,7 +1488,16 @@ static int ds_argmax_rescan_excluding(const float *x, const uint16_t *W_bf16,
 
 /* Argmax with token ID exclusion list (n-gram blocking, EOS warmup ban).
  * The common case (winner not excluded) costs one streaming argmax; when
- * the winner IS excluded we rescan exactly around the excluded rows. */
+ * the winner IS excluded we rescan exactly around the excluded rows.
+ * ds_argmax_matvec_bf16_excluding - 带禁用表的流式 argmax（V3 det 标签抑制等）
+ * 【算法】① 全词表流式 argmax（多线程分块归约或单线程直扫）；
+ *   ② 冠军若不在禁用表 → 直接返回（零额外成本，绝大多数步）；
+ *   ③ 否则 ds_argmax_rescan_excluding 精确重扫。
+ * 【参数】exclude_ids[n_exclude] 禁用的 token ID（可为 NULL）；n_exclude=0 等价
+ *   于普通 argmax。
+ * 【为什么"重扫"而非"跳过"】早年的分线程/分块回退方案在"本线程最大值被禁"
+ *   时会丢失该线程的次优解，可能返回排名更低的 token；按禁用行切段重扫
+ *   保证数学上的真 argmax，代价只是禁用命中的极少数步多 ~8ms 全表扫描。 */
 int ds_argmax_matvec_bf16_excluding(const float *x, const uint16_t *W_bf16,
                                        int in_dim, int out_dim,
                                        const int *exclude_ids, int n_exclude) {
@@ -1245,6 +1529,9 @@ int ds_argmax_matvec_bf16_excluding(const float *x, const uint16_t *W_bf16,
     return best;
 }
 
+/* ds_matmul_t_bf16 - ds_matmul_t 的 BF16 权重版：C = A @ B_bf16ᵀ
+ * M==1 时退化为 matvec（走 fused 内核，不物化 F32 副本）；
+ * M>1 时转 F32 视图后进 sgemm（与 ds_linear_nobias_bf16 同一取舍） */
 void ds_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N) {
     if (M == 1) {
@@ -1261,6 +1548,8 @@ void ds_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
  * BF16 → F32 Weight Conversion
  * ======================================================================== */
 
+/* ds_bf16_to_f32_alloc - 一次性把 n 个 BF16 精确展开为 F32（malloc，调用方 free）
+ * 转换即位模式左移 16 位，无舍入；用于编码器等需要整块 F32 权重的场景 */
 float *ds_bf16_to_f32_alloc(const uint16_t *src, size_t n) {
     float *dst = (float *)malloc(n * sizeof(float));
     if (!dst) return NULL;
@@ -1268,6 +1557,8 @@ float *ds_bf16_to_f32_alloc(const uint16_t *src, size_t n) {
     return dst;
 }
 
+/* ds_bf16_to_f32_convert - 对外转换入口：转发到 ds_bf16_to_f32_buf
+ * （内部按 64K 元素阈值决定是否并行），调用方自备 dst 容量 ≥ 4n 字节 */
 void ds_bf16_to_f32_convert(float *dst, const uint16_t *src, size_t n) {
     /* Route through the shared converter — parallel for large buffers */
     ds_bf16_to_f32_buf(dst, src, n);
@@ -1288,6 +1579,8 @@ void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n) {
 void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n) {
     ds_bf16_to_f32_convert(dst, src, n);
 }
+/* ds_f32_to_bf16_batch 的标量回退：u+0x8000 进位实现"就近舍入"（tie 向绝对值
+ * 增大方向），再右移 16 位取回高半——与 NEON vaddq/vandq 路径逐位一致 */
 void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n) {
     for (size_t i = 0; i < n; i++) {
         uint32_t u;
@@ -1330,6 +1623,10 @@ void ds_f32_matvec_sgemm(float *y, const float *x, const float *W_f32,
  * im2col: Unroll input patches into a column matrix for GEMM-based conv2d.
  * Input: [C_in, H_in, W_in]
  * Output columns: [C_in * kH * kW, H_out * W_out]
+ *
+ * 把每个输出位置对应的 kH×kW 感受野展平成 cols 的一列：列号 (ic,ki,kj) →
+ * 行 col_row，列内按输出位置 (oh,ow) 排布；padding 越界处补 0（与卷积的
+ * 零填充语义一致）。展开后卷积就是一次普通 sgemm（见 ds_conv2d）。
  */
 static void im2col(const float *in, float *cols,
                    int c_in, int h_in, int w_in,
@@ -1357,6 +1654,14 @@ static void im2col(const float *in, float *cols,
     }
 }
 
+/* ds_conv2d - 标准 2D 卷积（im2col + sgemm 实现，SAM patch embed / neck 压缩用）
+ * 【算法/数学】out[c_out, H_out, W_out] = Σ_c,k w[c_out,c,kh,kw]·in[c,ih,iw]，
+ *   H_out=(H_in+2p-kh)/s+1（同 W_out）；im2col 展开后等价于
+ *   weight[c_out, C_in·kh·kw] @ cols[C_in·kh·kw, H_out·W_out] → 一次 sgemm。
+ * 【为什么 im2col】把卷积降维成 GEMM 就能复用 BLAS 的极致优化，代价是
+ *   patch_size×spatial_out 的中间缓冲（stride>1 时远小于输入本身）。
+ * 【布局】in/out 均为 [C, H, W] 通道优先；bias 加在输出通道维。
+ * 【参考】PyTorch: nn.Conv2d(..., bias)；docs/06-视觉编码器篇。 */
 void ds_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int c_in, int c_out, int h_in, int w_in,
                  int kh, int kw, int stride, int padding) {
@@ -1420,6 +1725,13 @@ void ds_conv2d(float *out, const float *in, const float *weight, const float *bi
  * Normalization
  * ======================================================================== */
 
+/* ds_layer_norm - 标准 LayerNorm（SAM ViT / qwen-asr 编码器使用）
+ * 【算法/数学】out = (x-μ)/sqrt(σ²+ε)·γ + β；每行两遍扫描（先 μ 再 σ²），
+ *   AVX-512/AVX2 路径用 FMA 加速方差累加；ε 防止除零（调用方传 1e-5 等量级）。
+ * 【参数】out/x: [seq_len, hidden]；weight=γ、bias=β 各 [hidden]（逐维仿射）。
+ * 【与 RMSNorm 的区别】LayerNorm 减均值 + 加 β，RMSNorm 两者都省
+ *   （见 ds_rms_norm 顶部理论块）；解码器用 RMSNorm，编码器用 LayerNorm。
+ * 【参考】docs/01 §8.2；PyTorch: nn.LayerNorm(hidden, eps)。 */
 void ds_layer_norm(float *out, const float *x, const float *weight, const float *bias,
                      int seq_len, int hidden, float eps) {
     for (int s = 0; s < seq_len; s++) {
@@ -1629,6 +1941,13 @@ void ds_rms_norm(float *out, const float *x, const float *weight,
     }
 }
 
+/* ds_rms_norm_per_head - 对 Q/K 的每个注意力头【独立】做 RMSNorm（DeepSeek-V2 的 QK-Norm）
+ * 【契约】x 为 [seq_len, n_heads*head_dim]，原地修改；weight/eps 语义同
+ *   ds_rms_norm，但均值统计范围是单个 [head_dim] 段（本模型 10 头×128 维）。
+ * 【为什么按头】注意力 logit = q·k/√d 的量级由各头自己的向量决定，逐头
+ *   归一化把每个头的 logit 拉回稳定区间、抑制注意力熵塌缩；整行归一化
+ *   做不到这一点。
+ * 【参考】docs/01 §8.5；Dehghani et al. 2023（QK-Norm）。 */
 void ds_rms_norm_per_head(float *x, const float *weight,
                              int seq_len, int n_heads, int head_dim, float eps) {
     /* x is [seq, n_heads * head_dim] - normalize each [head_dim] segment
@@ -1807,6 +2126,9 @@ void ds_vec_add(float *dst, const float *a, const float *b, int n) {
  * Activation Functions
  * ======================================================================== */
 
+/* ds_silu - SiLU/Swish 激活（原地）：x·σ(x) = x/(1+e^-x)
+ * SwiGLU 的门控非线性；零点附近平滑、负半轴软抑制（区别于 ReLU 硬截断）。
+ * 【参考】docs/01 §7.3；PyTorch: nn.SiLU()。 */
 void ds_silu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float val = x[i];
@@ -1814,6 +2136,7 @@ void ds_silu(float *x, int n) {
     }
 }
 
+/* ds_gelu - 精确 GELU 激活（原地），SAM ViT / qwen-asr 编码器 FFN 使用 */
 void ds_gelu(float *x, int n) {
     /* Exact GELU using erf: 0.5 * x * (1 + erf(x / sqrt(2)))
      * Matches PyTorch nn.GELU(approximate='none') */
@@ -1832,6 +2155,10 @@ typedef struct {
     int intermediate;
 } ds_swiglu_task_t;
 
+/* ds_swiglu_worker - 交错布局 SwiGLU 线程体：按 token 切区间（每 token 的
+ * 2*inter 输入互不重叠）；alias_inplace=1 表示 out 与 gate_up 是同一缓冲
+ * （decode 路径省一次分配），此时必须逐元素就地覆盖、不能走先整行写 -g
+ * 再 vvexpf 的两遍式（会破坏尚未读取的输入） */
 static void ds_swiglu_worker(int tid, int n_threads, void *arg) {
     ds_swiglu_task_t *t = (ds_swiglu_task_t *)arg;
     int chunk = (t->seq_len + n_threads - 1) / n_threads;
@@ -1876,6 +2203,13 @@ static void ds_swiglu_worker(int tid, int n_threads, void *arg) {
     }
 }
 
+/* ds_swiglu_multiply - SwiGLU（交错布局版）：输入 [seq, 2*inter] 按
+ * [g0,u0,g1,u1,...] 排列（qwen-asr 风格 gate_up_fused 权重的输出布局），
+ * 输出 out[s,i] = SiLU(gu[2i])·gu[2i+1]
+ * 【并行条件】seq≥2 且 inter≥256 才进线程池——decode 单 token 时任务太小，
+ *   barrier 开销不划算（与 ds_swiglu_direct 同一阈值）。
+ * 【新代码建议】分离布局请用 ds_swiglu_direct（顺序读写，cache 更友好）。
+ * 【参考】docs/01 §7.3（SwiGLU 数学与 kernel fusion）。 */
 void ds_swiglu_multiply(float *out, const float *gate_up, int seq_len, int intermediate) {
     ds_swiglu_task_t task = {
         .out = out,
@@ -1959,16 +2293,22 @@ void ds_swiglu_direct(float *out, const float *gate_buf, const float *up_buf,
     }
 }
 
+/* ds_softmax - 逐行 softmax（原地）：p_i = e^(x_i-max)/Σ e^(x_j-max)
+ * 【为什么减 max】e^x 上溢极快（x>88 即 Inf）；减去行最大值后指数参数
+ * ≤0，结果落在 (0,1]，且分子分母同乘 e^-max 相互约掉、分布不变。
+ * 【参数】x[rows, cols] 行主序；MoE 路由 64 列、编码器分类头等小规模场景
+ * 使用；注意力的大行 softmax 内联在各 attention 内核里（online softmax）。
+ * 【参考】docs/01 §5.2；PyTorch: torch.softmax(dim=-1)。 */
 void ds_softmax(float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         float *row = x + r * cols;
-        float max_val = row[0];
+        float max_val = row[0];   // 第一遍：行最大值（防 exp 上溢的锚点）
         for (int c = 1; c < cols; c++) {
             if (row[c] > max_val) max_val = row[c];
         }
         float sum = 0.0f;
         for (int c = 0; c < cols; c++) {
-            row[c] = expf(row[c] - max_val);
+            row[c] = expf(row[c] - max_val);   // 就地覆写为分子 e^(x-max)，同时累加分母
             sum += row[c];
         }
         float inv_sum = 1.0f / sum;
@@ -1982,25 +2322,39 @@ void ds_softmax(float *x, int rows, int cols) {
  * Attention Operations
  * ======================================================================== */
 
+/* ds_dot_f32 - F32 点积包装：转发到编译期选定的平台实现（NEON/AVX/generic，
+ * 见 ds_kernels_impl.h 的宏分发），注意力 QK 打分等高频小向量运算用 */
 static inline float ds_dot_f32(const float *a, const float *b, int n) {
     return ds_dot_f32_impl(a, b, n);
 }
 
-/* dst = dst * scale */
+/* dst = dst * scale
+ * ds_vec_scale_inplace - 原地缩放；注意力 online softmax 收尾时乘 1/Σexp */
 static inline void ds_vec_scale_inplace(float *dst, float scale, int n) {
     ds_vec_scale_inplace_impl(dst, scale, n);
 }
 
-/* dst += alpha * src */
+/* dst += alpha * src
+ * ds_vec_axpy_inplace - 原地 axpy；online softmax 常规分支累加 wt·V 行 */
 static inline void ds_vec_axpy_inplace(float *dst, const float *src, float alpha, int n) {
     ds_vec_axpy_inplace_impl(dst, src, alpha, n);
 }
 
-/* dst = dst * correction + src */
+/* dst = dst * correction + src
+ * ds_vec_scale_add - 融合"重缩放旧和 + 并入新 V 行"：online softmax 换最大值
+ * 时一次遍历完成 o = o·e^(m_old-m_new) + v_new（省一趟单独的 scale 扫描） */
 static inline void ds_vec_scale_add(float *dst, const float *src, float correction, int n) {
     ds_vec_scale_add_impl(dst, src, correction, n);
 }
 
+/* ds_bidirectional_attention - 双向注意力（编码器：每个 token 看所有 token）
+ * 【算法/数学】head_h、行 i：score_j = (Q_i·K_j)·scale ∈ [0,seq)，
+ *   out_i = Σ_j softmax(score)_j · V_j（全序列归一化，无掩码）。
+ *   online softmax：单遍扫描同时维护 max/Σ/输出累加器，O(1) 额外内存
+ *   （不物化 [seq,seq] 注意力矩阵）。
+ * 【参数】Q/K/V: [seq, n_heads*head_dim] 行主序，Q/K/V 同长（无 GQA）；
+ *   scale=1/sqrt(head_dim) 由调用方传入。
+ * 【参考】docs/01 §9.1；SAM/DeepEncoder 的标准编码路径。 */
 void ds_bidirectional_attention(float *out, const float *Q, const float *K,
                                    const float *V, int seq,
                                    int n_heads, int head_dim, float scale) {
@@ -2042,6 +2396,13 @@ void ds_bidirectional_attention(float *out, const float *Q, const float *K,
     }
 }
 
+/* ds_causal_attention_heads - 因果注意力核心（支持 GQA），head 区间 [head_start, head_end)
+ * 【算法/数学】行 i（全局位置 global_pos=q_offset+i）只看 K/V 的 [0, min(global_pos, seq_k))：
+ *   k_end=global_pos+1 即因果掩码（未来的 token 不存在/不许看）。
+ *   GQA 映射：kv_h = h / heads_per_kv——每 heads_per_kv 个 Q 头共享一个 KV 头
+ *   （本工程 V2 编码器 14 Q 头/2 KV 头 → heads_per_kv=7）。
+ * 【q_offset】prefill 时 = 已缓存的序列前缀长度；decode 单 token 时 = 当前位置。
+ * 【参考】docs/01 §9.2（因果掩码）、§6.3（GQA）。 */
 static void ds_causal_attention_heads(float *out, const float *Q, const float *K,
                                         const float *V, int seq_q, int seq_k,
                                         int n_heads, int n_kv_heads, int head_dim,
@@ -2103,6 +2464,9 @@ typedef struct {
     int q_offset;
 } ds_causal_attn_task_t;
 
+/* ds_causal_attn_worker - 因果注意力线程体：按 head 切分（每 head 的整行
+ * 计算互不依赖，写区间互不相交）；按 head 而非按行切，保证每个 (head,行)
+ * 的在线 softmax 序列与串行版一致（逐位可复现） */
 static void ds_causal_attn_worker(int tid, int n_threads, void *arg) {
     ds_causal_attn_task_t *t = (ds_causal_attn_task_t *)arg;
     int chunk = (t->n_heads + n_threads - 1) / n_threads;
@@ -2125,6 +2489,9 @@ typedef struct {
     int n_heads; int head_dim; float scale; int k_end;
 } ds_dec_attn_task_t;
 
+/* ds_dec_attn_worker - 融合 decode 注意力线程体（seq_q=1、标准 MHA）：
+ * 每 head 独立扫描 k_end 个缓存 K/V 行做在线 softmax；K/V 行距 = 整个
+ * hidden（同一 head 的数据跨行等距，点积/累加都命中固定列带） */
 static void ds_dec_attn_worker(int tid, int nt, void *arg) {
     ds_dec_attn_task_t *t = (ds_dec_attn_task_t *)arg;
     int chunk = (t->n_heads + nt - 1) / nt;
@@ -2156,6 +2523,15 @@ static void ds_dec_attn_worker(int tid, int nt, void *arg) {
     }
 }
 
+/* ds_causal_attention - 因果注意力统一入口（decode 快路径 + GQA 通用路径）
+ * 【契约】Q: [seq_q, n_heads*head_dim]；K/V: [seq_k, n_kv_heads*head_dim]，
+ *   行距 = kv_hidden（非 aligned 版本）；q_offset 为首 query 的全局位置。
+ * 【路径选择】
+ *   seq_q==1 且 n_heads==n_kv_heads（标准 MHA decode，最常见）→ 融合快路径：
+ *     每 head 单遍扫完 QK→在线 softmax→VO，中间结果全在寄存器/累加器，
+ *     不写出注意力分数；≥2 线程时按 head 并行。
+ *   其余（prefill 批量 / GQA）→ ds_causal_attention_heads（可按 head 并行）。
+ * 【参考】docs/03 §6.3（decode 注意力）；docs/01 §5、§6.3。 */
 void ds_causal_attention(float *out, const float *Q, const float *K, const float *V,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset) {
@@ -2163,6 +2539,8 @@ void ds_causal_attention(float *out, const float *Q, const float *K, const float
      * Fused QK+softmax+VO in one pass per head, avoiding intermediate writes.
      * This is the most common decode pattern: seq_q=1, n_kv_heads=n_heads. */
     if (seq_q == 1 && n_heads == n_kv_heads && n_heads >= 2) {
+        /* 因果边界：全局位置 q_offset 的 query 只看前 q_offset+1 个 K/V，
+         * 超出 seq_k 截断（防御） */
         int k_end = q_offset + 1;
         if (k_end > seq_k) k_end = seq_k;
 
@@ -2229,6 +2607,10 @@ void ds_causal_attention(float *out, const float *Q, const float *K, const float
  * F32 KV cache layout where kv_stride ≥ kv_dim.
  * ======================================================================== */
 
+/* ds_causal_attention_heads_aligned - 因果注意力（aligned KV 缓存版），head 区间 [head_start, head_end)
+ * 与 ds_causal_attention_heads 唯一的区别：K/V 行距用 kv_stride（≥ kv_dim，
+ * 由缓存分配方对齐到 cache line），换取跨行访问的可预测地址模式；
+ * 因果掩码/GQA 映射/在线 softmax 与非 aligned 版逐行相同 */
 static void ds_causal_attention_heads_aligned(float *out, const float *Q,
                                                 const float *K, const float *V,
                                                 int seq_q, int seq_k,
@@ -2292,6 +2674,8 @@ typedef struct {
     int n_heads; int head_dim; float scale; int k_end; int kv_stride;
 } ds_dec_attn_aligned_task_t;
 
+/* ds_dec_attn_aligned_worker - aligned decode 注意力线程体（kv_stride 行距 +
+ * 2 行软件预取，其余与 ds_dec_attn_worker 相同） */
 static void ds_dec_attn_aligned_worker(int tid, int nt, void *arg) {
     ds_dec_attn_aligned_task_t *t = (ds_dec_attn_aligned_task_t *)arg;
     int chunk = (t->n_heads + nt - 1) / nt;
@@ -2335,6 +2719,8 @@ typedef struct {
     int head_dim; float scale; int q_offset; int kv_stride;
 } ds_causal_attn_aligned_task_t;
 
+/* ds_causal_attn_aligned_worker - aligned 因果注意力线程体（按 head 切分，
+ * 同 ds_causal_attn_worker，多传 kv_stride） */
 static void ds_causal_attn_aligned_worker(int tid, int n_threads, void *arg) {
     ds_causal_attn_aligned_task_t *t = (ds_causal_attn_aligned_task_t *)arg;
     int chunk = (t->n_heads + n_threads - 1) / n_threads;
@@ -2349,6 +2735,12 @@ static void ds_causal_attn_aligned_worker(int tid, int n_threads, void *arg) {
                                         h0, h1);
 }
 
+/* ds_causal_attention_aligned - 因果注意力（aligned KV 缓存版统一入口）
+ * 【契约】K/V 行距为 kv_stride（而非紧凑 kv_hidden），其余参数语义同
+ *   ds_causal_attention；路径选择也一致（MHA decode 快路径 + GQA 通用路径）。
+ * 【为什么对齐行距】KV 缓存每行补齐到 cache line 边界后，行起点不再被
+ *   前一行"劈开"，预取与替换的粒度更整（见下方 __builtin_prefetch）。
+ * 【参考】docs/03 §5（KV 缓存布局）。 */
 void ds_causal_attention_aligned(float *out, const float *Q, const float *K, const float *V,
                                    int seq_q, int seq_k, int n_heads, int n_kv_heads,
                                    int head_dim, float scale, int q_offset, int kv_stride) {
@@ -2423,16 +2815,22 @@ void ds_causal_attention_aligned(float *out, const float *Q, const float *K, con
  * Reference Sliding Window Attention (R-SWA) for Unlimited-OCR
  * ======================================================================== */
 
+/* ds_dot_bf16xf32 - BF16 存储的 K 行 × F32 Q 向量的点积（BF16 KV 缓存读取路径）
+ * 【数值】BF16→F32 用 union 位模式左移 16 位精确展开（无舍入），点积顺序与
+ *   F32 存储路径一致——差异只来自"存入时"的 BF16 舍入（0.4% 量级，
+ *   r2 有界实验授权，V3 全组合回归绿后启用；V4 打红回退，docs/05 §10.5） */
 float ds_dot_bf16xf32(const uint16_t *k, const float *q, int n) {
     float s = 0.0f;
     for (int i = 0; i < n; i++) {
-        union { uint32_t u; float f; } e;
+        union { uint32_t u; float f; } e;    // 类型双关：避免未定义的指针强转别名
         e.u = (uint32_t)k[i] << 16;
         s += q[i] * e.f;
     }
     return s;
 }
 
+/* ds_axpy_bf16xf32 - o += w·(BF16 V 行展开为 F32)：R-SWA 在线 softmax 累加
+ * BF16 V 行用（数学与 F32 路径 ds_vec_axpy_inplace 一致，仅输入精度不同） */
 void ds_axpy_bf16xf32(float *o, const uint16_t *v, float w, int n) {
     for (int i = 0; i < n; i++) {
         union { uint32_t u; float f; } e;
@@ -2451,6 +2849,8 @@ typedef struct {
     int prefill_len, window_start, kv_seq_len;
 } ds_rswa_attn_task_t;
 
+/* ds_rswa_attn_worker - R-SWA 线程体：按 head 切分，每 head 顺序扫
+ * 参考段 + 滑窗段（共用同一在线 softmax 状态），bf16 标志切换 K/V 读取路径 */
 static void ds_rswa_attn_worker(int tid, int nt, void *arg) {
     ds_rswa_attn_task_t *t = (ds_rswa_attn_task_t *)arg;
     int chunk = (t->n_heads + nt - 1) / nt;
@@ -2517,6 +2917,17 @@ static void ds_rswa_attn_worker(int tid, int nt, void *arg) {
     }
 }
 
+/* ds_rswa_attention_aligned - R-SWA（Reference Sliding Window）decode 注意力，F32 KV 版
+ * 【契约】Q: [n_heads*head_dim]（seq_q=1）；K/V 缓存行距 kv_stride；
+ *   注意力只覆盖两个【不连续】KV 区间：参考段 [0, prefill_len)（视觉+prompt，
+ *   恒驻）+ 滑窗段 [window_start, kv_seq_len)（环形缓冲的近期文本），
+ *   [prefill_len, window_start) 被滑出、跳过——KV 缓存总量由此恒定
+ *   （prefill_len + W，不再随生成步数增长，docs/05 §6）。
+ * 【算法】两段共用同一组 online softmax 运行状态（max/Σ/累加器）顺序扫描：
+ *   跳段不破坏 softmax——指数权重只依赖 score-max，与扫描顺序无关。
+ *   warmup 期 window_start==prefill_len 时两段恰好连续，等价普通因果注意力。
+ * 【路径】MHA decode 快路径按 head 并行/串行；GQA 通用路径逐 head 映射 kv_h。
+ * 【参考】docs/05 §6（R-SWA）；docs/14（V4/DASH 注意力）。 */
 void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, const float *V_base,
                                 int seq_q, int n_heads, int n_kv_heads, int head_dim,
                                 float scale, int kv_stride,
@@ -2658,6 +3069,13 @@ void ds_rswa_attention_aligned(float *out, const float *Q, const float *K_base, 
     }
 }
 
+/* ds_rswa_attention_aligned_bf16 - R-SWA 的 BF16 KV 感知入口（r2 任务 2）
+ * 【契约】K/V 为 void*：bf16=1 时按 uint16 行解释（ds_dot_bf16xf32 /
+ *   ds_axpy_bf16xf32 精确展开），bf16=0 时与 F32 版完全一致；warmup
+ *   （window_start==prefill_len）下两种模式都与 F32 全量因果逐位一致。
+ * 【防御】BF16 模式仅服务 V3/V4 解码（seq_q=1 且 MHA），其他形状直接
+ *   清零输出并报错（不静默算错）。
+ * 【性能】KV 读流量减半是动机；V3 实测 decode +8%（docs/05 §10.5）。 */
 void ds_rswa_attention_aligned_bf16(float *out, const float *Q, const void *K_base, const void *V_base,
                                     int seq_q, int n_heads, int n_kv_heads, int head_dim,
                                     float scale, int kv_stride,
@@ -2685,6 +3103,15 @@ void ds_rswa_attention_aligned_bf16(float *out, const float *Q, const void *K_ba
     ds_rswa_attn_worker(0, 1, &task);
 }
 
+/* ds_sinusoidal_pe - 经典 1D 正弦位置编码（Transformer 原版公式，qwen-asr 风格）
+ * 【算法/数学】half=d_model/2 个频率按几何级数排布：
+ *   inv_timescale_d = 10000^(-d/(half-1))；row[p,d]=sin(p·f_d)、
+ *   row[p,half+d]=cos(p·f_d)。与 ds_compute_2d_position_embeddings 同族，
+ *   差别在频率分母用 (half-1) 且 sin/cos 分列前后半。
+ * 【参数】pe[n_pos, d_model] 输出；n_pos 为位置数。
+ * 【注意】本函数未在 ds_kernels.h 声明（当前无调用方），保留作参考实现；
+ *   如需使用请先补头文件声明。
+ * 【参考】docs/01 §4.2；Vaswani 2017 §3.5。 */
 void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
     int half = d_model / 2;
     float log_timescale = logf(10000.0f) / (float)(half - 1);
@@ -2700,6 +3127,18 @@ void ds_sinusoidal_pe(float *pe, int n_pos, int d_model) {
     }
 }
 
+/* ds_compute_rope_neox - 预计算 RoPE（NeoX/split-half 风格）的 cos/sin 缓存
+ * 【算法/数学】维度 d∈[0, half) 的频率 f_d = theta^(-2d/head_dim)（theta 本模型
+ *   解码器取 10000），位置 pos 的旋转角 angle = pos·f_d：
+ *     cos_out[s,d] = cos_out[s,d+half] = cos(pos·f_d)   （前后半重复）
+ *     sin_out[s,d] = sin_out[s,d+half] = sin(pos·f_d)
+ *   低维 f≈1 旋转快（区分相邻位置），高维 f≈0 旋转慢（区分远距位置）——
+ *   多尺度"时钟组"（docs/01 §4.3）。
+ * 【为什么 split-half 重复】对齐 HF LlamaAttention 的缓存布局
+ *   emb = cat(freqs, freqs)，apply 端才能用 rotate_half 公式逐位一致。
+ * 【参数】positions[seq] 各 token 的绝对位置（decode 传当前位）；theta 为
+ *   RoPE base；缓存可预计算一次复用整个推理过程。
+ * 【参考】docs/01 §4.3；Su et al. 2021 RoFormer。 */
 void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
                               int seq, int head_dim, float theta) {
     /* Split-half RoPE cos/sin cache (matches LlamaAttention used by DeepSeek-OCR-2):
@@ -2714,6 +3153,7 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
     for (int s = 0; s < seq; s++) {
         float pos = (float)positions[s];
         for (int d = 0; d < half; d++) {
+            // f_d = theta^(-2d/head_dim)：指数随维度线性衰减，形成多尺度频率
             float freq = 1.0f / powf(theta, (float)(2 * d) / (float)head_dim);
             float angle = pos * freq;
             float c = cosf(angle);
@@ -2727,6 +3167,19 @@ void ds_compute_rope_neox(float *cos_out, float *sin_out, const int *positions,
     }
 }
 
+/* ds_apply_rope_neox - 把 RoPE 旋转施加到 Q 或 K（原地）：每 head 拆成
+ * head_dim/2 个 (d, d+half) 配对做 2D 旋转
+ * 【算法/数学】split-half 公式（等价于逐对平面旋转）：
+ *     out[d]      = x[d]·cos[d] - x[d+half]·sin[d]
+ *     out[d+half] = x[d]·sin[d] + x[d+half]·cos[d]
+ *   即 LlamaAttention 的 q*cos + rotate_half(q)*sin，rotate_half(x)=
+ *   cat(-x[half:], x[:half])；cos/sin 取 split-half 重复布局（见
+ *   ds_compute_rope_neox），故两个公式逐位一致。
+ * 【关键性质】旋转后位置 m 的 Q 与位置 n 的 K 的点积只依赖 m-n——
+ *   注意力天然感知相对位置（docs/01 §4.3）。只旋转 Q/K，V 不动。
+ * 【参数】x: [seq, n_heads*head_dim] 原地修改；cos_vals/sin_vals: [seq, head_dim]；
+ *   R-SWA 的 page 轴角度修正等场景调用方需自备 positions。
+ * 【参考】docs/01 §4.3；PyTorch 等价: LlamaAttention.apply_rotary_pos_emb。 */
 void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
                             int seq, int n_heads, int head_dim) {
     /*
@@ -2750,7 +3203,8 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
         for (int h = 0; h < n_heads; h++) {
             float *vec = x + s * hidden + h * head_dim;
 
-            /* Apply split-half rotate: save first half, then update in-place */
+            /* Apply split-half rotate: save first half, then update in-place
+             * 先取快照 x1/x2 再回写——两行输出互为对方的输入，直接覆盖会污染 */
             for (int d = 0; d < half; d++) {
                 float x1 = vec[d];
                 float x2 = vec[d + half];
@@ -2764,7 +3218,14 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
 /* NEON-vectorized BF16 roundtrip: truncate F32 array to BF16 precision and back.
  * Processes 4 floats at a time using NEON vcvtnq_f32_bf16 (if available) or
  * manual bit manipulation. This is ~4× faster than the scalar loop when
- * DS_BF16_SIMULATE_PYTHON is enabled. */
+ * DS_BF16_SIMULATE_PYTHON is enabled.
+ *
+ * ds_bf16_truncate_array - 原地把 F32 数组舍入到 BF16 精度再还原：
+ *   data[i] = bf16_round(data[i])（位级 = (u+0x8000)&0xFFFF0000，保留指数、
+ *   尾数仅剩高 7 位，数值上模拟"中间量是 BF16"的 Python 行为）。
+ * 【为什么需要】Python 里 BF16×BF16→BF16，中间激活每步都被舍到 BF16；
+ *   C 引擎全程 F32 累加，若不舍入，SwiGLU/Down 输出会带 Python 没有的
+ *   尾数位，长序列后逐步偏离（见 ds_expert_forward_fused 的 7 步流水线）。 */
 void ds_bf16_truncate_array(float *data, int n) {
 #ifdef __ARM_NEON
     /* NEON bit manipulation: round F32 to BF16 precision and back.
