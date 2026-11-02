@@ -58,7 +58,9 @@
 #define DS_SAM_DS2_DIM_V2       896     /* SAM net_3下采样输出通道(512→896, V2最终维度) */
 #define DS_VISUAL_TOKENS_BASE   256     /* 1024×1024输入的基础token数 = 64/4 × 64/4 = 16×16 */
 #define DS_LOCAL_CROP_TOKENS    144     /* 768×768裁剪的token数 = 48/4 × 48/4 = 12×12 */
-#define DS_MAX_LOCAL_CROPS      6       /* 最大局部裁剪数(V2: 动态多裁剪上限) */
+#define DS_MAX_LOCAL_CROPS      6       /* 最大局部裁剪数(V2: 动态多裁剪上限)；
+                                           注意 V3/V4 上限另计（V4=16、V3=32），
+                                           不使用本宏 */
 
 /* CLIP ViT-L/14 (V1/V3 encoder)
  * CLIP ViT-L/14 — V1/V3的第二编码器(24层标准ViT)
@@ -119,6 +121,9 @@
 #define DS_MODEL_VERSION_V1     1       /* DeepSeek-OCR (原始版, SAM+CLIP双编码器) */
 #define DS_MODEL_VERSION_V2     2       /* DeepSeek-OCR-2 (DeepEncoder V2, 因果流查询) */
 #define DS_MODEL_VERSION_UNLIMITED 3    /* Unlimited-OCR (SAM+CLIP+2D网格+R-SWA滑动窗口) */
+                                        /* 4 = Unlimited-OCR-2（DASH 块稀疏注意力）无专用
+                                           宏；ds_ocr.c 以字面量 4 判定（ds_dash.h 提供其
+                                           专属常量，如 DS_TOKEN_PAGE_MARKER=128827） */
 
 /* Maximum layer counts (for static array sizing) — 静态数组尺寸上限 */
 #define DS_MAX_ENC_LAYERS       24
@@ -409,7 +414,10 @@ typedef struct {
  * ======================================================================== */
 
 /* Called for each decoded text token during autoregressive generation.
- * 'piece' is the decoded token string (UTF-8). */
+ * 'piece' is the decoded token string (UTF-8).
+ * 流式输出回调：解码循环内每生成一个 token 触发一次。CLI 只给 V1/V2 挂
+ * （V3/V4 有幻觉前缀，须等终态后处理）；V1/V2 边生成边打印，进度打点
+ * 也走此通道（回调为空时 main.c 另挂进度回调）。 */
 typedef void (*ds_token_cb)(const char *piece, void *userdata);
 
 /* ========================================================================
@@ -492,20 +500,27 @@ typedef struct {
 
     /* Inference settings */
     int max_new_tokens;        /* Max tokens to generate (default: 4096) */
-    int keep_raw_layout;
+    int keep_raw_layout;       /* V4: 1 = 保留原生 <BLOCK>[坐标]<FORK> 结构化输出；
+                                  0 = 默认剥离布局标签、丢弃空内容块（--raw-layout） */
     int last_output_degenerate;  /* V4: 最近一次识别检测到畸形标签行（退化翻转信号，供 CLI 重试） */
     int last_output_loopy;       /* V3/V4: 解码中途检测到内容循环并提前终止（r4；DS_NO_EARLY_STOP=1 关闭） */
     float temperature;         /* Sampling temperature (default: 0.0 = greedy) */
     float repeat_penalty;      /* Repetition penalty (default: 1.0 = none, 1.1-1.5 typical) */
-    int num_local_crops;       /* Number of local crop regions (0-6) */
+    int num_local_crops;       /* 遗留字段（当前引擎内无写入方，保留兼容）；实际裁剪数
+                                  在 ds_recognize_image 局部变量中，不回填此字段 */
 
     /* Repetition penalty support */
-    float *dec_logits;                 /* [vocab_size] logits buffer */
-    int *token_history;                /* generated token IDs for penalty */
+    float *dec_logits;                 /* [vocab_size] prefill/全量采样路径的 logits；
+                                          贪心快速路径从不更新它（docs/08 §4.2） */
+    int *token_history;                /* 本轮已生成的 token id（重复惩罚 + n-gram 阻断共用；
+                                          每次识别结束时归零） */
     int token_history_len;
     int token_history_cap;
-    int no_repeat_ngram_size;          /* n-gram blocking (0=disabled, default=0) */
-    int min_new_tokens;               /* Min tokens before allowing EOS (0=disabled, default=256) */
+    int no_repeat_ngram_size;          /* n-gram blocking (0=disabled, default=0;
+                                          V3 被 main.c 强制为 35，--ngram 0 无效) */
+    int min_new_tokens;               /* EOS warmup: 此步数内禁选 EOS（0=关闭）。
+                                         默认 V3/V4=32、V1/V2=0（alloc_decoder_buffers；
+                                         旧注释"default=256"与代码不符，已修正） */
     int prefill_token_count;          /* Token count after prefill (for R-SWA: visual+prompt tokens) */
 
     /* Per-run performance stats */
@@ -560,7 +575,9 @@ typedef struct {
 ds_ctx_t *ds_load(const char *model_dir);
 
 /* INT4 quantize MoE expert weights (call after ds_load, when --int4 is set).
- * Reduces memory bandwidth ~4x for decode, with minimal accuracy loss. */
+ * Reduces memory bandwidth ~4x for decode, with minimal accuracy loss.
+ * 对第 1..11 层 MoE 路由/共享专家的 gate_up_fused 与 down 权重做逐块
+ * INT4 量化（layer 0 Dense FFN 跳过）；原 BF16 指针保留作回退。 */
 int ds_quantize_moe_int4(ds_ctx_t *ctx);
 
 /* Free all resources */
@@ -590,8 +607,9 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
                                     int *out_resized_w, int *out_resized_h);
 
 /* CLIP encoder forward pass (V1/V3):
- * V1: raw RGB pixels -> Conv2d(3→1024) -> CLIP transformer
- * V3: SAM features directly as CLIP patch_embeds */
+ * V1/V3 均直接以 SAM 特征作 CLIP patch_embeds（绕过自身 Conv2d，
+ * "二次精炼"设计，docs/04 §2.4.2）；rgb_pixels 等参数仅为保持 API 兼容，
+ * 当前实现不使用。输出含 image_newline 布局（1024²→273、640²→111 token）。 */
 float *ds_clip_encoder_forward(ds_ctx_t *ctx,
                                 const unsigned char *rgb_pixels, int width, int height, int channels,
                                 const float *sam_features, int n_sam_tokens,
@@ -629,9 +647,11 @@ void ds_drop_source_pages(const void *p, size_t bytes);
 /* Global verbose flag */
 extern int ds_verbose;
 
-/* V3 (Unlimited-OCR) post-processing: strip detection coordinate tags.
- * Removes <|det|>label [bbox]<|/det|> and <|ref|>...<|/ref|><|det|>...<|/det|> blocks.
- * Modifies text in-place, returns new length. */
+/* V3/V4 (Unlimited-OCR / Unlimited-OCR-2) post-processing: strip detection coordinate tags.
+ * Removes <|det|>label [bbox]<|/det|> and <|ref|>...<|/ref|><|/det|> blocks (终态清理第②步).
+ * Modifies text in-place, returns new length.
+ * 不成对的碎标签（孤立 opener/ref）原样保留——不猜优于猜错（docs/08 §6.4）；
+ * 随后把连续换行合并到 ≤2 个。 */
 int ds_strip_det_tags(char *text, int len);
 
 #endif /* DS_OCR_H */
