@@ -15,7 +15,8 @@
 7. [前馈网络(FFN)：逐位置的非线性变换](#7-前馈网络ffn逐位置的非线性变换)
 8. [层归一化与残差连接：稳定训练的秘诀](#8-层归一化与残差连接稳定训练的秘诀)
 9. [编码器 vs 解码器：双向与单向的区别](#9-编码器-vs-解码器双向与单向的区别)
-10. [在代码中找到一切](#10-在代码中找到一切)
+10. [训练视角：Wq/Wk/Wv/Wo 的权重是怎么学出来的](#10-训练视角wqwkvwwo-的权重是怎么学出来的)
+11. [在代码中找到一切](#11-在代码中找到一切)
 
 ---
 
@@ -323,6 +324,63 @@ $$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)
 
 > **缩放的必要性**：当维度 $d_k$ 较大时，QK^T 的值会相应增大（直观理解：点积是 $d_k$ 个乘积项的求和，维度越高项越多，结果的绝对值越大），把 softmax 推入梯度极小的饱和区（输入很大时 softmax 趋近 one-hot，梯度接近零）。除以 $\sqrt{d_k}$ 使点积的**方差**（衡量数值波动幅度的统计量，方差大意味着数值波动剧烈）维持在 1 附近，保证梯度有效传播。
 
+#### 5.3.1 从点积相似度到 softmax 权重：完整因果链
+
+注意力不是一步"魔法"，而是一条环环相扣的因果链。以单个 query 向量 $q$ 和一组 key $\{k_1,\dots,k_n\}$ 为例（本仓库解码器 $d_k = 128$）：
+
+```
+① 相似度打分   s_j = q · k_j          点积 = "两个向量方向有多一致"
+② 缩放        s_j = s_j / √d_k        控制分数的统计波动（推导见 5.3.2）
+③ 掩码        未来位置的 s_j = -∞     因果模型不许偷看（训练/推理形态见 §9.5）
+④ 归一化      a = softmax(s)          分数 → 和为 1 的"注意力预算"
+⑤ 加权聚合    out = Σ_j a_j · v_j     按"预算"混合各位置的内容
+```
+
+**为什么点积能衡量相似度？** 把点积用几何公式展开：
+
+$$q \cdot k = \|q\|\,\|k\|\,\cos\theta$$
+
+两个向量方向越一致（夹角 θ 越小，cos θ → 1），点积越大；方向正交（内容无关）时为 0；方向相反时为负。所以点积天然是"内容匹配度"的度量——query 用自己的方向"提问"，key 用自己的方向"应答"，匹配越准分数越高。
+
+**手算小算例**（n=3、d_k=2、scale = 1/√2）：q = [1, 0]，k₁ = [1, 1]，k₂ = [0, 1]，k₃ = [-1, 0]，对应 v₁ = [1, 0]，v₂ = [0, 1]，v₃ = [2, 2]。
+
+1. 打分：s₁ = 1×1 + 0×1 = 1，s₂ = 0，s₃ = -1
+2. 缩放：s/√2 → [0.707, 0, -0.707]
+3. softmax：max = 0.707，e⁰ = 1，e^-0.707 ≈ 0.493，e^-1.414 ≈ 0.243，和 ≈ 1.736 → a ≈ [0.576, 0.284, 0.140]
+4. 聚合：out ≈ 0.576·[1,0] + 0.284·[0,1] + 0.140·[2,2] = [0.856, 0.564]
+
+out 是三个 value 的"混合色"，注意力权重决定每个内容源的配比——softmax 的指数放大让最强匹配（k₁）拿走了一半以上的预算。
+
+代码对应：①②就是 `ds_kernels.c` 中 `ds_causal_attention` / `ds_bidirectional_attention` 里的 `ds_dot_f32(q_row, k_row, head_dim) * scale` 一行；③在因果内核里退化为循环上界（§9.5）；④⑤被融合进 online softmax 的单遍循环——边算分数边累加加权 V，不物化整个 [seq,seq] 注意力矩阵（原理见 docs/13 §2）。
+
+#### 5.3.2 为什么除以 √d_k 而不是 d_k：方差推导
+
+设 q、k 的各分量独立、零均值，方差分别为 σ_q²、σ_k²。对点积 s = q·k = Σᵢ qᵢkᵢ 逐项算期望与方差：
+
+```
+E[s]  = Σᵢ E[qᵢ]·E[kᵢ] = 0                      （零均值）
+E[s²] = E[Σᵢ Σⱼ qᵢkᵢ qⱼkⱼ]
+      = Σᵢ E[qᵢ²]·E[kᵢ²]                        （i≠j 的交叉项因零均值独立 → 期望为 0）
+      = d_k · σ_q² · σ_k²
+⇒ Var(s) = d_k · σ_q² · σ_k²，  std(s) = √d_k · σ_q · σ_k
+```
+
+关键结论：**点积的波动幅度随 √d_k 增长，而不是 d_k**。取 d_k = 128、σ_q = σ_k = 1，std(s) ≈ 11.3——两个"随机"token 的分数差动辄 ±20 以上。softmax 对差值是指数敏感的：e^20/e^0 ≈ 4.8 亿倍，分布立刻退化成 one-hot。
+
+one-hot 的 softmax 有个致命副作用：它的雅可比矩阵 diag(a) − aaᵀ ≈ **零矩阵**（对角元 1−aᵢ ≈ 0，非对角元 −aᵢaⱼ ≈ 0）。反向传播穿过 softmax 时梯度被整块抹掉——这就是"饱和区"的准确含义。
+
+**两种除法候选的对比**：
+
+| 除法 | 缩放后 std（d_k=128, σ=1） | softmax 行为 |
+|------|--------------------------|-------------|
+| 不除 | √128 ≈ 11.3 | 饱和成 one-hot，梯度消失 |
+| 除以 d_k | 1/√128 ≈ 0.088 | 分数挤成一团，注意力趋近均匀分布，"聚焦"失效 |
+| **除以 √d_k** | **≈ 1** | 分数落在灵敏区：有区分度，梯度健康 |
+
+除以 d_k 会"矫枉过正"：方差被压到 σ_q²σ_k²/d_k → 0，所有分数几乎相等，注意力退化成对所有 value 的无差别平均。除以 √d_k 恰好把 std 归一到 O(1)——这是"方差守恒"的选择，不是拍脑袋的常数。
+
+**本仓库对应**：`ds_moe_decoder.c` 的 `decoder_layer_forward` 中 `float scale = 1.0f / sqrtf((float)head_dim);`（head_dim=128），随后传入 `ds_causal_attention`；`ds_deep_encoder.c` 的 `enc_attn_process_head` 里同理（`double scale = 1.0/sqrt((double)head_dim)`）。逐行更细的推导版本见 [13-进阶专题篇 §1.5](./13-进阶专题篇.md)。
+
 ### 5.4 代码实现
 
 **ds-ocr 编码器中的双向注意力**（`ds_kernels.c`）：
@@ -421,6 +479,48 @@ int enc_kv_heads = 2;   /* K/V 头数（7个Q头共享1组KV） */
 int n_heads = 16;       /* Q 头数 */
 int n_kv_heads = 8;     /* K/V 头数（2个Q头共享1组KV） */
 ```
+
+### 6.5 GQA 的 head_group 映射公式与 KV Cache 缩小账
+
+#### 映射公式
+
+GQA 把 n_heads 个 Q 头分成 n_kv_heads 组，每组共享一份 K/V。设组大小 g，映射是**一个整除**：
+
+```
+heads_per_kv = n_heads / n_kv_heads     ← 组大小 g
+kv_h = h / heads_per_kv                 ← Q 头 h → 所属的 KV 头
+```
+
+例如 ds-ocr V2 编码器 n_heads=14、n_kv_heads=2 → heads_per_kv=7：Q 头 0~6 共享 KV 头 0，Q 头 7~13 共享 KV 头 1。整除映射让相邻编号的 Q 头天然成组。
+
+**代码对应**（`ds_kernels.c` → `ds_causal_attention_heads`）：
+
+```c
+int heads_per_kv = n_heads / n_kv_heads;
+...
+int kv_h = h / heads_per_kv;   /* GQA 映射：q_head ÷ heads_per_kv = kv_head */
+```
+
+V2 编码器里同一公式的另一份手写（`ds_deep_encoder.c` → `enc_attn_process_head`）：
+
+```c
+int kv_group_size = n_q_heads / n_kv_heads;   /* = 7 */
+int kv_h = h / kv_group_size;                 /* 7 个 Q 头共享 1 组 KV */
+```
+
+之后 Q 头 h 的注意力循环里，K/V 一律从 `K + j*kv_hidden + kv_h*head_dim` 取行——多个 Q 头读同一个 KV 头的同一行数据，这就是"共享"的全部含义，没有额外的同步或拷贝。
+
+#### KV Cache 缩小账
+
+KV cache 每 token 每层的大小 = 2（K 和 V）× n_kv_heads × head_dim × 字节数。n_kv_heads 直接乘在账上，所以 **GQA 把缓存压缩 n_kv_heads/n_heads 倍**：
+
+| 模型 | n_heads / n_kv_heads | 每 token·层 KV（F32） | 相对 MHA |
+|------|---------------------|----------------------|---------|
+| ds-ocr 解码器（MHA） | 10 / 10 | 2×10×128×4B = 10 KB | 1× |
+| ds-ocr V2 编码器（GQA） | 14 / 2 | 2×2×128×4B = 2 KB | **1/7** |
+| qwen-asr 解码器（GQA） | 16 / 8 | 2×8×128×4B = 8 KB | 1/2 |
+
+算一笔解码器的账：本模型是 MHA，每 token 每层 K+V 共 2×1280 = 2560 个 F32 = 10KB，12 层累计 120KB/token；`ds_ocr.h` 里 `kv_cache_max = 4096`（V1/V2），缓存满载约 0.5GB——而 decode 每步都要把全部已缓存的 K/V 读一遍（带宽瓶颈之一，docs/05 的 Roofline 分析）。V2 编码器一侧视觉 token 动辄数百上千个，GQA 省下的 7 倍 K/V 读写直接决定编码阶段的吞吐；代价只是每 7 个 Q 头共用一份 K/V，多头"多样性"里与 K/V 相关的那部分被共享了。
 
 ---
 
@@ -578,6 +678,20 @@ if (layer->k_norm_weight)
     ds_rms_norm_per_head(k, layer->k_norm_weight, 1, n_kv_heads, head_dim, eps);
 ```
 
+这一小节把"为什么"补全。
+
+**数学形式**。普通 RMSNorm 对整行 hidden=1280 个数算一个 RMS；per-head 版把 Q/K 看作 [n_heads × head_dim]，**对每个 head 的 128 维段独立**算 RMS，再乘可学习缩放向量 γ（本仓库设计中 q_norm/k_norm 各为 [head_dim=128]，10 个头共享同一份 γ）：
+
+```
+head h 的 q 段:  q_h ← ( q_h / √(mean(q_h²) + ε) ) ⊙ γ_q
+```
+
+**动机：注意力 logit 的量级是 q、k 幅值的乘积**。由 5.3.2 的方差推导，logit = q·k/√d_k 的波动由 ‖q‖、‖k‖ 共同决定——若训练后期某些通道的 q 幅值膨胀 ρ 倍、k 也膨胀 ρ 倍，logit 就膨胀 ρ² 倍。1/√d_k 缩放只在设计时刻用固定的 d_k 校准一次，管不住训练过程中幅值的漂移；per-head RMSNorm 在**每次前向时动态**把每个头的 q、k 钉回单位 RMS，logit 的量级上界从此只由 γ 决定——训练再久也不会飘进 softmax 饱和区。它与 1/√d_k 构成双保险：后者治"维度带来的方差"（静态），前者治"训练动力学带来的幅值漂移"（动态）。
+
+**顺序约束：必须在 RoPE 之前**。RMSNorm 的逐通道缩放 diag(γ) 与 RoPE 的旋转矩阵 R(θ) **不可交换**：若先旋转再缩放，Q·K 的点积不再只依赖相对位置 m−n，RoPE 的核心性质被破坏；先归一化（钉住幅值）再旋转（只改相位），两者各司其职。本仓库 `ds_moe_decoder.c` 的 `decoder_layer_forward` 严格按 "per-head norm → RoPE → 写 KV cache → 因果注意力" 的顺序执行。
+
+**本仓库现状**：QK-Norm 在这里是**可选路径**——`ds_ocr.c` 用 `DEC_F32(q_norm_weight, "self_attn.q_norm.weight")` 加载，权重表里没有该张量时指针为 NULL、上述 if 分支整体跳过；两个官方 checkpoint（DeepSeek-OCR / OCR-2）的权重表都没有它。这是为"带 QK-Norm 的变体权重"预留的钩子——QK-Norm 的做法最早见于 ViT-22B（Dehghani et al. 2023），Qwen3 等模型沿用，函数实现在 `ds_kernels.c` 的 `ds_rms_norm_per_head`。
+
 ---
 
 ## 9. 编码器 vs 解码器：双向与单向的区别
@@ -641,9 +755,84 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
 | DeepEncoder V2 | 深化视觉特征 | 混合（视觉双向+流查询因果） | `ds_deep_encoder.c` |
 | MoE Decoder | 生成 OCR 文字 | 因果 | `ds_moe_decoder.c` |
 
+### 9.5 因果掩码的两种形态：训练整块下三角 vs 推理只算一行
+
+因果掩码在"训练"和"推理"里长得很不一样——理解这一点，就理解了推理引擎为什么分 prefill 和 decode 两条路径。
+
+**形态一：训练（也是推理的 prefill 阶段）——整块下三角并行**。训练用 teacher forcing：把完整目标序列一次性喂进去，所有位置并行计算，用一张 [seq, seq] 下三角掩码把未来位置的分数填 -∞：
+
+```
+        K₁  K₂  K₃  K₄
+Q₁    [ 0  -∞  -∞  -∞ ]
+Q₂    [ 0   0  -∞  -∞ ]     0 = 允许（正常参与 softmax）
+Q₃    [ 0   0   0  -∞ ]     -∞ = 禁止（softmax 后权重恰为 0）
+Q₄    [ 0   0   0   0 ]
+```
+
+每一行都是独立的 softmax，整块一次算完——训练能并行，靠的就是这张矩阵。
+
+**形态二：推理 decode——只算新 token 的那一行**。自回归生成时，历史 token 的 K/V 都已躺在 KV cache 里；第 t 步只需给**一个**新 query 算一行注意力。此时掩码不再是矩阵：query 的全局位置是 q_offset = t，未来位置压根不存在，"掩码"退化成一个循环上界 k_end = q_offset + 1——被禁的位置**连点积都不算**，比填 -∞ 更省。
+
+**本仓库的两条路径**（`ds_moe_decoder.c`）：
+
+| 路径 | 函数 | seq_q | 掩码形态 | 计算特征 |
+|------|------|-------|---------|---------|
+| Prefill | `ds_decoder_prefill` | seq_len≈280-330（视觉+prompt token） | 整块下三角（逐行收紧的循环上界） | 批量 sgemm，算力瓶颈 |
+| Decode | `ds_decoder_forward`（每层走 `decoder_layer_forward`） | 1 | 隐式上界 k_end = q_offset+1 | 逐 token matvec，带宽瓶颈 |
+
+底层统一收口在 `ds_kernels.c` 的 `ds_causal_attention` / `ds_causal_attention_heads`：行 i 的全局位置 global_pos = q_offset + i，允许的 K/V 下标 j ≤ global_pos，实现上就是一行 `int k_end = global_pos + 1;`（超出缓存已有长度 seq_k 时截断防御）——"训练整块、推理一行"在同一个函数里只体现为 seq_q 的取值不同，连 -∞ 都不需要。
+
+**复杂度账**：prefill 对 seq=L 要算 L 行、每行平均 L/2 个 key → O(L²·d)；每步 decode 只算 1 行、平均 L/2 个 key → O(L·d)。生成 n 个 token 总计仍是 O(n²·d) 量级（与训练同阶），但被 KV cache 摊成了 n 次轻量步骤——KV cache 省掉的是"每生成一个字就重算全部历史"的重复劳动。
+
+**调用方视角**：`ds_ocr.c` 的 OCR 解码循环先用 `ds_decoder_prefill(ctx, input_embeds, prefix_len)` 一次性填满 KV cache 并拿到首个生成 token，随后循环调用 `ds_decoder_forward(ctx, dec_input)` 逐 token 生成——两条路径最终在同一个因果注意力内核里汇合。
+
 ---
 
-## 10. 在代码中找到一切
+## 10. 训练视角：Wq/Wk/Wv/Wo 的权重是怎么学出来的
+
+> **一句话导读**：前面所有章节都把权重当成"给定的常数"，这一节换一个视角——这些数是从数据里"炼"出来的。理解一轮训练循环，你就同时理解了推理引擎里每个张量的来历。
+
+### 10.1 一轮训练循环：前向 → 损失 → 梯度 → 更新
+
+语言模型训练的最小循环只有四步：
+
+```
+① 前向    把一批 token 序列喂进 Transformer（与推理完全相同的前向计算，
+          Wq/Wk/Wv/Wo、FFN、嵌入全部参与），得到每个位置的 logits
+② 损失    目标 = 序列右移一格（每个位置预测"下一个 token"），
+          交叉熵损失：L = −log softmax(logits)[目标token]
+③ 反向    用链式法则从 L 逐层回推，得到每个权重的 ∂L/∂W。
+          线性层 y = xW 的梯度有个统一形状：∂L/∂W = (上游梯度)ᵀ × x
+          ——上游梯度与该层输入激活的外积
+④ 更新    W ← W − η·∂L/∂W（SGD）；现代模型用 AdamW：
+          按梯度的一阶/二阶滑动矩为每个参数自适应步长（详见 docs/11 §6）
+```
+
+**迷你手算**（单参数感受一下"学"）：模型 y = w·x，样本 x=2、目标 t=1，学习率 η=0.1，初始 w=0：
+
+| 轮次 | 前向 y = w·x | 损失 L = (y−t)² | 梯度 ∂L/∂w = 2(y−t)·x | 更新 w ← w − η·∂L/∂w |
+|------|-------------|----------------|----------------------|---------------------|
+| 1 | 0 | 1 | −4 | 0.4 |
+| 2 | 0.8 | 0.04 | −0.8 | 0.48 |
+| 3 | 0.96 | 0.0016 | −0.16 | 0.496 |
+
+三轮之后 w → 0.5（y → t）。真实的 Transformer 就是这个动作的十亿次重复：每个 batch 做一遍前向→损失→梯度→更新，直到损失不再下降。
+
+**梯度为什么能同时流到所有层？** ∂L/∂Wq 依赖"注意力输出的上游梯度"，而注意力输出又依赖 Wk/Wv 产出的 K/V，K/V 又依赖更深的层……链式法则把这些依赖全部串成一条链。5.3.2 说的"softmax 饱和 → 梯度消失"、8.1 说的"残差是梯度捷径"、8.5 说的"QK-Norm 防饱和"，全部是让第 ③ 步的梯度能活着流回浅层的工程手段——**归一化/残差/缩放这些设计，本质都是为反向传播铺路**。训练时损失算在"每个位置的下一个 token"上（teacher forcing，掩码见 §9.5），一个 batch 的梯度同时教 Wq/Wk/Wv/Wo/FFN/嵌入各自该往哪挪。
+
+### 10.2 推理引擎里：只见权重，不见梯度
+
+本仓库是推理引擎，反向传播的整条流水线（激活缓存、梯度张量、优化器状态）都不存在：
+
+- **权重只读**：mmap 映射 safetensors，BF16 零拷贝（`ds_ocr.c` 加载、`ds_safetensors.c` 解析），全程没有任何写入权重的代码路径
+- **每个张量都是训练动力学的"化石"**：RMSNorm 的 γ 里留着训练后期的激活尺度；q_norm/k_norm 张量在不在、路由器权重用 BF16 还是 F32，都由训练框架当时的选择冻结（docs/12 §9 称之为"后训练指纹"）
+- **生成时的"目标"不是数据集给的**：argmax/采样得到 token t，嵌入后喂回下一步——自回归循环替代了训练的 teacher forcing（这正是 §9.5 训练/推理掩码两态的根源）
+
+这也回答了一个常见困惑：为什么推理引擎不需要 autograd、不需要 PyTorch？——因为 ②③④ 步只在训练时存在，推理是纯 ①。等你想反过来动手训练或微调时，再进入 [11-从零构建大模型：预训练篇](./11-从零构建大模型：预训练篇.md)（训练循环、优化器、Scaling Laws）与 [12-从零构建大模型：后训练与对齐篇](./12-从零构建大模型：后训练与对齐篇.md)（SFT/RLHF 实操）。
+
+---
+
+## 11. 在代码中找到一切
 
 ### ds-ocr 项目中 Transformer 组件的对应关系
 
@@ -653,8 +842,10 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
 | RoPE 位置编码 | `ds_kernels.c/h` | `ds_compute_rope_neox`, `ds_apply_rope_neox` |
 | 2D 位置编码 | `ds_visual_tokenizer.c` | `ds_compute_2d_position_embeddings` |
 | 双向注意力 | `ds_kernels.c` | `ds_bidirectional_attention` |
-| 因果注意力 | `ds_kernels.c` | `ds_causal_attention` |
+| 因果注意力 | `ds_kernels.c` | `ds_causal_attention`（含 GQA 映射 kv_h = h/heads_per_kv） |
 | 混合注意力 | `ds_kernels.c` | `ds_mixed_attention` |
+| 解码器 Prefill（批量路径） | `ds_moe_decoder.c` | `ds_decoder_prefill`（sgemm 整块下三角） |
+| 解码器 Decode（单步路径） | `ds_moe_decoder.c` | `ds_decoder_forward` + `decoder_layer_forward`（matvec，k_end 隐式掩码） |
 | RMSNorm | `ds_kernels.c` | `ds_rms_norm`, `ds_rms_norm_per_head` |
 | LayerNorm | `ds_kernels.c` | `ds_layer_norm` |
 | SwiGLU FFN | `ds_kernels.c` | `ds_swiglu_multiply` |
@@ -685,16 +876,17 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
 
 1. **嵌入**：把 token 变成向量（查表），子词分词覆盖所有语言，BF16 存储省内存
 2. **位置编码**：注入位置信息（正弦编码 / RoPE 旋转编码），RoPE 让注意力自动感知相对位置
-3. **自注意力**：token 之间交换信息（QKV → 点积 → softmax → 加权聚合）
-4. **多头注意力**：多个子空间并行关注不同关系，GQA 减少 KV 缓存
+3. **自注意力**：token 之间交换信息（QKV → 点积 → softmax → 加权聚合），1/√d_k 缩放是方差守恒的选择
+4. **多头注意力**：多个子空间并行关注不同关系，GQA 用 kv_h = h/heads_per_kv 映射省 KV cache
 5. **FFN**：逐位置非线性变换，SwiGLU 的门控机制选择性传递信息
-6. **归一化**：稳定训练（RMSNorm/LayerNorm），Pre-Norm 更稳定
+6. **归一化**：稳定训练（RMSNorm/LayerNorm），Pre-Norm 更稳定；per-head QK Norm 动态钉住 logit 量级
 7. **残差连接**：梯度捷径（x + SubLayer(x)），深度网络能训练的基础
-8. **因果掩码**：解码器生成时只看过去，编码器理解时看全部
+8. **因果掩码**：训练/prefill 整块下三角并行，decode 只算新 token 一行
+9. **训练视角**：前向→损失→梯度→更新炼出权重；推理引擎是"只读权重 + 纯前向"的切片
 
 **下一步**：在 [02-MoE混合专家篇](./02-MoE混合专家篇.md) 中，我们将深入 MoE 架构——看 ds-ocr 的 64 个专家如何分工合作。
 ---
 
 ## 🔭 进阶延伸
 
-本篇的后续深化见：06-视觉编码器篇（2D 位置与 patch 化的图像版）、10-论文导读（Attention/RoPE/RMSNorm 原文导读）。
+本篇的后续深化见：06-视觉编码器篇（2D 位置与 patch 化的图像版）、10-论文导读（Attention/RoPE/RMSNorm 原文导读）、11/12-从零构建大模型篇（本篇 §10 训练视角的全量展开：预训练循环与后训练对齐）、13-进阶专题篇（FlashAttention、MLA、方差推导的逐行版本）。

@@ -1,6 +1,6 @@
 # 00 · 术语表 Glossary
 
-> 覆盖 ds-ocr 全部 13 篇的**核心名词与专业术语**，按章节归类。每个词条给出**一句话定义** + **关键机制**，并标注对应的深入学习章节。
+> 覆盖 ds-ocr 全部 15 篇的**核心名词与专业术语**，按章节归类。每个词条给出**一句话定义** + **关键机制**，并标注对应的深入学习章节。
 > 英文术语的缩写（`attn`、`gqa` 等在代码中的写法）见 README 的"术语对照表"。
 > 术语解释中 `<理论依据>` 为权威定义要点，完整论文见 10 篇论文导读。
 
@@ -98,6 +98,10 @@
 MoE 训练中为了让专家批处理平衡而引入的缓冲系数。<当某专家收到的 token 过多时，超出 capacity 的 token 会被丢弃或重路由。>非 aux-loss 的负载均衡手段之一。
 - 相关章节：02 · 13
 
+### Aux Loss（负载均衡辅助损失）
+**MoE 训练中强迫各专家负载均匀的附加损失**。<对路由分布加"专家重要度均匀"的正则项，防止路由塌缩到少数热点专家；与 capacity factor 同属负载均衡手段。>DeepSeek-V3 改用 per-expert 偏置动态调节（见下条 aux-loss-free）替代显式损失。注意：损失只存在于训练期，推理权重里只剩路由器本身。
+- 相关章节：02 · 13
+
 ### Aux-loss-free（无辅助损失）
 **DeepSeek-V3 采用的不加辅助负载均衡损失的 MoE 路由**。<通过给每个专家加偏置（bias）实现负载均衡，避免辅助损失对主损失的干扰，训练更稳定。>
 - 相关章节：13
@@ -145,6 +149,14 @@ MoE 训练中为了让专家批处理平衡而引入的缓冲系数。<当某专
 ### Kernel / Kernel Fusion（内核融合）
 **把多个应当顺序执行的数学运算合并到一个循环/kernel 里执行**。<减少中间结果的落盘往返（内存读写），典型如"在线 softmax + 融合 BF16 matvec"。>ds-ocr 在三层（generic/NEON/AVX）上做平台优化并融合算子。
 - 相关章节：03 · 05 · 09
+
+### FlashAttention
+**IO 感知的精确注意力内核**：分块扫描 K/V、维护 running max/sum（**online softmax**），**永不物化 N² 注意力矩阵**。<GPU 上省的是 HBM 读写，是"把 IO 作为第一性约束"的内核设计思想；CPU 引擎照样借用 online softmax 的数值形式。>ds-ocr 的 `ds_causal_attention_aligned`（ds_kernels.c）内部即 online softmax，完整推导见 13 章 §2。
+- 相关章节：13 · 03 · 10
+
+### MLA（Multi-head Latent Attention，多头潜在注意力）
+**DeepSeek-V2 的 KV 压缩方案**：把 K/V 联合投影成低秩潜在向量缓存、用时再展开，KV cache 缩到 MHA 的十几分之一。<本仓库解码器是"去 MLA 化"的 3B 变体（kv_lora_rank=None，退回标准 MHA），MoE 骨架保留——MLA 只出现在"祖师爷"论文与 13 章的推导里。>
+- 相关章节：10 · 13 · 03
 
 ### Continuous batching / Chunked prefill / Prefix caching
 **服务化推理的高效技术**：
@@ -198,6 +210,30 @@ MoE 训练中为了让专家批处理平衡而引入的缓冲系数。<当某专
 ### R-SWA（Reference Sliding Window Attention，参考滑窗注意力）
 **融合"全局参考 token 注意力"与"局部滑窗注意力"的机制**。<让每个 token 既能访问固定窗口内的局部上下文，又能访问少数全局参考 token（如首部 summary/图像级 token），兼顾局部细节与全局语义、控制计算量。>ds-ocr 的 V3 解码器用它作为注意力结构。
 - 相关章节：04 · 05 · 06
+
+### DASH（Document-Aware Sparse Attention with Head-CLS routing）
+**V4 解码器的块稀疏注意力**：KV 按 32 token 分块，路由器用 head_cls 块摘要对每个 query 打分 → top-16 窗口 entmax15 归一 → 选 K=12 个"读预算"块（各带 log-prior 偏置），与局部窗 128 取并集。<每 query 可见 KV ≤512 且与文档总长无关，为多页长文档而生。>C 实现整文件在 ds_dash.c，完整数学与手算例见 14 章 §4/§4.5。
+- 相关章节：14 · 13
+
+### page2d（二维位置编码）
+**把"第几页"烧进 RoPE 的二维位置方案**：每个 token 有 (tok, page) 双坐标——tok 轴 63 对频率用页内 running count（页内相对距离与文档总长解耦）、page 轴 1 对角度 = (page%2)·1 rad（只判"同页/跨页"，页序交给 DASH 路由）。<C 实现 `rope2d_cos_sin_row()`（ds_dash.c）；页桶三条规则与公式推导见 14 章 §3。>
+- 相关章节：14
+
+### Causal Flow Queries（因果流查询）
+**DeepEncoder V2 的输出机制**：视觉 token 与若干可学习查询拼进同一条序列——视觉段双向互见，查询段**因果地**逐步吸收视觉信息，查询段输出即逐位置压缩的视觉摘要，直接对接自回归解码。<C 实现 `ds_encoder_forward_v2()`（ds_deep_encoder.c）；查询数 1024²→256、768²→144。>
+- 相关章节：06 · 10
+
+### Window Attention（窗口注意力）
+**把注意力限制在固定大小的空间窗口内**的稀疏化。<SAM 在 ViT 里穿插窗口层（14×14 patch 窗口）+ 少量全局层，把 N² 压进窗口——"局部为主、全局点睛"；ds-ocr 的 SAM ViT-B 12 层 = 8 窗口 + 4 全局（global_attn_indexes=[2,5,8,11]）。>
+- 相关章节：06 · 10
+
+### rel-pos（Relative Position Bias，相对位置偏置）
+**按 Q/K 的相对距离查表、加到注意力分数上**的位置机制：<SAM 沿行/列两方向各维护 (2w−1)×head_dim 的 rel_pos 表，解耦相加；窗口层表固定 27 行与输入无关、全局层表随网格插值。>区别于 RoPE（旋转进 Q/K 内积），rel-pos 是"加分项"，两者的位置信息通道互不影响。
+- 相关章节：06 · 10
+
+### Pixel Shuffle（像素重排，空间→通道重排）
+**用空间换通道的无参数重排**：把 H×W×C 的张量按 r×r 邻域重排成 H/r×W/r×r²C，常与卷积组合做下采样/上采样。<视觉压缩里"合并相邻 patch"的另一种形态；ds-ocr 的 4× 压缩选了 stride-2 卷积（`sam_downsample_forward`），pixel shuffle 是等效替代方案——面试高频对比题。>
+- 相关章节：06
 
 ### NaViT（Patch n' Pack）
 多尺度 patch 打包训练 ViT 的方法，可处理**可变分辨率**的输入。
@@ -385,6 +421,14 @@ RLHF 中最常用的强化学习算法，用**价值网络（critic）**估计�
 ### logsumexp（对数-求和-指数）
 **$\log\sum_j e^{z_j}$ 的数值稳定算法**：先减最大值 $m$ 再取指数，$m$ 在 log 外加回。<直接算会溢出（$e^{1000}=\infty$）；减 max 后指数项都 ≤1。>训练 CE 与推理 softmax 共用同一技巧（`ds_moe_decoder.c` 的 `expf((logits[i]-max_logit)/temp)`）。
 - 相关章节：11 §5.1 · 08 §1.2
+
+### z-loss
+**对 logits 的 logsumexp 施加的辅助正则**（损失项 $z = \log\sum_j e^{z_j}$，罚其平方）。<压住 logsumexp 的绝对值，防 softmax 梯度数值不稳定，PaLM/T5 系训练标配；与交叉熵相加使用，不改变 argmax 方向。>与 aux loss 同属"训练期的隐形损失"，推理权重里不留痕迹。
+- 相关章节：11 · 12
+
+### Teacher Forcing（教师强制）
+**训练时把真值 token 喂作下一步的输入**，而不是模型自己上一步的预测。<自回归训练的标准做法：整条序列并行前向、每步同时算损失，无需逐步采样；代价是训练/推理分布错配（exposure bias）。>推理的 prefill 阶段一次吃整段输入并出全部 KV，正是 teacher forcing 的前向结构在推理侧的对应物。
+- 相关章节：11 · 03
 
 ### Tied embeddings（权重共享）
 **词嵌入矩阵 $E$ 与输出投影 $W_{\text{lm\_head}}$ 共享同一份权重**。<省一半参数（本工程 129280×1280 ≈ 1.66 亿）+ 正则化嵌入空间。>运行时形态：`dec->lm_head_bf16 ? dec->lm_head_bf16 : dec->tok_embeddings_bf16`——无独立 lm_head 时回退到词嵌入。
