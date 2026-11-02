@@ -1,7 +1,6 @@
 /*
  * ds_ocr.c - DeepSeek-OCR Pure C Inference Engine
  * ds_ocr.c — DeepSeek-OCR 纯C推理引擎主协调器
- * ds_ocr.c — DeepSeek-OCR 纯C推理引擎主协调器
  *
  * ═══════════════════════════════════════════════════════════════════════
  * 【模块角色】整个推理流水线的"总指挥"
@@ -25,10 +24,12 @@
  *   │ 9. 后处理: V3去除det/ref标签, 截断空格                       │
  *   └──────────────────────────────────────────────────────────────┘
  *
- * 【三版本差异】(详见 ds_ocr.h 中的 ds_config_t)
+ * 【四版本差异】(详见 ds_ocr.h 中的 ds_config_t)
  *   V1: 单图1024×1024 + CLIP双编码器 + 标准因果注意力
  *   V2: 多裁剪768×768 + DeepEncoder V2 + 标准因果注意力
- *   V3: 单图1024×1024 + CLIP双编码器 + R-SWA滑动窗口注意力
+ *   V3: 多裁剪640×640 + CLIP双编码器 + R-SWA滑动窗口注意力
+ *   V4: 视觉侧同V3 + DASH块稀疏注意力 + page2d RoPE
+ *       （详见 docs/14-V4与DASH注意力篇.md）
  *
  * 【性能优化历程】(详见 05-性能优化实战篇.md)
  *   v0.5(97s) → v0.7(28s) → v0.8(17s) → v0.9(15s) = 6.5×加速
@@ -535,6 +536,8 @@ static void *v3_global_worker(void *arg) {
     free(sg);
     if (!cg) { t->failed = 1; return NULL; }
 
+    /* 第一步: 剥 newline——CLIP 输出 273 = 16 行×(16+1)，每行末列是 image_newline，
+     * 跳过它取回 16×16=256 个纯视觉特征 */
     int n_global_raw = ggrid * ggrid;
     float *global_raw = (float *)malloc(n_global_raw * hidden * sizeof(float));
     if (!global_raw) { free(cg); t->failed = 1; return NULL; }
@@ -543,6 +546,8 @@ static void *v3_global_worker(void *arg) {
                cg + r * (ggrid + 1) * hidden, ggrid * hidden * sizeof(float));
     free(cg);
 
+    /* 第二步: 重插 newline——按 16 行×(16+1) 行宽统一插入行分隔符
+     * （末尾 view_sep 由 concat 阶段统一追加，此处不含） */
     int n_gnl = ggrid * (ggrid + 1);
     float *gnl = (float *)malloc(n_gnl * hidden * sizeof(float));
     if (!gnl) { free(global_raw); t->failed = 1; return NULL; }
@@ -618,7 +623,7 @@ static int detect_model_version(const char *model_dir) {
         return -1;
     }
 
-    char buf[65536];
+    char buf[65536];   /* 一次读入整个 config.json（64KB 足够容纳全部已知配置） */
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     buf[n] = '\0';
     fclose(f);
@@ -682,6 +687,8 @@ static void init_config(ds_config_t *cfg, int version) {
     cfg->sam_ds1_dim = DS_SAM_DS1_DIM;
     cfg->visual_tokens_base = DS_VISUAL_TOKENS_BASE;
     cfg->max_local_crops = DS_MAX_LOCAL_CROPS;
+    /* 全局注意力层索引 [2,5,8,11]：SAM 12 层中仅这 4 层做全局注意力，
+     * 其余走 14×14 窗口注意力（混合窗口注意力，与官方 SAM ViT-B 配置一致） */
     cfg->sam_global_attn_indexes[0] = 2;
     cfg->sam_global_attn_indexes[1] = 5;
     cfg->sam_global_attn_indexes[2] = 8;
@@ -730,8 +737,8 @@ static void init_config(ds_config_t *cfg, int version) {
         cfg->sam_ds2_dim = DS_SAM_DS2_DIM; /* 1024 for V1 */
     }
 
-    /* MoE Decoder (same for V1 and V2) */
-    cfg->enc_output_dim = DS_DEC_HIDDEN;
+    /* MoE Decoder — 四版共用同一解码器超参（差异仅在注意力路径：V3 R-SWA / V4 DASH） */
+    cfg->enc_output_dim = DS_DEC_HIDDEN;  /* 编码器输出=解码器隐藏维(1280)：投影层的目标维度 */
     cfg->dec_hidden = DS_DEC_HIDDEN;
     cfg->dec_layers = DS_DEC_LAYERS;
     cfg->dec_heads = DS_DEC_HEADS;
@@ -744,8 +751,8 @@ static void init_config(ds_config_t *cfg, int version) {
     cfg->dec_top_k = DS_DEC_TOP_K;
     cfg->dec_first_k_dense = DS_DEC_FIRST_K_DENSE;
     cfg->vocab_size = DS_DEC_VOCAB_SIZE;
-    cfg->dec_rms_norm_eps = 1e-6f;
-    cfg->dec_rope_theta = 10000.0f;
+    cfg->dec_rms_norm_eps = 1e-6f;    /* RMSNorm 防除零小量（与 config.json 一致） */
+    cfg->dec_rope_theta = 10000.0f;   /* 解码器 1D RoPE 基频（V4 实际走 ds_dash 的 page2d RoPE，此值仅作后备） */
 
     /* ── 第二段：版本专属字段（覆盖第一段同名编码器字段，取值一致；
      *    并补 sliding_window_size / has_qk_norm / image_token_id 等）── */
@@ -1026,7 +1033,9 @@ static int load_all_weights(ds_ctx_t *ctx) {
         LOAD_F32("model.qwen2_model.query_768.weight", vt->causal_query_768_embeddings);
     }
 
-    /* ---- Projector Weights ---- */
+    /* ---- Projector Weights ----
+     * 投影层 [1280, proj_input_dim]：把编码器维度(V1/V3 2048 / V2 896)
+     * 线性对齐到解码器隐藏维 1280 */
     LOAD_F32("model.projector.layers.weight", ctx->projector.weight);
     LOAD_F32("model.projector.layers.bias", ctx->projector.bias);
 
@@ -1049,6 +1058,8 @@ static int load_all_weights(ds_ctx_t *ctx) {
         } \
     } while(0)
 
+    /* token 嵌入表 [vocab=129280, 1280]，BF16 零拷贝；与 lm_head 权重绑定(tied)——
+     * decode 查表得输入嵌入，argmax 路径用 lm_head（见下） */
     LOAD_BF16("model.embed_tokens.weight", dec->tok_embeddings_bf16);
 
     for (int l = 0; l < cfg->dec_layers; l++) {
@@ -1124,8 +1135,8 @@ static int load_all_weights(ds_ctx_t *ctx) {
         }
     }
 
-    LOAD_F32("model.norm.weight", dec->norm);
-    LOAD_BF16("lm_head.weight", dec->lm_head_bf16);
+    LOAD_F32("model.norm.weight", dec->norm);        /* 最终 RMSNorm [1280] */
+    LOAD_BF16("lm_head.weight", dec->lm_head_bf16);  /* 输出投影 [vocab,1280]：decode 每步 matvec/argmax 的热点 */
 
     #undef LOAD_F32
     #undef LOAD_BF16
@@ -1206,6 +1217,8 @@ int ds_quantize_moe_int4(ds_ctx_t *ctx) {
                                       hidden, n_shared * moe_inter);
             }
         }
+        /* 逐层置位标志：decode 前向（ds_moe_decoder.c）据此走 INT4 反量化路径；
+         * 无对应量化副本时前向按 qweight 指针判空自行回退 BF16 */
         ly->int4_enabled = 1;
     }
 
@@ -1267,7 +1280,7 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     int n_heads = cfg->dec_heads;
     int n_kv_heads = cfg->dec_kv_heads;
     int head_dim = cfg->dec_head_dim;
-    int kv_dim = n_kv_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;   /* KV 维度 = 10头×128 = 1280（MHA：与 hidden 同宽） */
     int intermediate = cfg->dec_intermediate;
 
     /* KV cache: [layers, max_seq, kv_dim] stored as F32, cache-line aligned.
@@ -1303,16 +1316,16 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->_kv_row_stride = kv_row_stride;  /* store for attention access */
 
 
-    /* Single-token decoder buffers */
-    ctx->dec_x = (float *)malloc(hidden * sizeof(float));
-    ctx->dec_x_norm = (float *)malloc(hidden * sizeof(float));
-    ctx->dec_q = (float *)malloc(n_heads * head_dim * sizeof(float));
-    ctx->dec_k = (float *)malloc(kv_dim * sizeof(float));
-    ctx->dec_v = (float *)malloc(kv_dim * sizeof(float));
-    ctx->dec_attn_out = (float *)malloc(n_heads * head_dim * sizeof(float));
-    ctx->dec_proj_out = (float *)malloc(hidden * sizeof(float));
-    ctx->dec_expert_out = (float *)malloc(hidden * sizeof(float));
-    ctx->dec_shared_out = (float *)malloc(hidden * sizeof(float));
+    /* Single-token decoder buffers — decode 每步复用的草稿纸（避免热路径 malloc/free） */
+    ctx->dec_x = (float *)malloc(hidden * sizeof(float));          /* 当前 token 嵌入 / 层间输出中转 */
+    ctx->dec_x_norm = (float *)malloc(hidden * sizeof(float));            /* input RMSNorm 后副本 */
+    ctx->dec_q = (float *)malloc(n_heads * head_dim * sizeof(float));     /* 注意力 Q 投影（10头×128=1280） */
+    ctx->dec_k = (float *)malloc(kv_dim * sizeof(float));                 /* 注意力 K 投影 */
+    ctx->dec_v = (float *)malloc(kv_dim * sizeof(float));                 /* 注意力 V 投影 */
+    ctx->dec_attn_out = (float *)malloc(n_heads * head_dim * sizeof(float)); /* softmax(QK^T)V 拼接输出 */
+    ctx->dec_proj_out = (float *)malloc(hidden * sizeof(float));          /* wo 投影后（残差相加前） */
+    ctx->dec_expert_out = (float *)malloc(hidden * sizeof(float));        /* 路由专家加权和输出 */
+    ctx->dec_shared_out = (float *)malloc(hidden * sizeof(float));        /* 共享专家输出 */
     ctx->dec_layer_out = (float *)malloc(hidden * sizeof(float));
     ctx->dec_gate_scores = (float *)malloc(cfg->dec_n_routed_experts * sizeof(float));
 
@@ -1384,7 +1397,7 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->enc_output = (float *)malloc(max_tokens * hidden * sizeof(float));
 
     /* Default settings */
-    ctx->max_new_tokens = 4096;
+    ctx->max_new_tokens = 4096;   /* 生成上限默认值（main.c 的 -n 覆盖） */
     ctx->temperature = 0.0f; /* Greedy by default */
     ctx->repeat_penalty = 1.0f; /* No penalty by default */
     ctx->no_repeat_ngram_size = 0; /* Disabled by default; ngram blocking causes premature EOS in OCR.
@@ -1444,7 +1457,7 @@ ds_ctx_t *ds_load(const char *model_dir) {
         free(ctx);
         return NULL;
     }
-    ctx->safetensors = ms;
+    ctx->safetensors = ms;   /* 保存句柄：load_all_weights 读权重、ds_free 统一 munmap */
 
     /* Load weights */
     if (load_all_weights(ctx) != 0) {
@@ -1832,7 +1845,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                         width, height);
 
             /* Global: pad to 1024x1024 */
-            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);
+            ds_image_t *global_img = ds_image_pad(&img, 1024, 127);   /* 等比缩放+居中填充到1024²，127=中性灰填充色 */
             if (!global_img) return NULL;
 
             int n_sam_tokens;
@@ -1968,10 +1981,10 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 } else {
                     fprintf(stderr, "Cannot open py_pil_global_view.bin, using C pad\n");
                     free(g_chw);
-                    global_img = ds_image_pad(&img, 1024, 127);
+                    global_img = ds_image_pad(&img, 1024, 127);   /* 中性灰127填充到1024² */
                 }
             } else {
-                global_img = ds_image_pad(&img, 1024, 127);
+                global_img = ds_image_pad(&img, 1024, 127);   /* 中性灰127填充到1024²（PIL ImageOps.pad 对应物） */
             }
             if (!global_img) {
                 goto cleanup_crops;
@@ -2127,7 +2140,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         int global_size = 1024;
         int ggrid = global_size / 16 / 4;  /* 1024→16 */
 
-        ds_image_t *gimg = ds_image_pad(&img, global_size, 127);
+        ds_image_t *gimg = ds_image_pad(&img, global_size, 127);   /* 中性灰127填充：与官方 PIL pad 对齐 */
         if (!gimg) return NULL;
         int n_gnl = ggrid * (ggrid + 1);
         float *gnl = NULL;
@@ -2804,7 +2817,7 @@ prompt_construction:
             fprintf(stderr, "V1 prompt: BOS + img_start + enc(%d) + img_end + text(%d) = %d tokens\n",
                     n_encoder_tokens, n_text_after, prefix_len);
     }
-    free(encoder_output);
+    free(encoder_output);   /* 视觉 token 已拷入 input_embeds 图像槽位，编码缓冲完成使命 */
 
     if (ds_verbose >= 1)
         fprintf(stderr, "Decoder prefix: %d tokens\n", prefix_len);
@@ -2841,13 +2854,13 @@ prompt_construction:
      */
     ctx->kv_cache_len = 0;   /* 每次识别重建缓存（同一 ctx 可连续识别多图/多页） */
 
-    float *dec_input = (float *)malloc(hidden * sizeof(float));
+    float *dec_input = (float *)malloc(hidden * sizeof(float));   /* decode 单 token 输入缓冲（step>0 时放上一 token 嵌入） */
 
     /* Prefill ALL prefix tokens. Python's model.generate() prefills the entire
      * prompt (including last text token), then samples from the last position's
      * logits. We do the same: prefill prefix_len tokens, then use prefill logits
      * for first generated token, then decode subsequent tokens. */
-    int first_token = -1;
+    int first_token = -1;   /* prefill 末位 logits 的 argmax——step 0 直接复用，省一次前向 */
     const char *slow_prefill = getenv("DS_SLOW_PREFILL");
     if (prefix_len > 1) {
         if (slow_prefill) {
@@ -3009,7 +3022,7 @@ prompt_construction:
     output[0] = '\0';
 
     int n_generated = 0;
-    int eos_token = DS_TOKEN_EOS;
+    int eos_token = DS_TOKEN_EOS;   /* 终止条件①: EOS(id=1)；终止条件②: step 达到 max_new_tokens */
 
     /* 诊断: 跨识别累积状态基线 (DS_HIST_DIAG=1)
      * token_history 跨识别不重置 — 若其写入量跨过 8704 上限，
@@ -3200,13 +3213,13 @@ prompt_construction:
         n_generated++;
     }
 
-    ctx->perf_decode_steps = n_generated;
+    ctx->perf_decode_steps = n_generated;   /* --profile 每步平均耗时 = perf_decode_ms ÷ 本值 */
 
     free(dec_input);
 
     double total_end = now_ms();
-    ctx->perf_total_ms = total_end - t0;
-    ctx->perf_text_tokens = n_generated;
+    ctx->perf_total_ms = total_end - t0;         /* 端到端总耗时（编码+prefill+decode） */
+    ctx->perf_text_tokens = n_generated;         /* 正文 token 数（main.c 完成行与 tok/s 引用） */
     ctx->perf_encode_ms = encode_end - encode_start;
     ctx->perf_prefill_ms = prefill_end - encode_end;  /* prompt construction + prefill */
     ctx->perf_decode_ms = total_end - decode_start;
@@ -3498,11 +3511,13 @@ static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
         char *le = eol ? eol : end;
         const char *src = p;
         size_t n = (size_t)(le - p);
-        if (n >= 6 && strncmp(src, "<PAGE>", 6) == 0) { src += 6; n -= 6; }
+        if (n >= 6 && strncmp(src, "<PAGE>", 6) == 0) { src += 6; n -= 6; }  /* 规则1: 剥行首 <PAGE> 标记 */
         char *fk = NULL;
-        for (char *q = (char *)src; q + 6 <= src + n; q++)
+        for (char *q = (char *)src; q + 6 <= src + n; q++)   /* 规则2: 定位行内 <FORK>——其后是本块内容 */
             if (strncmp(q, "<FORK>", 6) == 0) { fk = q; break; }
-        if (!fk && n >= 7 && strstr(src, "<BLOCK>") != NULL) malformed++;   /* 畸形标签行（无 FORK）→ 退化翻转信号 */
+        if (!fk && n >= 7 && strstr(src, "<BLOCK>") != NULL) malformed++;   /* 规则4: 畸形标签行（有<BLOCK>无<FORK>）→ 退化翻转信号 */
+        /* 规则2/3: <BLOCK>type[坐标]<FORK>内容 → 只留「内容」；FORK 后内容
+         * trim 为空则是空容器块，整行丢弃（continue 跳过写入） */
         if (fk) {
             const char *content = fk + 6;
             size_t clen = (size_t)(src + n - content);
@@ -3511,7 +3526,7 @@ static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
             if (k == 0) { p = eol ? eol + 1 : end; continue; }   /* 空内容块：整行丢弃 */
             src = content; n = clen;
         }
-        if (n > 0) { memmove(w, src, n); w += n; }
+        if (n > 0) { memmove(w, src, n); w += n; }   /* 规则5: 其余行原样保留（读写指针同行推进，输出恒≤输入） */
         if (eol) { *w++ = '\n'; p = eol + 1; } else { p = end; }
     }
     *w = '\0';
@@ -3544,7 +3559,7 @@ static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
 int ds_strip_det_tags(char *text, int len) {
     if (!text || len <= 0) return len;
 
-    int read = 0, write = 0;
+    int read = 0, write = 0;   /* 读/写双指针：read 扫描原文，write 原地追加保留文本 */
     while (read < len) {
         /* Check for <|ref|>...<|/ref|><|det|>...<|/det|> pattern (ref+det pair) */
         if (read + 7 < len && memcmp(text + read, "<|ref|>", 7) == 0) {
@@ -3596,7 +3611,8 @@ int ds_strip_det_tags(char *text, int len) {
 
     text[write] = '\0';
 
-    /* Clean up multiple consecutive newlines left after tag removal */
+    /* Clean up multiple consecutive newlines left after tag removal
+     * 标签剥离后的连续换行合并为 ≤2 个（保留段落间隔、压掉剥离空洞） */
     int w2 = 0, r2 = 0;
     int prev_newline = 0;
     while (r2 < write) {

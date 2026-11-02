@@ -40,6 +40,8 @@
  *   tokenizer.json (HuggingFace): 嵌套JSON格式 — 备选格式（V2使用）
  *     {"model": {"vocab": {...}, "merges": ["a b", ...]}, ...}
  *   merges.txt / tokenizer.json.merges: BPE合并规则列表
+ *
+ * 【教程】本模块的逐行讲解见 docs/07-分词与词表篇.md，与本头文件对照阅读
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -88,6 +90,7 @@ typedef struct {
  * 同时加载同目录下的 merges.txt（BPE合并规则）
  *
  * 返回: 新分配的 ds_tokenizer_t（调用者负责释放），失败返回NULL
+ * 详见 docs/07-分词与词表篇.md §8（两阶段扫描 + added_tokens 扩容）
  */
 ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path);
 
@@ -104,6 +107,7 @@ ds_tokenizer_t *ds_tokenizer_load(const char *vocab_json_path);
  *
  * 这是 vocab.json 不可用时的备选方案（如 DeepSeek-OCR V2）
  * 提取逻辑: 解析嵌套JSON，从 model.vocab 和 model.merges 中提取数据
+ * 详见 docs/07-分词与词表篇.md §8.3（单文件替代方案，数组序即 rank）
  */
 ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json_path);
 
@@ -122,6 +126,7 @@ ds_tokenizer_t *ds_tokenizer_load_from_tokenizer_json(const char *tokenizer_json
  * 多个 token 组合后才形成完整的 UTF-8 字符。
  * 例如: 中文字符"你" = UTF-8 [0xE4, 0xBD, 0xA0]
  * 可能被编码为3个独立的字节token，解码时需要拼接后才能还原
+ * 详见 docs/07-分词与词表篇.md §7（零拷贝查表，多字节逐 piece 自然愈合）
  */
 const char *ds_tokenizer_decode(const ds_tokenizer_t *tok, int token_id);
 
@@ -143,6 +148,7 @@ const char *ds_tokenizer_decode(const ds_tokenizer_t *tok, int token_id);
  *   V1/V2: "\nFree OCR." → [201, 21431, 126041, 16]
  *   V3: "\ndocument parsing." → [201, 34030, 76466, 16]
  * 编码的 token 数很少(4个)，所以性能不是瓶颈
+ * 详见 docs/07-分词与词表篇.md §6（字节→载体字符→贪心合并 三步走）
  */
 int *ds_tokenizer_encode(const ds_tokenizer_t *tok, const char *text, int *out_n_tokens);
 
@@ -152,6 +158,8 @@ int *ds_tokenizer_encode(const ds_tokenizer_t *tok, const char *text, int *out_n
  *   - id_to_text / id_to_bpe 字符串数组
  *   - vocab_map / merge_map 哈希表
  *   - 结构体本身
+ * key 的所有权约定（谁拥有、谁释放，vocab_map 绝不 double-free）
+ * 详见 docs/07-分词与词表篇.md §10.3
  */
 void ds_tokenizer_free(ds_tokenizer_t *tok);
 

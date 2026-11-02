@@ -101,7 +101,7 @@ static float rand_float(void) {
     return 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0f;
 }
 
-/* Helper: fill array with random floats (used by tests as they need it) */
+/* fill_random - 用 [-1,1] 均匀随机数填满数组（部分测试的数据源） */
 static void __attribute__((unused)) fill_random(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] = rand_float();
 }
@@ -110,6 +110,11 @@ static void __attribute__((unused)) fill_random(float *x, int n) {
  * test_kernels - Math Kernel Correctness
  * ======================================================================== */
 
+/* test_kernels_layer_norm - 验证 LayerNorm 的平移不变性与线性缩放 (docs/01)
+ * 期望值全部手算可复现：
+ *   常数输入 5.0 → 去均值后全 0 → 输出 = 0*weight + bias；
+ *   bias=i → 输出恰为 i；+1/-1 交替 → mean=0、var=1 → 输出 ≈ x；
+ *   weight=2 → 输出线性放大一倍。 */
 static void test_kernels_layer_norm(void) {
     TEST_BEGIN("kernels.layer_norm");
     const int hidden = 8;
@@ -152,6 +157,10 @@ static void test_kernels_layer_norm(void) {
     TEST_END();
 }
 
+/* test_kernels_rms_norm - 验证 RMSNorm 不去均值、只按均方根缩放 (docs/01)
+ * 全 1 输入: rms = sqrt(mean(1²)+eps) ≈ 1 → 输出 ≈ 1；
+ * weight=2 → 输出 = 2。这是 RMSNorm 与 LayerNorm 的核心区分点，
+ * 期望值由公式 out = x / rms(x) * weight 直接得出。 */
 static void test_kernels_rms_norm(void) {
     TEST_BEGIN("kernels.rms_norm");
     const int hidden = 8;
@@ -176,6 +185,10 @@ static void test_kernels_rms_norm(void) {
     TEST_END();
 }
 
+/* test_kernels_linear - 验证 y = x·Wᵀ + b 的逐元素期望值 (docs/03)
+ * W 取 3×4 的单位阵（第 4 列全 0 补齐），x 两行取 [1,2,3,0] 与
+ * [4,5,6,0] → 期望 y = [1,2,3] 与 [4,5,6]，纯手算矩阵乘；
+ * 再加 b=[10,20,30] 验证偏置逐项相加。 */
 static void test_kernels_linear(void) {
     TEST_BEGIN("kernels.linear");
     const int in_dim = 4, out_dim = 3, seq = 2;
@@ -209,6 +222,10 @@ static void test_kernels_linear(void) {
     TEST_END();
 }
 
+/* test_kernels_silu - 验证 SiLU(x) = x·sigmoid(x) 四个采样点 (docs/01)
+ * 期望值由公式直接算: SiLU(0)=0、SiLU(1)=1·σ(1)≈0.731、
+ * SiLU(-1)≈-0.269、SiLU(10)≈10（大正值饱和趋近恒等）。
+ * 注意 SiLU 就地修改输入缓冲。 */
 static void test_kernels_silu(void) {
     TEST_BEGIN("kernels.silu");
     float x[4] = {0.0f, 1.0f, -1.0f, 10.0f};
@@ -223,6 +240,10 @@ static void test_kernels_silu(void) {
     TEST_END();
 }
 
+/* test_kernels_gelu - 验证 GELU 四个采样点 (docs/01)
+ * 期望值来自 GELU 近似公式（tanh 版）:
+ * GELU(0)=0、GELU(1)≈0.841、GELU(-1)≈-0.159、GELU(2)≈1.954。
+ * 容差 0.01 覆盖精确 erf 版与 tanh 近似版的差异。 */
 static void test_kernels_gelu(void) {
     TEST_BEGIN("kernels.gelu");
     float x[4] = {0.0f, 1.0f, -1.0f, 2.0f};
@@ -237,6 +258,10 @@ static void test_kernels_gelu(void) {
     TEST_END();
 }
 
+/* test_kernels_swiglu - 验证 SwiGLU 门控乘法与交错布局 (docs/02)
+ * gate_up 按 [gate, up] 交错存放（偶下标 gate、奇下标 up），
+ * 期望值 = SiLU(gate)·up 逐对手算:
+ *   SiLU(1)*2≈1.462、SiLU(0)*3=0、SiLU(-1)*4≈-1.076、SiLU(10)*5≈50 */
 static void test_kernels_swiglu(void) {
     TEST_BEGIN("kernels.swiglu");
     const int seq = 1, inter = 4;
@@ -256,6 +281,9 @@ static void test_kernels_swiglu(void) {
     TEST_END();
 }
 
+/* test_kernels_softmax - 验证 softmax 的归一性与保序性 (docs/01)
+ * 数学性质: 输出和恒为 1（概率单纯形上）；输入越大概率越大
+ * （softmax 单调）。不钉具体数值——性质成立即正确。 */
 static void test_kernels_softmax(void) {
     TEST_BEGIN("kernels.softmax");
     float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -274,6 +302,10 @@ static void test_kernels_softmax(void) {
     TEST_END();
 }
 
+/* test_kernels_matmul - 验证 C = A·Bᵀ 的转置乘法约定 (docs/03)
+ * B 按 [N,K] 行存（不显式转置），期望值逐项手算:
+ *   C[0,0]=1*1+2*0+3*1=4、C[0,1]=1*0+2*1+3*1=5、
+ *   C[1,0]=4*1+5*0+6*1=10、C[1,1]=4*0+5*1+6*1=11 */
 static void test_kernels_matmul(void) {
     TEST_BEGIN("kernels.matmul_t");
     const int M = 2, K = 3, N = 2;
@@ -296,6 +328,10 @@ static void test_kernels_matmul(void) {
     TEST_END();
 }
 
+/* test_kernels_rope - 验证 NeoX 风格 RoPE 的旋转角生成 (docs/01)
+ * 位置 0: 角度全 0 → cos=1、sin=0（恒等旋转）；
+ * 位置 1 首对: theta_0 = 1/10000^(0/4) = 1 → cos(1)≈0.5403、sin(1)。
+ * 期望值由 RoPE 公式 theta_i = pos / base^(2i/d) 直接得出。 */
 static void test_kernels_rope(void) {
     TEST_BEGIN("kernels.rope_neox");
     const int head_dim = 4;
@@ -316,6 +352,10 @@ static void test_kernels_rope(void) {
     TEST_END();
 }
 
+/* test_kernels_conv2d - 验证 1×1 恒等卷积与 2×2 平均池化 (docs/06)
+ * 1×1 卷积 weight=1、bias=0 → 输出=输入（恒等映射）；
+ * 2×2 卷积 weight 全 0.25、stride=2 → 等价 2×2 平均池化:
+ * 左上块 (1+2+4+5)/4 = 3.0，期望值手算。 */
 static void test_kernels_conv2d(void) {
     TEST_BEGIN("kernels.conv2d");
     /* Simple 3×3 input, 1 channel, 1×1 conv (identity-like), 1 output channel */
@@ -337,12 +377,16 @@ static void test_kernels_conv2d(void) {
     float pool_out[4]; /* 2×2 output */
     ds_conv2d(pool_out, in, pool_weight, bias, 1, 1, 3, 3, 2, 2, 2, 0);
 
-    /* pool(1,2 / 4,5) = (1+2+4+5)/4 = 3.0 */
+    /* Pool: out = (1+2+4+5)/4 = 3.0（平均池化 = 权重全 0.25 的 2×2 卷积） */
     ASSERT_EQ_FLOAT(pool_out[0], 3.0f, 0.01f);
 
     TEST_END();
 }
 
+/* test_kernels_moe_router - 验证 MoE 路由打分与 top-k 选择 (docs/02)
+ * gate 权重构造使 4 个专家对同一输入的得分恰为 [10, 1, 0.5, 0.1]
+ * （专家 0 在 dim0 上权值 10），期望值即构造值；
+ * top-2 应先选专家 0，第二名在专家 1/2 之间（同分平手时的顺序不钉）。 */
 static void test_kernels_moe_router(void) {
     TEST_BEGIN("kernels.moe_router");
     const int hidden = 4, n_experts = 4;
@@ -373,6 +417,10 @@ static void test_kernels_moe_router(void) {
     TEST_END();
 }
 
+/* test_kernels_bf16_conversion - 验证 BF16 存储的往返精度 (docs/09)
+ * 单位阵存成 BF16（1.0 = 0x3f80），y = W·x 应还原 x 本身；
+ * 容差 0.02 来自 BF16 只有 8 位尾数（相对误差 ~0.4%），
+ * 期望值 = 输入原值，验证"量化不显著失真"。 */
 static void test_kernels_bf16_conversion(void) {
     TEST_BEGIN("kernels.bf16_conversion");
     /* BF16 → FP32 roundtrip via linear_nobias_bf16 */
@@ -398,6 +446,9 @@ static void test_kernels_bf16_conversion(void) {
     TEST_END();
 }
 
+/* test_kernels_add_mul_scale - 验证逐元素 add/mul/scale 三件套 (docs/03)
+ * 期望值手算: add 后 a=[11,22,33,44]；scale 0.5 后 c=[0.5,1,1.5,2]。
+ * mul 的结果无断言（乘法语义平凡），只验证不越界不崩溃。 */
 static void test_kernels_add_mul_scale(void) {
     TEST_BEGIN("kernels.add_mul_scale");
     float a[4] = {1, 2, 3, 4};
@@ -416,6 +467,11 @@ static void test_kernels_add_mul_scale(void) {
     TEST_END();
 }
 
+/* test_kernels_attention - 验证双向注意力的"对号入座"性质 (docs/01)
+ * 构造 Q=K=单位向量、V=对角大值 [100,0 / 0,200]:
+ * token0 的 Q=[1,0] 与 K[0] 完全匹配、与 K[1] 正交
+ * → softmax 后注意力几乎全落在 V[0] → out[0] 接近 100；
+ * 同理 out[3] 接近 200。期望值来自正交向量的点积为 0。 */
 static void test_kernels_attention(void) {
     TEST_BEGIN("kernels.bidirectional_attention");
     /* Simplest possible: 2 tokens, 1 head, head_dim=2
@@ -447,6 +503,9 @@ static void test_kernels_attention(void) {
     TEST_END();
 }
 
+/* test_kernels - 内核套件入口：依次运行全部数学内核单测 (docs/03)
+ * 覆盖归一化/激活/线性层/softmax/矩阵乘/RoPE/卷积/MoE 路由/
+ * BF16 转换/逐元素运算/注意力——每个子测自计 PASS/FAIL。 */
 static void test_kernels(void) {
     fprintf(stderr, "\n=== test_kernels ===\n");
     test_kernels_layer_norm();
@@ -469,12 +528,16 @@ static void test_kernels(void) {
  * test_config - Configuration and Constants
  * ======================================================================== */
 
+/* test_config_constants - 把编译期常量钉在 HuggingFace config.json 的官方值上
+ * 期望值来源 = 模型仓库 config.json 原文。这是"结构契约"测试：
+ * 任何一维改错（尤其 KV 头数、MoE 专家维度）都会在这里被当场抓住，
+ * 比跑完整推理再对拍便宜得多。 */
 static void test_config_constants(void) {
     TEST_BEGIN("config.constants");
 
     /* Decoder must use MHA (kv_heads == heads), NOT GQA */
     ASSERT_EQ_INT(DS_DEC_KV_HEADS, DS_DEC_HEADS);
-    ASSERT_EQ_INT(DS_DEC_KV_HEADS, 10);
+    ASSERT_EQ_INT(DS_DEC_KV_HEADS, 10);   /* 10 = hidden 1280 / head_dim 128 */
 
     /* Decoder dimensions */
     ASSERT_EQ_INT(DS_DEC_HEAD_DIM, 128);
@@ -525,6 +588,10 @@ static void test_config_constants(void) {
     TEST_END();
 }
 
+/* test_config_init_v1 - 配置初始化的占位验证 (docs/04)
+ * init_config 是 ds_ocr.c 的 static 函数（test.c 走普通链接够不到），
+ * 这里只能验证公开结构体可分配；真正的逐字段验证在 test_unit.c 的
+ * ocr_statics 套件（unity 编译进 ds_ocr.c 触达 static）。 */
 static void test_config_init_v1(void) {
     TEST_BEGIN("config.init_v1");
     ds_ctx_t ctx;
@@ -539,6 +606,9 @@ static void test_config_init_v1(void) {
     TEST_END();
 }
 
+/* test_config_struct_sizes - 验证静态数组上限覆盖最大模型配置 (docs/04)
+ * 期望值来源: V2 编码器 24 层 / 解码器 12 层 / 64 专家——
+ * 上限宏一旦小于实际层数，加载权重时就会越界写，必须在这里拦住。 */
 static void test_config_struct_sizes(void) {
     TEST_BEGIN("config.struct_sizes");
 
@@ -558,6 +628,7 @@ static void test_config_struct_sizes(void) {
     TEST_END();
 }
 
+/* test_config - 配置套件入口：常量钉扎 + 结构体尺寸 */
 static void test_config(void) {
     fprintf(stderr, "\n=== test_config ===\n");
     test_config_constants();
@@ -569,6 +640,9 @@ static void test_config(void) {
  * test_tokenizer - BPE Tokenizer
  * ======================================================================== */
 
+/* test_tokenizer_gpt2_mapping - 分词器错误路径: 词表文件不存在必须返回 NULL (docs/07)
+ * ds_tokenizer_load 对缺失文件返回 NULL 而非崩溃/退出——
+ * 上游正是靠这个 NULL 决定 fallback 到 tokenizer.json。 */
 static void test_tokenizer_gpt2_mapping(void) {
     TEST_BEGIN("tokenizer.gpt2_byte_mapping");
     /* The GPT-2 byte-to-unicode mapping is internal, but we can test
@@ -579,6 +653,9 @@ static void test_tokenizer_gpt2_mapping(void) {
     TEST_END();
 }
 
+/* test_tokenizer_api - 分词器 API 的占位测试 (docs/07)
+ * NULL 解码等防御逻辑需要真实词表才能有意义地验证，
+ * 完整编解码对拍在 test_unit.c 的 tokenizer 套件（真实 tokenizer.json）。 */
 static void test_tokenizer_api(void) {
     TEST_BEGIN("tokenizer.api_null_safety");
     /* Decode with NULL tokenizer should not crash */
@@ -588,6 +665,7 @@ static void test_tokenizer_api(void) {
     TEST_END();
 }
 
+/* test_tokenizer - 分词器套件入口：错误路径为主（重头戏在 test_unit.c） */
 static void test_tokenizer(void) {
     fprintf(stderr, "\n=== test_tokenizer ===\n");
     test_tokenizer_gpt2_mapping();
@@ -598,6 +676,8 @@ static void test_tokenizer(void) {
  * test_safetensors - Safetensors Reader
  * ======================================================================== */
 
+/* test_safetensors_missing_file - 错误路径: 文件不存在必须返回 NULL (docs/03)
+ * safetensors_open 打不开文件时应安静失败，由调用方决定报错方式。 */
 static void test_safetensors_missing_file(void) {
     TEST_BEGIN("safetensors.missing_file");
     safetensors_file_t *sf = safetensors_open("nonexistent.safetensors");
@@ -605,6 +685,8 @@ static void test_safetensors_missing_file(void) {
     TEST_END();
 }
 
+/* test_safetensors_missing_dir - 错误路径: 目录不存在返回 NULL (docs/03)
+ * multi_safetensors_open（多分片聚合打开）对缺失目录同样要安静失败。 */
 static void test_safetensors_missing_dir(void) {
     TEST_BEGIN("safetensors.missing_dir");
     multi_safetensors_t *ms = multi_safetensors_open("/nonexistent/dir");
@@ -612,6 +694,9 @@ static void test_safetensors_missing_dir(void) {
     TEST_END();
 }
 
+/* test_safetensors_dtype_sizes - 验证 dtype 枚举两两可区分 (docs/03)
+ * 枚举值本身不要求连续，但必须互异且 UNKNOWN 为负哨兵——
+ * find/get 系列靠 dtype 分发读取路径，撞值会静默读错数据。 */
 static void test_safetensors_dtype_sizes(void) {
     TEST_BEGIN("safetensors.dtype_enums");
     /* Verify dtype enum values are distinct */
@@ -622,6 +707,10 @@ static void test_safetensors_dtype_sizes(void) {
     TEST_END();
 }
 
+/* test_safetensors_tensor_struct - 验证张量元数据计算 (docs/03)
+ * numel = 各维连乘（1280*768 = 983040，手算）；
+ * is_bf16 对 DTYPE_F32 为假、对 DTYPE_BF16 为真——
+ * BF16 直读路径（mmap 零转换）的开关判据。 */
 static void test_safetensors_tensor_struct(void) {
     TEST_BEGIN("safetensors.tensor_struct");
     safetensor_t t;
@@ -641,6 +730,8 @@ static void test_safetensors_tensor_struct(void) {
     TEST_END();
 }
 
+/* test_safetensors - safetensors 套件入口：错误路径 + 元数据计算
+ * 真实权重文件的打开/读取在集成套件（需要下载模型）。 */
 static void test_safetensors(void) {
     fprintf(stderr, "\n=== test_safetensors ===\n");
     test_safetensors_missing_file();
@@ -653,6 +744,8 @@ static void test_safetensors(void) {
  * test_api - Public API
  * ======================================================================== */
 
+/* test_api_load_missing - 错误路径: 模型目录不存在 ds_load 返回 NULL (docs/04)
+ * CLI 依赖这个约定给用户报"模型未下载"而不是段错误。 */
 static void test_api_load_missing(void) {
     TEST_BEGIN("api.load_missing_dir");
     ds_ctx_t *ctx = ds_load("/nonexistent/dir");
@@ -660,6 +753,8 @@ static void test_api_load_missing(void) {
     TEST_END();
 }
 
+/* test_api_free_null - 防御性 API: ds_free(NULL) 不崩溃 (docs/04)
+ * 惯例测试——free 类函数必须容忍 NULL（glibc free 同款契约）。 */
 static void test_api_free_null(void) {
     TEST_BEGIN("api.free_null");
     /* ds_free(NULL) should not crash */
@@ -668,6 +763,9 @@ static void test_api_free_null(void) {
     TEST_END();
 }
 
+/* test_api_set_callback - 回调注册 API 存在且容忍全 NULL 参数 (docs/08)
+ * 流式输出回调在真实识别中由 main.c 注册；这里验证
+ * ds_set_token_callback(NULL,...) 不崩溃（链接 + 空参防御）。 */
 static void test_api_set_callback(void) {
     TEST_BEGIN("api.set_callback");
     /* Creating a minimal ctx just for callback test is tricky without ds_load.
@@ -677,6 +775,7 @@ static void test_api_set_callback(void) {
     TEST_END();
 }
 
+/* test_api - 公开 API 套件入口：错误路径与 NULL 防御 */
 static void test_api(void) {
     fprintf(stderr, "\n=== test_api ===\n");
     test_api_load_missing();
@@ -688,6 +787,10 @@ static void test_api(void) {
  * test_integration - End-to-End (requires model weights)
  * ======================================================================== */
 
+/* test_integration_model_load - 端到端: V1 模型加载 + 配置回读 (docs/04)
+ * 模型目录可由环境变量 DS_MODEL_DIR 覆盖，缺省 ./deepseek-ocr；
+ * 没有模型就 SKIP（计入通过——基础设施测试不许在无模型环境红）。
+ * 期望值 = config.json 官方值（与 test_config_constants 互相印证）。 */
 static void test_integration_model_load(void) {
     TEST_BEGIN("integration.model_load");
     /* Check if model directory exists */
@@ -720,6 +823,11 @@ static void test_integration_model_load(void) {
     TEST_END();
 }
 
+/* test_integration_v2_model_load - 端到端: V2 模型加载 + 权重指针齐全性 (docs/04/06)
+ * V2 检测（model_version/enc_type）、DeepEncoder V2 24 层配置、
+ * 以及关键权重非 NULL——这是"加载完整性"清单：SAM patch embed、
+ * causal_query_embeddings、解码器 embedding/lm_head、MoE 专家
+ * （layer 4 是第一个 MoE 层，专家 0/63 首尾都查）。 */
 static void test_integration_v2_model_load(void) {
     TEST_BEGIN("integration.v2_model_load");
     struct stat st;
@@ -804,6 +912,9 @@ static void test_integration_v2_model_load(void) {
     TEST_END();
 }
 
+/* test_integration_v2_image_load - 端到端: 图片加载与基本属性 (docs/06)
+ * 支持环境变量 DS_TEST_IMAGE 指定测试图；加载失败再试 ASCII 路径
+ * /tmp/test_ocr.jpg；核心断言: RGB 三通道、宽高为正。 */
 static void test_integration_v2_image_load(void) {
     TEST_BEGIN("integration.v2_image_load");
     const char *img_path = getenv("DS_TEST_IMAGE");
@@ -832,6 +943,10 @@ static void test_integration_v2_image_load(void) {
     TEST_END();
 }
 
+/* test_integration_v2_visual_tokenizer - 端到端: 视觉分词器 token 数钉扎 (docs/06)
+ * 数学链路: 1024×1024 输入 ÷ patch 16 → 64×64=4096 patch
+ * → Conv 压缩 ÷4×4 → 16×16=256 token。断言 n_tokens==256
+ * 钉住整条视觉前向的形状正确性（比逐值对拍便宜、足以抓住结构性回归）。 */
 static void test_integration_v2_visual_tokenizer(void) {
     TEST_BEGIN("integration.v2_visual_tokenizer");
     struct stat st;
@@ -878,6 +993,9 @@ static void test_integration_v2_visual_tokenizer(void) {
     TEST_END();
 }
 
+/* test_integration_v2_ocr - 端到端: 图片→文本完整管线 (docs/04)
+ * max_new_tokens 压到 32 换取测试速度；只断言"能出非空结果"，
+ * 识别质量由 docs/golden 冻结标签在 regress 流程里另行对拍。 */
 static void test_integration_v2_ocr(void) {
     TEST_BEGIN("integration.v2_ocr");
     struct stat st;
@@ -921,6 +1039,7 @@ static void test_integration_v2_ocr(void) {
     TEST_END();
 }
 
+/* test_integration - 集成套件入口：需要真实模型权重，缺啥就 SKIP */
 static void test_integration(void) {
     fprintf(stderr, "\n=== test_integration ===\n");
     test_integration_model_load();
@@ -934,6 +1053,7 @@ static void test_integration(void) {
  * Main
  * ======================================================================== */
 
+/* print_usage - 打印命令行用法（套件名 → 入口函数对照表） */
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [test_name]\n\n", prog);
     fprintf(stderr, "Available test suites:\n");
@@ -946,6 +1066,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  all               - Run all tests (default)\n");
 }
 
+/* main - 测试驱动: 固定随机种子保证可复现，按 argv 选择套件，
+ * 退出码 = 失败套件数是否为 0（CI 判据）。
+ * ds_verbose=1 让被测模块打印加载信息，便于失败时人工定位。 */
 int main(int argc, char **argv) {
     ds_verbose = 1;
     srand(42); /* Deterministic random seed */

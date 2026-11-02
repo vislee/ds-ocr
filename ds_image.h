@@ -52,32 +52,35 @@ typedef struct {
  * 支持格式: PNG, JPEG, WebP, BMP, TIFF, GIF, PSD 等（stb_image 支持的所有格式）
  *
  * 处理流程:
- *   1. stbi_load() 解码图像文件 → RGB像素数组
- *   2. 如果原始图像是RGBA(4通道)或灰度(1通道)，自动转为RGB(3通道)
- *   3. 返回 ds_image_t 结构体
+ *   1. macOS+USE_APPLE_VISION 时优先 CoreGraphics 解码（含 EXIF 方向自动
+ *      转正，对齐 PIL 的 exif_transpose），任一环节失败自动退回；其他平台直接走 stb_image
+ *   2. 解码时统一转成 RGB 3通道（stbi_load 第4参数传3 / CG路径手动紧缩RGBA→RGB）
+ *   3. 返回 ds_image_t 结构体（owns_stb 标记像素归哪个分配器管）
  *
  * 返回: 新分配的 ds_image_t（调用者负责释放），失败返回NULL
  *
  * 【为什么不需要resize?】
  * 此函数只做解码，不做缩放——缩放由调用方根据模型版本选择：
- * - V1/V3: 调用方会 pad 到 1024×1024
+ * - V1: resize 拉伸到 1024×1024；V3: pad 到 1024×1024 或 640×640
  * - V2: dynamic_preprocess 生成多个 768×768 裁剪
  */
 ds_image_t *ds_image_load(const char *path);
 
-/* ds_image_resize — 双线性插值缩放图像
+/* ds_image_resize — 高质量重采样缩放图像（拉伸模式，不保持宽高比）
  *
- * 将图像缩放到指定尺寸（拉伸模式，不保持宽高比）
- * 使用双线性插值(bilinear interpolation)进行像素重采样
+ * 使用 PIL 风格抗锯齿双三次插值（Keys bicubic，a=-0.5）重采样：
+ *   - 上采样：源坐标周围 4×4 邻域按可分离核 wx·wy 加权
+ *   - 下采样：滤波核按 scale_factor 展宽并对权重归一化（PIL antialias），
+ *     每个目标像素平均更多源像素，避免缩图时的摩尔纹/丢行
  *
  * 数学原理:
- *   对目标图像的每个像素(x,y)，映射回源图像坐标(x_src, y_src)，
- *   取周围4个像素的加权平均值作为输出值：
- *     out(x,y) = (1-α)(1-β)·src(x₀,y₀) + α(1-β)·src(x₁,y₀)
- *              + (1-α)β·src(x₀,y₁)   + αβ·src(x₁,y₁)
- *   其中 α,β 是小数部分的插值权重
+ *   目标像素中心经缩放映射回源坐标：fx = (x+0.5)·scale - 0.5（中心对齐，
+ *   避免半像素系统性偏移），out(x,y) = ΣΣ wx·wy·src(ix,iy) / ΣΣ wx·wy
  *
- * 使用场景: V1/V3 的全局图缩放到 1024×1024（stretch模式）
+ * macOS 优先走 CoreGraphics 高质量插值（与 PIL BICUBIC 输出一致），
+ * 失败回退本文件内置的 C 实现。
+ *
+ * 使用场景: dynamic_preprocess 第③步整图缩放；全局图缩放到目标尺寸
  */
 ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_height);
 

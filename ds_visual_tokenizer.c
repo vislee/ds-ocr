@@ -6,8 +6,12 @@
  * 【SAM ViT-B 前向传播详解】
  * ─────────────────────────────────────────────────────────────────────
  *
+ * 零基础读者请配合 docs/06-视觉编码器篇.md 逐节对照阅读（本文注释中的
+ * 「docs/06 §N」均指该文件的对应小节）。
+ *
  * Step 1: Patch Embed — 将图像切分为patch并线性投影
- *   输入: RGB [3, H, W] (float32, [0,1])
+ *   输入: RGB [3, H, W] (float32, [-1,1]，由 ds_image_to_float_chw 做
+ *   (p/255-0.5)/0.5 归一化，mean=std=0.5 对齐 Python BasicImageTransform)
  *   操作: Conv2d(3→768, kernel=16, stride=16) — 等价于将16×16像素块投影为768维向量
  *   输出: [768, H/16, W/16] — 1024²输入时为 [768, 64, 64] = 4096个patch
  *
@@ -116,23 +120,44 @@ int ds_enc_gate_budget(void);   /* ds_deep_encoder.c 提供读取点 */
  * SAM LayerNorm2d (Channel-wise LayerNorm for spatial features)
  * ======================================================================== */
 
+/* layer_norm_2d - LayerNorm2d：对"每个空间位置"跨通道归一化（docs/06 §4）
+ *
+ * 与普通 LayerNorm（ds_layer_norm）方向恰好相反：
+ *   普通 LN，token 布局 [N, D]：固定一个 token，沿 D 维特征求均值/方差；
+ *   LN2d，卷积布局 [C, H·W]：固定一个像素，沿 C 个通道求均值/方差。
+ * 卷积特征图没有"token"概念，"特征维"落在通道轴上，所以归一化轴换成 C。
+ * PyTorch 对应 sam.neck 里的 LayerNorm2d（eps 默认 1e-6，非 nn.LayerNorm 的 1e-5）。
+ *
+ * @param out      输出 [channels, spatial]，与 in 同为 CHW 压平布局
+ * @param in       输入 [channels, spatial]，in[c*spatial+s] = 第 c 通道第 s 像素
+ * @param weight   逐通道缩放 γ [channels]
+ * @param bias     逐通道平移 β [channels]，可为 NULL
+ * @param channels 通道数 C（neck 中为 256）
+ * @param spatial  空间元素总数 H·W
+ * @return 无，结果写入 out
+ */
 static void layer_norm_2d(float *out, const float *in,
                            const float *weight, const float *bias,
                            int channels, int spatial) {
     /* in/out: [channels, spatial], normalize across channels for each spatial position */
     for (int s = 0; s < spatial; s++) {
+        /* 均值：固定像素 s，对 C 个通道累加——注意步长是 spatial 而非 1，
+         * 因为 CHW 布局下相邻通道的同一像素隔了整整一張平面 */
         float mean = 0.0f;
         for (int c = 0; c < channels; c++) mean += in[c * spatial + s];
         mean /= channels;
 
+        /* 方差：E[(x-μ)²]，同样只在通道轴上 */
         float var = 0.0f;
         for (int c = 0; c < channels; c++) {
             float d = in[c * spatial + s] - mean;
             var += d * d;
         }
         var /= channels;
+        /* 1/σ，eps=1e-6 防止除零（SAM 源码 LayerNorm2d 的默认值） */
         float inv_std = 1.0f / sqrtf(var + 1e-6f);
 
+        /* 仿射变换 y = γ·(x-μ)/σ + β，逐通道一套 γ/β */
         for (int c = 0; c < channels; c++) {
             float val = (in[c * spatial + s] - mean) * inv_std;
             out[c * spatial + s] = val * weight[c] + (bias ? bias[c] : 0.0f);
@@ -159,22 +184,41 @@ static void layer_norm_2d(float *out, const float *in,
 static float get_rel_pos_v2(const float *rel_pos, int head_dim,
                              const float *q_val,
                              int q_coord, int k_coord, int rel_size) {
+    /* 相对位移 q-k ∈ [-(size-1), size-1]，加 (size-1) 平移到 [0, 2·size-2]，
+     * 正好覆盖表的全部 2·size-1 行——这就是"+rel_size-1"这个魔数的来源 */
     int rel_offset = q_coord - k_coord + rel_size - 1;
+    /* 防御性越界检查：窗内坐标本不会越界，pad 区域坐标可能异常 */
     if (rel_offset < 0 || rel_offset >= 2 * rel_size - 1) return 0.0f;
+    /* 表布局行主序 [2·size-1, head_dim]：第 rel_offset 行的起点。
+     * 这张表各注意力头共享（SAM V2 权重里没有 head 维） */
     const float *rp = rel_pos + rel_offset * head_dim;
     float sum = 0.0f;
+    /* bias = q · rel_pos[rel_offset]：把查到的 embedding 与当前 query 做点积 */
     for (int d = 0; d < head_dim; d++) sum += q_val[d] * rp[d];  /* dot product */
     return sum;
 }
 
+/* get_rel_pos_v1 - V1 风格相对位置偏置：直接查表取值（与 V2 对照阅读）
+ * V1 表布局 [n_heads, head_dim, 2·rel_size-1]（每头一张独立表），
+ * 与 V2 的 [2·rel_size-1, head_dim]（各头共享、需与 q 点积）不同。
+ * 注意：当前前向路径不经过此函数（window_attn_forward /
+ * sam_global_process_head 内联了同样的数学），仅 add_rel_pos_bias 引用，
+ * 保留作两种表布局的教学对照。
+ *
+ * @return 第 head_idx 张表在 rel_offset 处沿 head_dim 求和的标量 */
 static float get_rel_pos_v1(const float *rel_pos, int n_heads, int head_dim,
                              int q_coord, int k_coord, int rel_size, int head_idx) {
     (void)n_heads;  /* V1 索引只依赖 head_idx，n_heads 仅用于形状校验 */
+    /* 同 V2：真实位移 q-k 平移 (size-1) 后作表下标 */
     int rel_offset = q_coord - k_coord + rel_size - 1;
     if (rel_offset < 0 || rel_offset >= 2 * rel_size - 1) return 0.0f;
-    /* V1: shape [n_heads, head_dim, 2*rel_size-1] */
+    /* V1: shape [n_heads, head_dim, 2*rel_size-1]
+     * 三层下标摊平：先跳过前 head_idx 张表（每张 head_dim·(2·size-1) 个元素），
+     * 再在表内定位第 rel_offset "列" */
     const float *rp = rel_pos + (size_t)head_idx * head_dim * (2 * rel_size - 1) + rel_offset;
     float sum = 0.0f;
+    /* 同一 head 内相邻 d 的同一下标相隔 (2*rel_size-1) 个 float——
+     * 步长取表宽而非 1，因为 head_dim 不是最内层维度 */
     for (int d = 0; d < head_dim; d++) sum += rp[d * (2 * rel_size - 1)];
     return sum;
 }
@@ -188,6 +232,11 @@ static float get_rel_pos_v1(const float *rel_pos, int n_heads, int head_dim,
  *
  * q: query tensor, shape [n_heads * seq_len * head_dim] in (heads, seq, dim) layout
  *    For V2: q[h * seq_len * head_dim + qi * head_dim + d]
+ *
+ * 【教学参考，不在热路径】本函数是"朴素查表"版：每个 (q,k) 对都做
+ * head_dim 点积，代价 O(seq²·head_dim)。实际前向在 window_attn_forward /
+ * sam_global_process_head 里用"块结构"加速（bias 只依赖位移，同一块共享），
+ * 读代码时先看懂这里，再看那两处的优化版。
  */
 static void __attribute__((unused)) add_rel_pos_bias(float *attn_scores, int n_heads,
                               int q_h, int q_w, int k_h, int k_w,
@@ -197,20 +246,24 @@ static void __attribute__((unused)) add_rel_pos_bias(float *attn_scores, int n_h
     int seq_len = q_h * q_w;
     for (int h = 0; h < n_heads; h++) {
         for (int qi = 0; qi < seq_len; qi++) {
+            /* 一维 token 下标 → 二维网格坐标（行主序）：qy=行, qx=列 */
             int qy = qi / q_w;
             int qx = qi % q_w;
+            /* 头 h 的第 qi 个 query 向量起点（q 布局 [heads, seq, head_dim]） */
             const float *q_val = q + (size_t)h * seq_len * head_dim + qi * head_dim;
             for (int ki = 0; ki < k_h * k_w; ki++) {
                 int ky = ki / k_w;
                 int kx = ki % k_w;
                 float bias;
                 if (is_v2) {
+                    /* 行/列两个方向解耦：各自查表、各自点积后相加 */
                     bias = get_rel_pos_v2(rel_pos_h, head_dim, q_val, qy, ky, q_h)
                          + get_rel_pos_v2(rel_pos_w, head_dim, q_val, qx, kx, q_w);
                 } else {
                     bias = get_rel_pos_v1(rel_pos_h, n_heads, head_dim, qy, ky, q_h, h)
                          + get_rel_pos_v1(rel_pos_w, n_heads, head_dim, qx, kx, q_w, h);
                 }
+                /* 直接累加进 score 矩阵 [heads, seq, seq] 对应位置 */
                 attn_scores[(size_t)h * seq_len * seq_len + qi * seq_len + ki] += bias;
             }
         }
@@ -240,8 +293,11 @@ static void __attribute__((unused)) add_rel_pos_bias(float *attn_scores, int n_h
 static float *window_partition_pad(const float *x, int seq_h, int seq_w,
                                     int win_size, int dim, int *n_windows_out,
                                     int *padded_h, int *padded_w) {
+    /* 需要补的行/列数：64%14=8 → 补 6；恰好整除时 (14-0)%14=0 不补。
+     * 双重 % 保证 64→70 这类"差一点"和 42→42 这类"不用补"都正确 */
     int pad_h = (win_size - seq_h % win_size) % win_size;
     int pad_w = (win_size - seq_w % win_size) % win_size;
+    /* 补后的网格：1024² 输入 64→70，768² 裁剪 48→56，640² 裁剪 40→42 */
     int Hp = seq_h + pad_h;
     int Wp = seq_w + pad_w;
     *padded_h = Hp;
@@ -250,26 +306,39 @@ static float *window_partition_pad(const float *x, int seq_h, int seq_w,
     /* Pad input if needed (zero padding) */
     float *padded = NULL;
     if (pad_h > 0 || pad_w > 0) {
+        /* calloc 一步完成分配+清零：补出来的像素全为 0
+         * （对应 Python F.pad 的默认 constant 0 填充） */
         padded = (float *)calloc((size_t)Hp * Wp * dim, sizeof(float));
+        /* 逐行拷贝有效区域：每行只搬 seq_w×dim 个 float，
+         * 行尾补列与底部补行保持 0 */
         for (int y = 0; y < seq_h; y++) {
             memcpy(padded + y * Wp * dim, x + y * seq_w * dim, seq_w * dim * sizeof(float));
         }
     }
+    /* 无需 pad 时直接读原输入，省一次整块拷贝 */
     const float *src = padded ? padded : x;
     int src_w = padded ? Wp : seq_w;
 
+    /* 网格方向上的窗口数：70/14=5 → 5×5=25 个窗口（1024² 输入） */
     int n_h = Hp / win_size;
     int n_w = Wp / win_size;
     int n_windows = n_h * n_w;
+    /* 每窗 token 数：14×14=196 */
     int win_tokens = win_size * win_size;
 
+    /* 输出布局 [n_windows, win_tokens, dim]：窗口提到最外维，
+     * 每个窗口是连续的 196×768 块，方便整窗交给一个线程 */
     float *out = (float *)malloc((size_t)n_windows * win_tokens * dim * sizeof(float));
 
     for (int nh = 0; nh < n_h; nh++) {
         for (int nw = 0; nw < n_w; nw++) {
+            /* 窗口按行优先编号：第 nh 行第 nw 列的窗 */
             int win_idx = nh * n_w + nw;
             for (int wh = 0; wh < win_size; wh++) {
                 for (int ww = 0; ww < win_size; ww++) {
+                    /* src_row：该 token 在源网格中的行号（全局行主序）；
+                     * dst_row：它在窗口输出里的行号（窗内行主序）。
+                     * 两者只差一个"从全局坐标到窗内坐标"的平移换算 */
                     int src_row = (nh * win_size + wh) * src_w + (nw * win_size + ww);
                     int dst_row = win_idx * win_tokens + wh * win_size + ww;
                     memcpy(out + dst_row * dim, src + src_row * dim, dim * sizeof(float));
@@ -283,7 +352,15 @@ static float *window_partition_pad(const float *x, int seq_h, int seq_w,
     return out;
 }
 
-/* Window unpartition with unpadding: reverse of window_partition_pad */
+/* window_unpartition_pad - window_partition_pad 的逆操作（docs/06 §3.2）
+ * 把 [n_windows, win_tokens, dim] 的窗口注意力结果拼回 [seq_h, seq_w, dim]，
+ * 并裁掉 pad 阶段补上的行列（补区内容直接丢弃，不参与后续计算）。
+ *
+ * @param x          输出缓冲 [seq_h·seq_w, dim]，由调用方分配（此处为 attn_out）
+ * @param padded_h/padded_w  划分时记录的补后网格（70×70 等）
+ * @param windowed   输入 [n_windows, win_tokens, dim]
+ * @return 无，结果写入 x
+ */
 static void window_unpartition_pad(float *x, int seq_h, int seq_w,
                                     int win_size, int dim,
                                     int padded_h, int padded_w,
@@ -294,7 +371,7 @@ static void window_unpartition_pad(float *x, int seq_h, int seq_w,
 
     /* Unpartition to padded size, then copy only valid region */
     if (padded_h == seq_h && padded_w == seq_w) {
-        /* No padding needed */
+        /* No padding needed: 窗口→全局坐标的反向散射，与划分对称 */
         for (int nh = 0; nh < n_h; nh++) {
             for (int nw = 0; nw < n_w; nw++) {
                 int win_idx = nh * n_w + nw;
@@ -308,7 +385,9 @@ static void window_unpartition_pad(float *x, int seq_h, int seq_w,
             }
         }
     } else {
-        /* Unpartition to padded buffer, then extract valid region */
+        /* Unpartition to padded buffer, then extract valid region
+         * 两步走：先拼回 70×70 的"补后"缓冲，再取左上 64×64 有效区。
+         * 补区的 6 行/列计算结果直接扔掉 */
         float *padded_out = (float *)malloc((size_t)padded_h * padded_w * dim * sizeof(float));
         for (int nh = 0; nh < n_h; nh++) {
             for (int nw = 0; nw < n_w; nw++) {
@@ -322,7 +401,8 @@ static void window_unpartition_pad(float *x, int seq_h, int seq_w,
                 }
             }
         }
-        /* Extract original region [seq_h, seq_w] from padded [padded_h, padded_w] */
+        /* Extract original region [seq_h, seq_w] from padded [padded_h, padded_w]
+         * 逐行拷贝有效区域，天然裁掉右侧补列与底部补行 */
         for (int y = 0; y < seq_h; y++) {
             memcpy(x + y * seq_w * dim, padded_out + y * padded_w * dim, seq_w * dim * sizeof(float));
         }
@@ -350,7 +430,10 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
                                  int n_tokens, int n_heads, int head_dim,
                                  const float *rel_pos_h, const float *rel_pos_w,
                                  int win_h, int win_w) {
+    /* 768 = 12 heads × 64 head_dim：整层宽度（所有头拼在一起） */
     int hidden = n_heads * head_dim;
+    /* 1/√d_k = 1/√64 = 1/8：scaled dot-product attention 的缩放因子，
+     * 防止点积方差随维度增大而爆炸、softmax 掉进饱和区梯度消失 */
     float scale = 1.0f / sqrtf((float)head_dim);
 
     /* BLAS-accelerated window attention.
@@ -362,9 +445,14 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
      * Step 3: Row-wise softmax
      * Step 4: attn_out_h = scores @ V_h  (BLAS sgemm)
      */
+    /* [196×196] 注意力分数缓冲：窗口层只需 196²×4B ≈ 150KB，
+     * 对比全局层的 4096²×4B ≈ 67MB——这就是窗口化省内存的原因 */
     float *scores = (float *)malloc((size_t)n_tokens * n_tokens * sizeof(float));
 
     for (int h = 0; h < n_heads; h++) {
+        /* 头 h 的切片起点：Q/K/V 都是 [n_tokens, hidden] 行主序，
+         * 每行内按 [头0 | 头1 | ...] 排列，跳过前 h×64 列即得本头视图；
+         * 行距仍是 hidden=768（stride=hidden 的"伪矩阵"） */
         const float *Q_h = Q + h * head_dim;   /* stride = hidden */
         const float *K_h = K + h * head_dim;
         const float *V_h = V + h * head_dim;
@@ -372,11 +460,14 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
 
         /* Step 1: QK^T with BLAS */
 #ifdef USE_BLAS
+        /* scores = scale·Q_h·K_hᵀ：M=N=196, K=64；lda/ldb=hidden 表示
+         * Q_h/K_h 相邻行相隔 768 个 float（伪矩阵），C 连续 ldc=196 */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_tokens, n_tokens, head_dim,
                     scale, Q_h, hidden, K_h, hidden,
                     0.0f, scores, n_tokens);
 #else
+        /* 朴素三重循环后备：scores[i,j] = Σ_d Q[i,d]·K[j,d] × scale */
         for (int i = 0; i < n_tokens; i++) {
             for (int j = 0; j < n_tokens; j++) {
                 float s = 0.0f;
@@ -388,24 +479,34 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
 #endif
 
         /* Step 2: Add rel_pos bias (block-structured for window attention) */
-        /* Height bias: depends on (qy, ky) only */
+        /* Height bias: depends on (qy, ky) only
+         * 块结构填充：bias 只随 (qy,ky) 变、与 qx/kx 无关，
+         * 所以对每个 (qy,ky) 块算一次点积，整块 14 列复用同一值。
+         * 点积次数从 196² 降到 196×27，这是窗口注意力偏置的加速关键 */
         for (int dy = 0; dy < 2 * win_h - 1; dy++) {
+            /* dy 是表下标（0..26），actual_dy = qy-ky 是真实位移（-13..13） */
             int actual_dy = dy - (win_h - 1);
+            /* 表的第 dy 行 [head_dim]（窗口层表固定 27 行，与输入尺寸无关） */
             const float *rh_vec = rel_pos_h + dy * head_dim;
 
             for (int qy = 0; qy < win_h; qy++) {
+                /* 该位移下唯一满足 ky=qy-actual_dy 的 key 行 */
                 int ky = qy - actual_dy;
                 if (ky < 0 || ky >= win_h) continue;
 
+                /* (qy,ky) 块在 196×196 score 矩阵中的左上角：
+                 * q 行段 [qy·14, qy·14+13]，k 列段 [ky·14, ky·14+13] */
                 int row_start = qy * win_w;
                 int col_start = ky * win_w;
 
                 for (int qx = 0; qx < win_w; qx++) {
                     const float *q_vec = Q_h + (row_start + qx) * hidden;
+                    /* bias = q_{(qy,qx)} · rh_vec：每行 qx 各算一次 */
                     float bias = 0.0f;
                     for (int d = 0; d < head_dim; d++)
                         bias += q_vec[d] * rh_vec[d];
 
+                    /* 块内一行：14 个 kx 共享同一 bias，一次加完 */
                     float *row = scores + (row_start + qx) * n_tokens + col_start;
                     for (int kx = 0; kx < win_w; kx++)
                         row[kx] += bias;
@@ -413,7 +514,8 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
             }
         }
 
-        /* Width bias: depends on (qx, kx) only */
+        /* Width bias: depends on (qx, kx) only — 与高度方向对称，
+         * 只是这里"块"是列方向对齐的（固定 qx,kx，扫 qy,ky） */
         for (int dx = 0; dx < 2 * win_w - 1; dx++) {
             int actual_dx = dx - (win_w - 1);
             const float *rw_vec = rel_pos_w + dx * head_dim;
@@ -428,6 +530,8 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
                     for (int d = 0; d < head_dim; d++)
                         bias += q_vec[d] * rw_vec[d];
 
+                    /* 该 (qx,kx) 组合对应 win_h×win_h=196 个 score 位置，
+                     * bias 全相同：沿 ky 逐行累加到第 kx 列 */
                     for (int ky = 0; ky < win_h; ky++) {
                         int row = qy * win_w + qx;
                         int col = ky * win_w + kx;
@@ -441,17 +545,20 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
         {
             for (int i = 0; i < n_tokens; i++) {
                 float *row = scores + i * n_tokens;
+                /* 先求行最大值：exp 前减去它防上溢（数值稳定 softmax 标准写法） */
                 float max_s = -1e30f;
                 for (int j = 0; j < n_tokens; j++) {
                     float s = row[j];
                     if (s > max_s) max_s = s;
                 }
+                /* exp(x-max) 并累加分母 */
                 float sum_e = 0.0f;
                 for (int j = 0; j < n_tokens; j++) {
                     float e = expf(row[j] - max_s);
                     row[j] = e;
                     sum_e += e;
                 }
+                /* 原地除以分母 → 每行归一化为概率分布 */
                 if (sum_e > 0.0f) {
                     float inv = 1.0f / sum_e;
                     for (int j = 0; j < n_tokens; j++)
@@ -460,8 +567,10 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
             }
         }
 
-        /* Step 4: attn_out_h = scores @ V_h  (BLAS sgemm) */
+        /* Step 4: attn_out_h = scores @ V_h  (BLAS sgemm)
+         * 概率加权平均：out_i = Σ_j attn[i,j]·V_j（对每个头独立做） */
 #ifdef USE_BLAS
+        /* M=196, N=64, K=196：scores 连续，V_h 行距 hidden */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     n_tokens, head_dim, n_tokens,
                     1.0f, scores, n_tokens, V_h, hidden,
@@ -488,25 +597,41 @@ static void window_attn_forward(float *out, const float *Q, const float *K, cons
  * ======================================================================== */
 
 /* Context for one SAM window-attention layer, shared read-only by the
- * per-window workers. Each window writes a disjoint win_attn slice. */
+ * per-window workers. Each window writes a disjoint win_attn slice.
+ *
+ * 窗口并行任务描述：权重指针来自 vt->sam_layers[l]（只读共享），
+ * 输出切片按窗口编号划分（互不重叠 → 无锁）。 */
 typedef struct {
     const float *padded_x;      /* [n_windows, win_tokens, dim] padded input */
     float *win_attn;            /* [n_windows, win_tokens, dim] output */
-    const float *qkv_w, *qkv_b; /* fused QKV projection [3*dim, dim] */
-    const float *rel_h, *rel_w; /* relative position embeddings */
+    const float *qkv_w, *qkv_b; /* fused QKV projection [3*dim, dim] = attn.qkv.weight [2304,768] */
+    const float *rel_h, *rel_w; /* rel_pos_h/w：V2 窗口层 [2·14-1, 64]=[27,64]，各头共享、永不插值 */
     int n_windows, win_tokens, win_size, dim, n_heads, head_dim;
-    int tid, nthreads;
+    int tid, nthreads;          /* 线程号与总线程数（步幅切分用） */
 } sam_window_task_t;
 
-/* QKV projection + attention for window w */
+/* sam_process_window - 处理一个 14×14 窗口的完整注意力（docs/06 §3.4）
+ * 步骤：fused QKV 投影 → 按 768 列拆成 Q/K/V → 窗口内多头注意力。
+ * 输入取自 padded_x（先 pad 后投影：补零位置得到 QKV(0)=qkv_bias 而非 0，
+ * 与 Python 行为一致，顺序说明见 sam_layer_forward 注释）。
+ * 每窗口写 win_attn 自己的切片，多窗口可无锁并行
+ * （pthread 步幅切分见 sam_window_worker）。
+ *
+ * @param t 共享只读任务描述（权重/输入/输出指针 + 几何参数）
+ * @param w 窗口编号，范围 [0, n_windows)
+ */
 static void sam_process_window(const sam_window_task_t *t, int w) {
     int dim = t->dim, win_tokens = t->win_tokens;
+    /* 第 w 个窗口的输入起点：每个窗占 win_tokens×dim 个 float */
     const float *wx = t->padded_x + (size_t)w * win_tokens * dim;
 
-    /* QKV projection for this window (on padded data, matching Python) */
+    /* QKV projection for this window (on padded data, matching Python)
+     * fused 权重 attn.qkv.weight [2304, 768]：一次 matmul 同时算出
+     * Q、K、V，每 token 输出 3×768=2304 维 */
     float *wqkv = (float *)malloc((size_t)win_tokens * 3 * dim * sizeof(float));
     ds_linear(wqkv, wx, t->qkv_w, t->qkv_b, win_tokens, dim, 3 * dim);
 
+    /* 按列切三份：每行 [Q(768) | K(768) | V(768)] → 三个 [196, 768] 缓冲 */
     float *wQ = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
     float *wK = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
     float *wV = (float *)malloc((size_t)win_tokens * dim * sizeof(float));
@@ -517,6 +642,7 @@ static void sam_process_window(const sam_window_task_t *t, int w) {
     }
     free(wqkv);
 
+    /* 结果写本窗口专属切片 [w, :, :]，窗口间互不重叠 → 无锁 */
     float *wout = t->win_attn + (size_t)w * win_tokens * dim;
     window_attn_forward(wout, wQ, wK, wV, win_tokens, t->n_heads, t->head_dim,
                         t->rel_h, t->rel_w, t->win_size, t->win_size);
@@ -524,7 +650,10 @@ static void sam_process_window(const sam_window_task_t *t, int w) {
     free(wQ); free(wK); free(wV);
 }
 
-/* Thread entry: process windows tid, tid+nthreads, tid+2*nthreads, ... */
+/* sam_window_worker - 窗口并行线程入口：步幅切分，线程 t 处理窗 t, t+nw, t+2nw...
+ * 25 个窗口相互独立、输出切片互不重叠 → 全程无锁。
+ * 用裸 pthread 而非共享线程池：SAM 可能已经运行在某个 crop worker
+ * 线程里，再嵌套抢公共池会超额订阅/死锁（门控见 sam_layer_forward）。 */
 static void *sam_window_worker(void *arg) {
     sam_window_task_t *t = (sam_window_task_t *)arg;
     for (int w = t->tid; w < t->n_windows; w += t->nthreads)
@@ -539,15 +668,27 @@ static void *sam_window_worker(void *arg) {
  * （1024² 时 67MB/线程；DS_SAM_GBL_THREADS 可调，默认 6）。
  * 门控纪律与窗口并行相同: 多 crop 波次期间由调用方清零（crop 已并行）。 */
 typedef struct {
-    const float *Q, *K, *V;
-    float *attn_out;
+    const float *Q, *K, *V;     /* [seq_len, dim] 行主序，每行内按头分段 */
+    float *attn_out;            /* [seq_len, dim] 输出，各头写各自列段 */
     int seq_len, seq_h, seq_w, dim, n_heads, head_dim;
-    float scale;
-    const float *eff_rel_h, *eff_rel_w;
+    float scale;                /* 1/√head_dim */
+    const float *eff_rel_h, *eff_rel_w; /* 全局层 rel_pos：已按输入尺寸插值后的生效表 */
     int layer_idx;
-    int tid, nthreads;
+    int tid, nthreads;          /* 线程号与总线程数（按头步幅切分） */
 } sam_global_task_t;
 
+/* sam_global_process_head - 全局注意力单头流水线：QKᵀ→rel_pos→softmax→·V
+ * (docs/06 §3.4)
+ * 与 window_attn_forward 的数学完全一致，差别只在规模与表长：
+ * seq_len=4096（1024²）或 2304（768²），rel_pos 表需按输入网格插值
+ * （127→95 等，见 sam_layer_forward）。scores 缓冲由调用方传入——
+ * 多线程时每线程私有一份，避免同缓冲伪共享。
+ *
+ * @param t      任务描述（只读共享）
+ * @param h      注意力头编号
+ * @param scores 调用方提供的 [seq_len, seq_len] 工作缓冲
+ * @return 无，本头结果写入 attn_out 的第 h 列段
+ */
 static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) {
     const int seq_len = t->seq_len, dim = t->dim, head_dim = t->head_dim;
     const int seq_h = t->seq_h, seq_w = t->seq_w;
@@ -556,6 +697,7 @@ static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) 
     const float *eff_rel_h = t->eff_rel_h, *eff_rel_w = t->eff_rel_w;
     const float *Q = t->Q, *K = t->K, *V = t->V;
     float *attn_out = t->attn_out;
+    /* 本头视图：跳过前 h×64 列，行距仍是 dim（伪矩阵，见 window_attn_forward） */
     const float *Q_h = Q + h * head_dim;
     const float *K_h = K + h * head_dim;
     const float *V_h = V + h * head_dim;
@@ -607,8 +749,10 @@ static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) 
              * This reduces O(seq²*head_dim) to O(seq_h²*seq_w*head_dim + seq_w²*seq_h*head_dim).
              */
 
-            /* Height bias: for each dy offset, fill matching blocks */
+            /* Height bias: for each dy offset, fill matching blocks
+             * 与窗口层同款块结构加速，只是表长随输入网格变（127/95/79） */
             for (int dy = 0; dy < 2 * seq_h - 1; dy++) {
+                /* dy 是表下标（0..2·seq_h-2），actual_dy 是真实位移 qy-ky */
                 int actual_dy = dy - (seq_h - 1);
                 const float *rh_vec = eff_rel_h + dy * head_dim;
 
@@ -636,10 +780,11 @@ static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) 
 
             /* Width bias: for each dx offset, fill matching positions */
             for (int dx = 0; dx < 2 * seq_w - 1; dx++) {
-                int actual_dx = dx - (seq_w - 1);
+                int actual_dx = dx - (seq_w - 1);   /* 表下标 → 真实位移 qx-kx */
                 const float *rw_vec = eff_rel_w + dx * head_dim;
 
                 for (int qx = 0; qx < seq_w; qx++) {
+                    /* 与 kx = qx-actual_dx 配对的所有 (qy,ky) 位置共享同一 bias */
                     int kx = qx - actual_dx;
                     if (kx < 0 || kx >= seq_w) continue;
 
@@ -660,7 +805,8 @@ static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) 
                 }
             }
 
-            /* Debug: dump scores with bias for block 11 head 0 */
+            /* Debug: dump scores with bias for block 11 head 0
+             * 供 tools/regress 与 Python 参考对拍（DS_DUMP_TENSORS 开启时） */
             if (layer_idx == 11 && h == 0 && getenv("DS_DUMP_TENSORS")) {
                 FILE *sf = fopen("dump/c_block11_h0_scores_with_bias.bin", "wb");
                 if (sf) { fwrite(scores, sizeof(float), (size_t)seq_len * seq_len, sf); fclose(sf); }
@@ -717,8 +863,13 @@ static void sam_global_process_head(sam_global_task_t *t, int h, float *scores) 
 #endif
 }
 
+/* sam_global_worker - head 并行线程入口：线程 t 处理头 t, t+nw, t+2nw...
+ * 先分配线程私有 [seq_len, seq_len] scores 缓冲（1024² 时 4096²×4B≈67MB，
+ * 这是全局注意力并行的主要内存代价），再按步幅扫自己名下的头。
+ * 每头两次 sgemm 形状与串行路径一致 → 并行不改变浮点结果（逐位相同）。 */
 static void *sam_global_worker(void *arg) {
     sam_global_task_t *t = (sam_global_task_t *)arg;
+    /* 私有工作缓冲：分配失败则本线程直接退出，其余线程照常完成 */
     float *scores = (float *)malloc((size_t)t->seq_len * t->seq_len * sizeof(float));
     if (!scores) return NULL;
     for (int h = t->tid; h < t->n_heads; h += t->nthreads)
@@ -752,30 +903,35 @@ static void sam_layer_forward(float *out, const float *x,
                                int layer_idx, int seq_h, int seq_w) {
     int dim = DS_SAM_EMBED_DIM;     /* 768 */
     int n_heads = DS_SAM_HEADS;     /* 12 */
-    int head_dim = DS_SAM_HEAD_DIM; /* 64 */
-    int mlp_dim = DS_SAM_MLP_DIM;   /* 3072 */
-    int seq_len = seq_h * seq_w;
-    int win_size = DS_SAM_WINDOW_SIZE; /* 14 */
+    int head_dim = DS_SAM_HEAD_DIM; /* 64 = 768/12 */
+    int mlp_dim = DS_SAM_MLP_DIM;   /* 3072 = 768*4，FFN 中间层宽 4 倍是 ViT 惯例 */
+    int seq_len = seq_h * seq_w;    /* 1024² 输入为 64×64=4096 */
+    int win_size = DS_SAM_WINDOW_SIZE; /* 14：窗口注意力边长（Swin 同款魔数） */
 
-    /* Global attention at layers 2, 5, 8, 11 */
+    /* Global attention at layers 2, 5, 8, 11
+     * 该布局来自 config.json 的 global_attn_indexes，训练时固定不可改 */
     int use_global_attn = (layer_idx == 2 || layer_idx == 5 || layer_idx == 8 || layer_idx == 11);
 
-    const float *norm1_w = vt->sam_layers[layer_idx].norm1_weight;
-    const float *norm1_b = vt->sam_layers[layer_idx].norm1_bias;
-    const float *qkv_w = vt->sam_layers[layer_idx].attn_qkv_weight;
-    const float *qkv_b = vt->sam_layers[layer_idx].attn_qkv_bias;
-    const float *proj_w = vt->sam_layers[layer_idx].attn_proj_weight;
-    const float *proj_b = vt->sam_layers[layer_idx].attn_proj_bias;
-    const float *rel_h = vt->sam_layers[layer_idx].rel_pos_h;
+    /* 取本层全部权重指针（张量名 = safetensors 中 layers.{l}.*，
+     * 形状标注见 ds_ocr.h 的 ds_visual_tokenizer_t） */
+    const float *norm1_w = vt->sam_layers[layer_idx].norm1_weight;   /* [768] */
+    const float *norm1_b = vt->sam_layers[layer_idx].norm1_bias;     /* [768] */
+    const float *qkv_w = vt->sam_layers[layer_idx].attn_qkv_weight;  /* [2304, 768] Q/K/V 融合 */
+    const float *qkv_b = vt->sam_layers[layer_idx].attn_qkv_bias;    /* [2304] */
+    const float *proj_w = vt->sam_layers[layer_idx].attn_proj_weight; /* [768, 768] */
+    const float *proj_b = vt->sam_layers[layer_idx].attn_proj_bias;  /* [768] */
+    const float *rel_h = vt->sam_layers[layer_idx].rel_pos_h;        /* [2s-1, 64]，s 随层类型 */
     const float *rel_w = vt->sam_layers[layer_idx].rel_pos_w;
-    const float *norm2_w = vt->sam_layers[layer_idx].norm2_weight;
+    const float *norm2_w = vt->sam_layers[layer_idx].norm2_weight;   /* [768] */
     const float *norm2_b = vt->sam_layers[layer_idx].norm2_bias;
-    const float *lin1_w = vt->sam_layers[layer_idx].mlp_lin1_weight;
-    const float *lin1_b = vt->sam_layers[layer_idx].mlp_lin1_bias;
-    const float *lin2_w = vt->sam_layers[layer_idx].mlp_lin2_weight;
-    const float *lin2_b = vt->sam_layers[layer_idx].mlp_lin2_bias;
+    const float *lin1_w = vt->sam_layers[layer_idx].mlp_lin1_weight; /* [3072, 768] */
+    const float *lin1_b = vt->sam_layers[layer_idx].mlp_lin1_bias;   /* [3072] */
+    const float *lin2_w = vt->sam_layers[layer_idx].mlp_lin2_weight; /* [768, 3072] */
+    const float *lin2_b = vt->sam_layers[layer_idx].mlp_lin2_bias;   /* [768] */
 
-    /* Pre-norm (LayerNorm1) */
+    /* Pre-norm (LayerNorm1)
+     * Pre-Norm 架构：先归一化再进注意力，残差主干保持恒等映射，
+     * 深层网络训练更稳（GPT/ViT 均如此，区别于原始 Post-Norm） */
     float *x_norm = (float *)malloc(seq_len * dim * sizeof(float));
     ds_layer_norm(x_norm, x, norm1_w, norm1_b, seq_len, dim, 1e-6f);
 
@@ -784,16 +940,19 @@ static void sam_layer_forward(float *out, const float *x,
         ds_dump_tensor("sam_block11_after_norm1", x_norm, seq_len * dim, "[4096, 768]");
     }
 
-    /* Fused QKV projection: [seq, dim] @ [dim, 3*dim] → Q, K, V */
+    /* Fused QKV projection: [seq, dim] @ [dim, 3*dim] → Q, K, V
+     * 三个 [4096, 768] 缓冲：注意 Q/K/V 本身还没有分头，
+     * 头的划分发生在注意力内部（按 64 列一段） */
     float *Q = (float *)malloc(seq_len * dim * sizeof(float));
     float *K = (float *)malloc(seq_len * dim * sizeof(float));
     float *V = (float *)malloc(seq_len * dim * sizeof(float));
 
-    /* Fused QKV: qkv_w is [3*dim, dim], qkv_b is [3*dim] */
+    /* Fused QKV: qkv_w is [3*dim, dim], qkv_b is [3*dim]
+     * 一次 ds_linear 同时算 Q、K、V——比三次小 matmul 快（大 GEMM 利用率更高） */
     float *qkv = (float *)malloc(seq_len * 3 * dim * sizeof(float));
     ds_linear(qkv, x_norm, qkv_w, qkv_b, seq_len, dim, 3 * dim);
 
-    /* Split QKV */
+    /* Split QKV：每行是 [Q(768)|K(768)|V(768)] 三段拼接，按列切开 */
     for (int s = 0; s < seq_len; s++) {
         memcpy(Q + s * dim, qkv + s * 3 * dim, dim * sizeof(float));
         memcpy(K + s * dim, qkv + s * 3 * dim + dim, dim * sizeof(float));
@@ -827,7 +986,9 @@ static void sam_layer_forward(float *out, const float *x,
         int needed_size = 2 * seq_h - 1;  /* 2*48-1=95 for 768x768 */
 
         if (needed_size != stored_size) {
-            /* Try loading precomputed rel_pos from model_dir first */
+            /* Try loading precomputed rel_pos from model_dir first
+             * 预计算文件由 Python 参考实现导出——运行时 C 插值与
+             * PyTorch F.interpolate 总有浮点级细微差异，能复用就复用 */
             char rp_h_path[1024], rp_w_path[1024];
             snprintf(rp_h_path, sizeof(rp_h_path), "%s/rel_pos_h_layer%d_size%d.bin",
                      vt->model_dir, layer_idx, needed_size);
@@ -836,18 +997,21 @@ static void sam_layer_forward(float *out, const float *x,
             FILE *rfh = fopen(rp_h_path, "rb");
             FILE *rfw = fopen(rp_w_path, "rb");
             if (rfh && rfw) {
+                /* 文件布局 [needed_size, head_dim] float32 行主序，正好一张表 */
                 interp_rel_h = (float *)malloc(needed_size * head_dim * sizeof(float));
                 interp_rel_w = (float *)malloc(needed_size * head_dim * sizeof(float));
                 size_t rh_read = fread(interp_rel_h, sizeof(float), needed_size * head_dim, rfh);
                 size_t rw_read = fread(interp_rel_w, sizeof(float), needed_size * head_dim, rfw);
                 fclose(rfh); rfh = NULL;
                 fclose(rfw); rfw = NULL;
+                /* 读满才算有效；不足则当作没这个文件，走下方运行时插值 */
                 if ((int)rh_read == needed_size * head_dim && (int)rw_read == needed_size * head_dim) {
                     eff_rel_h = interp_rel_h;
                     eff_rel_w = interp_rel_w;
                     if (ds_verbose >= 1)
                         fprintf(stderr, "Loaded precomputed rel_pos for layer %d from %s\n",
                                 layer_idx, rp_h_path);
+                    /* 预计算表命中，跳过下方运行时线性插值 */
                     goto rel_pos_done;
                 }
                 free(interp_rel_h); free(interp_rel_w);
@@ -866,14 +1030,19 @@ static void sam_layer_forward(float *out, const float *x,
             for (int d = 0; d < head_dim; d++) {
                 for (int i = 0; i < needed_size; i++) {
                     /* PyTorch align_corners=False linear interpolation:
-                     * src = (dst + 0.5) * src_size / dst_size - 0.5 */
+                     * src = (dst + 0.5) * src_size / dst_size - 0.5
+                     * 把目标行中心映射回源坐标系（半像素对齐，与
+                     * bicubic 的坐标映射公式同源） */
                     float src_f = (float)(i + 0.5f) * (float)stored_size / (float)needed_size - 0.5f;
+                    /* 边界外夹回最近的有效行 */
                     if (src_f < 0.0f) src_f = 0.0f;
                     if (src_f > stored_size - 1.0f) src_f = (float)(stored_size - 1);
+                    /* s0/s1：夹取后的左右两个源行；frac：线性混合系数 */
                     int s0 = (int)src_f;
                     int s1 = s0 + 1;
                     if (s1 >= stored_size) s1 = stored_size - 1;
                     float frac = src_f - s0;
+                    /* 逐维独立插值：每个 head_dim 通道各自线性混合 */
                     interp_rel_h[i * head_dim + d] = rel_h[s0 * head_dim + d] * (1.0f - frac)
                                                      + rel_h[s1 * head_dim + d] * frac;
                     interp_rel_w[i * head_dim + d] = rel_w[s0 * head_dim + d] * (1.0f - frac)
@@ -889,6 +1058,7 @@ static void sam_layer_forward(float *out, const float *x,
     ; /* label target for precomputed rel_pos skip */
 
     /* Attention */
+    /* calloc：无论窗口/全局路径最终都会写满全部有效区域，清零只是防御 */
     float *attn_out = (float *)calloc(seq_len * dim, sizeof(float));
 
     if (use_global_attn) {
@@ -912,12 +1082,17 @@ static void sam_layer_forward(float *out, const float *x,
             .layer_idx = layer_idx, .tid = 0, .nthreads = 1,
         };
 
+        /* head 并行门控：单 SAM 独跑时启用（多 crop 波次期间调用方已清零，
+         * 因为 crop 之间已经并行，再并行会超额订阅） */
         if (sam_gate_gbl() && ds_get_threads() > 1) {
             int nw = sam_gate_gbl();
+            /* DS_SAM_GBL_THREADS 环境变量可覆盖默认线程预算 */
             const char *nw_env = getenv("DS_SAM_GBL_THREADS");
             if (nw_env && nw_env[0]) { int v = atoi(nw_env); if (v > 0) nw = v; }
+            /* 最多 12 线程——头只有 12 个，多了只会空转 */
             if (nw > n_heads) nw = n_heads;
             if (nw > 1) {
+                /* 起 nw-1 个 worker，主线程亲自处理 tid=0 的份额后汇合 */
                 pthread_t *th = (pthread_t *)malloc((nw - 1) * sizeof(pthread_t));
                 sam_global_task_t *dt = (sam_global_task_t *)malloc(nw * sizeof(sam_global_task_t));
                 for (int i = 1; i < nw; i++) {
@@ -929,11 +1104,13 @@ static void sam_layer_forward(float *out, const float *x,
                 for (int i = 1; i < nw; i++) pthread_join(th[i - 1], NULL);
                 free(th); free(dt);
             } else {
+                /* 退化为单线程：一个 score 缓冲扫完 12 个头 */
                 float *scores = (float *)malloc((size_t)seq_len * seq_len * sizeof(float));
                 for (int h = 0; h < n_heads; h++) sam_global_process_head(&gtask, h, scores);
                 free(scores);
             }
         } else {
+            /* 门控关闭（多 crop 波次）：串行路径，行为与 nw=1 分支相同 */
             float *scores = (float *)malloc((size_t)seq_len * seq_len * sizeof(float));
             for (int h = 0; h < n_heads; h++) sam_global_process_head(&gtask, h, scores);
             free(scores);
@@ -949,8 +1126,10 @@ static void sam_layer_forward(float *out, const float *x,
          * attention scores (diff max=0.209 at Block 0). */
         int n_windows, padded_h, padded_w;
         float *padded_x = window_partition_pad(x_norm, seq_h, seq_w, win_size, dim, &n_windows, &padded_h, &padded_w);
+        /* 每窗 token 数 196（14×14） */
         int win_tokens = win_size * win_size;
 
+        /* [n_windows, 196, 768]：每窗写自己的连续切片 */
         float *win_attn = (float *)calloc((size_t)n_windows * win_tokens * dim, sizeof(float));
 
         sam_window_task_t wtask = {
@@ -979,6 +1158,7 @@ static void sam_layer_forward(float *out, const float *x,
             }
             if (nw > n_windows) nw = n_windows;
             if (nw > 1) {
+                /* 主线程处理 tid=0 份额，与 nw-1 个 worker 汇合 */
                 pthread_t *th = (pthread_t *)malloc((nw - 1) * sizeof(pthread_t));
                 sam_window_task_t *dt = (sam_window_task_t *)malloc(nw * sizeof(sam_window_task_t));
                 for (int i = 1; i < nw; i++) {
@@ -992,6 +1172,7 @@ static void sam_layer_forward(float *out, const float *x,
                 for (int i = 1; i < nw; i++) pthread_join(th[i - 1], NULL);
                 free(th); free(dt);
             } else {
+                /* 单线程：串行扫 25 个窗口 */
                 for (int w = 0; w < n_windows; w++) sam_process_window(&wtask, w);
             }
         } else {
@@ -999,19 +1180,23 @@ static void sam_layer_forward(float *out, const float *x,
         }
         free(padded_x);
 
-        /* Unpartition back to full sequence (removes padding) */
+        /* Unpartition back to full sequence (removes padding)
+         * 拼回 4096×768 并丢弃补区结果，attn_out 与输入一一对应 */
         window_unpartition_pad(attn_out, seq_h, seq_w, win_size, dim, padded_h, padded_w, win_attn);
         free(win_attn);
     }
 
     free(Q); free(K); free(V);
-    /* Output projection + residual */
+    /* Output projection + residual
+     * attn.proj [768,768]：把 12 个头的结果拼回一层里做跨头信息混合 */
     float *proj_out = (float *)malloc(seq_len * dim * sizeof(float));
     ds_linear(proj_out, attn_out, proj_w, proj_b, seq_len, dim, dim);
     free(attn_out);
+    /* 释放全局层插值出来的临时 rel_pos 表（窗口层 interp_* 为 NULL） */
     if (interp_rel_h) free(interp_rel_h);
     if (interp_rel_w) free(interp_rel_w);
 
+    /* 残差连接：out = x + attn(x)——恒等主干让梯度直达浅层 */
     for (int i = 0; i < seq_len * dim; i++) out[i] = x[i] + proj_out[i];
 
     if (layer_idx == 11) {
@@ -1022,14 +1207,18 @@ static void sam_layer_forward(float *out, const float *x,
 
     free(proj_out);
 
-    /* FFN: Pre-norm (LayerNorm2) + GELU MLP */
+    /* FFN: Pre-norm (LayerNorm2) + GELU MLP
+     * 升维→非线性→降维的瓶颈结构，与注意力残差并列的第二条子层 */
     float *ffn_norm = (float *)malloc(seq_len * dim * sizeof(float));
     ds_layer_norm(ffn_norm, out, norm2_w, norm2_b, seq_len, dim, 1e-6f);
 
+    /* lin1: 768→3072 升维 4 倍，给非线性留出表达空间 */
     float *fc1 = (float *)malloc(seq_len * mlp_dim * sizeof(float));
     ds_linear(fc1, ffn_norm, lin1_w, lin1_b, seq_len, dim, mlp_dim);
+    /* GELU(x) = x·Φ(x)：比 ReLU 平滑（保留小幅负值），BERT/ViT 同款 */
     ds_gelu(fc1, seq_len * mlp_dim);
 
+    /* lin2: 3072→768 降维回原通道数，准备做残差 */
     float *fc2 = (float *)malloc(seq_len * dim * sizeof(float));
     ds_linear(fc2, fc1, lin2_w, lin2_b, seq_len, mlp_dim, dim);
 
@@ -1037,6 +1226,7 @@ static void sam_layer_forward(float *out, const float *x,
         ds_dump_tensor("sam_block11_mlp_out", fc2, seq_len * dim, "[4096, 768]");
     }
 
+    /* 第二条残差：out = out + FFN(LN(out))，本层到此结束 */
     for (int i = 0; i < seq_len * dim; i++) out[i] += fc2[i];
 
     free(x_norm); free(ffn_norm); free(fc1); free(fc2);
@@ -1067,10 +1257,13 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
                                 const ds_visual_tokenizer_t *vt) {
     int c_in = DS_SAM_EMBED_DIM; /* 768 */
     int c_mid = DS_SAM_NECK_DIM; /* 256 */
-    int spatial_sz = h * w;
+    int spatial_sz = h * w;      /* 64×64=4096（1024² 输入） */
 
-    /* Neck conv1: [768, h, w] → [256, h, w] (1×1 conv, no padding) */
+    /* Neck conv1: [768, h, w] → [256, h, w] (1×1 conv, no padding)
+     * 1×1 卷积 = 对每个像素独立做一次 768→256 线性映射，空间上不混合邻域；
+     * 权重 sam_neck_conv1_weight [256, 768, 1, 1]（形状即契约，见下文事故注） */
     float *conv1_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
+    /* ds_conv2d 参数依次: in_c=768, out_c=256, kH=1, kW=1, stride=1, pad=0 */
     ds_conv2d(conv1_out, spatial, vt->sam_neck_conv1_weight, vt->sam_neck_conv1_bias,
               c_in, c_mid, h, w, 1, 1, 1, 0);
 
@@ -1091,7 +1284,7 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
         if (f) { fwrite(vt->sam_neck_ln1_bias, sizeof(float), 256, f); fclose(f); }
     }
 
-    /* LayerNorm2d after conv1 */
+    /* LayerNorm2d after conv1：跨 256 个通道归一化（实现见 layer_norm_2d） */
     float *ln1_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
     layer_norm_2d(ln1_out, conv1_out, vt->sam_neck_ln1_weight, vt->sam_neck_ln1_bias,
                   c_mid, spatial_sz);
@@ -1105,8 +1298,10 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
 
     /* Neck conv2: [256, h, w] → [256, h, w]
      * ALL versions (V1, V2, V3): 3×3 conv, stride=1, padding=1
-     * Weight shape: [256, 256, 3, 3] confirms kernel_size=3 */
+     * Weight shape: [256, 256, 3, 3] confirms kernel_size=3
+     * 3×3 卷积负责空间邻域混合（conv1 不做），s=1/p=1 保持网格尺寸不变 */
     float *conv2_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
+    /* 参数: in_c=256, out_c=256, kH=3, kW=3, stride=1, pad=1（p=1 使 3×3 输出入同尺寸） */
     ds_conv2d(conv2_out, ln1_out, vt->sam_neck_conv2_weight, vt->sam_neck_conv2_bias,
               c_mid, c_mid, h, w, 3, 3, 1, 1);
     free(ln1_out);
@@ -1117,7 +1312,7 @@ static float *sam_neck_forward(const float *spatial, int h, int w,
         if (f) { fwrite(conv2_out, sizeof(float), c_mid * spatial_sz, f); fclose(f); }
     }
 
-    /* LayerNorm2d after conv2 */
+    /* LayerNorm2d after conv2：neck 收尾，输出 [256, 64, 64] 交降采样 */
     float *ln2_out = (float *)malloc(c_mid * spatial_sz * sizeof(float));
     layer_norm_2d(ln2_out, conv2_out, vt->sam_neck_ln2_weight, vt->sam_neck_ln2_bias,
                   c_mid, spatial_sz);
@@ -1146,24 +1341,31 @@ static float *sam_downsample_forward(const float *spatial, int h, int w,
                                       int ds2_dim,
                                       int *out_h, int *out_w) {
     /* net_2: Conv2d(256→512, k3, s2, p1) */
+    /* 卷积输出尺寸公式 floor((h+2p-k)/s)+1：代入 p=1,k=3,s=2 得
+     * floor((h-1)/2)+1 = h/2（h 为偶数）——64→32→16 的第一跳 */
     int h2 = (h + 2 * 1 - 3) / 2 + 1; /* = h/2 */
     int w2 = (w + 2 * 1 - 3) / 2 + 1;
     int sp2 = h2 * w2;
 
+    /* 权重 sam_net2_weight [512, 256, 3, 3]：stride=2 卷积兼做下采样与升维 */
     float *net2_out = (float *)malloc(DS_SAM_DS1_DIM * sp2 * sizeof(float));
     ds_conv2d(net2_out, spatial, vt->sam_net2_weight, vt->sam_net2_bias,
               DS_SAM_NECK_DIM, DS_SAM_DS1_DIM, h, w, 3, 3, 2, 1);
 
     /* net_3: Conv2d(512→ds2_dim, k3, s2, p1) */
+    /* 第二跳：32→16（1024²）或 24→12（768²），网格就此定格 */
     int h3 = (h2 + 2 * 1 - 3) / 2 + 1; /* = h/4 */
     int w3 = (w2 + 2 * 1 - 3) / 2 + 1;
     int sp3 = h3 * w3;
 
+    /* 权重 sam_net3_weight [1024, 512, 3, 3]（V2 为 [896, 512, 3, 3]）——
+     * 输出通道数是四代模型的分叉点 */
     float *net3_out = (float *)malloc(ds2_dim * sp3 * sizeof(float));
     ds_conv2d(net3_out, net2_out, vt->sam_net3_weight, vt->sam_net3_bias,
               DS_SAM_DS1_DIM, ds2_dim, h2, w2, 3, 3, 2, 1);
     free(net2_out);
 
+    /* 回传最终网格尺寸：1024² 输入 16×16，768² 输入 12×12 */
     *out_h = h3;
     *out_w = w3;
     return net3_out;
@@ -1189,13 +1391,16 @@ static float *sam_downsample_forward(const float *spatial, int h, int w,
  * 【纪律】两套重采样器各随其参考实现，对过数；不要凭"哪个才对"互相
  * "统一"，参数跟参考走（git eae0424 审计曾把 -0.5 误改 -0.75）。 */
 static float bicubic_weight(float x) {
-    const float a = -0.5f;
+    const float a = -0.5f;   /* 核形状参数：PIL BICUBIC 风格（详见函数头注释） */
     float ax = fabsf(x);
     if (ax <= 1.0f) {
+        /* 主瓣 |x|≤1：权重为正、在 x=0 处取 1（自身像素权重最大） */
         return (a + 2.0f) * ax * ax * ax - (a + 3.0f) * ax * ax + 1.0f;
     } else if (ax < 2.0f) {
+        /* 旁瓣 1<|x|<2：权重可为负——三次核允许轻微过冲（锐利感的来源） */
         return a * ax * ax * ax - 5.0f * a * ax * ax + 8.0f * a * ax - 4.0f * a;
     }
+    /* |x|≥2：支撑域之外，权重为 0（每个采样点只看 ±2 邻域） */
     return 0.0f;
 }
 
@@ -1217,29 +1422,38 @@ static float *bicubic_interpolate_2d(const float *src, int src_h, int src_w,
 
     /* Compute scale factors and kernel support for antialiasing.
      * For downsampling (scale < 1), the filter is widened by 1/scale.
-     * For upsampling (scale >= 1), the standard 4x4 kernel is used. */
+     * For upsampling (scale >= 1), the standard 4x4 kernel is used.
+     * scale = 源格/目标格：64→48 时 ≈1.33，64→40 时 =1.6 */
     float y_scale = (float)src_h / (float)tgt_h;
     float x_scale = (float)src_w / (float)tgt_w;
+    /* 核半径 support：fminf(scale,1)<1（目标格更密）时按 2/scale 扩大，
+     * 否则固定为 2——本工程实际走 64→48/40（scale>1），恒为 2，
+     * 即每个目标点看 5×5 邻域（含边界夹取） */
     int y_support = (int)ceilf(2.0f / fminf(y_scale, 1.0f));
     int x_support = (int)ceilf(2.0f / fminf(x_scale, 1.0f));
 
     for (int ty = 0; ty < tgt_h; ty++) {
+        /* align_corners=False 坐标映射：目标像素中心对齐源坐标系，
+         * sy 通常落在两个源行之间（这就是"插值"的含义） */
         float sy = (float)src_h * ((float)ty + 0.5f) / (float)tgt_h - 0.5f;
-        int sy0 = (int)floorf(sy);
+        int sy0 = (int)floorf(sy);   /* 邻域基准：最近的源整数行 */
 
         for (int tx = 0; tx < tgt_w; tx++) {
             float sx = (float)src_w * ((float)tx + 0.5f) / (float)tgt_w - 0.5f;
             int sx0 = (int)floorf(sx);
 
             for (int d = 0; d < embed_dim; d++) {
+                /* 二维可分离卷积：先 y 后 x 两方向权重相乘累加 */
                 float val = 0.0f;
                 float w_sum = 0.0f;
 
                 for (int ky = -y_support; ky <= y_support; ky++) {
+                    /* 边界夹取：越界邻域点取边缘像素（replicate padding） */
                     int y_clamped = sy0 + ky;
                     if (y_clamped < 0) y_clamped = 0;
                     if (y_clamped >= src_h) y_clamped = src_h - 1;
                     float dy = (float)(sy0 + ky) - sy;
+                    /* 距离乘 fminf(scale,1) 后过核：scale<1 时等效把核拉宽 */
                     float wy = bicubic_weight(dy * fminf(y_scale, 1.0f));
 
                     for (int kx = -x_support; kx <= x_support; kx++) {
@@ -1249,12 +1463,14 @@ static float *bicubic_interpolate_2d(const float *src, int src_h, int src_w,
                         float dx = (float)(sx0 + kx) - sx;
                         float wx = bicubic_weight(dx * fminf(x_scale, 1.0f));
 
+                        /* 联合权重 = wx·wy（可分离），NHWC 布局按 d 步长取值 */
                         float w = wx * wy;
                         val += w * src[(y_clamped * src_w + x_clamped) * embed_dim + d];
                         w_sum += w;
                     }
                 }
-                /* Normalize to prevent drift from boundary clamping */
+                /* Normalize to prevent drift from boundary clamping
+                 * 夹取使权重和偏离 1，除回去避免边缘位置编码系统性偏移 */
                 dst[(ty * tgt_w + tx) * embed_dim + d] = (w_sum > 0.0f) ? val / w_sum : 0.0f;
             }
         }
@@ -1284,6 +1500,8 @@ static float *bicubic_interpolate_2d(const float *src, int src_h, int src_w,
 static float *interpolate_pos_embed(const float *pos_embed, int src_grid,
                                      int tgt_grid, int embed_dim) {
     if (src_grid == tgt_grid) {
+        /* 网格相同也拷贝一份：两条来源（原表/插值表）所有权统一，
+         * 调用方不做区分、一律 free */
         float *out = (float *)malloc(src_grid * src_grid * embed_dim * sizeof(float));
         memcpy(out, pos_embed, src_grid * src_grid * embed_dim * sizeof(float));
         return out;
@@ -1291,6 +1509,7 @@ static float *interpolate_pos_embed(const float *pos_embed, int src_grid,
     if (ds_verbose >= 1)
         fprintf(stderr, "Interpolating pos_embed: %dx%d -> %dx%d (bicubic)\n",
                 src_grid, src_grid, tgt_grid, tgt_grid);
+    /* 委托给带 antialias 的 bicubic 重采样（见 bicubic_interpolate_2d） */
     return bicubic_interpolate_2d(pos_embed, src_grid, src_grid,
                                    tgt_grid, tgt_grid, embed_dim);
 }
@@ -1312,28 +1531,36 @@ static float *interpolate_pos_embed(const float *pos_embed, int src_grid,
 static float *sam_patch_embed(const float *image_chw, int img_h, int img_w,
                                const float *weight, const float *bias,
                                int *out_h, int *out_w) {
-    int patch_size = DS_SAM_PATCH_SIZE;
-    int embed_dim = DS_SAM_EMBED_DIM;
+    int patch_size = DS_SAM_PATCH_SIZE;   /* 16 */
+    int embed_dim = DS_SAM_EMBED_DIM;     /* 768 */
+    /* token 网格：1024/16=64（768 裁剪 48、640 裁剪 40）——整除由上游
+     * resize/pad 保证，否则 / 会静默截断丢掉最后一行像素 */
     *out_h = img_h / patch_size;
     *out_w = img_w / patch_size;
 
+    /* 4096（1024²）/ 2304（768²）/ 1600（640²）个 patch */
     int n_patches = (*out_h) * (*out_w);
     float *patches = (float *)malloc(n_patches * embed_dim * sizeof(float));
 
-    /* Conv2D: weight [768, 3, 16, 16], stride 16, no padding */
+    /* Conv2D: weight [768, 3, 16, 16], stride 16, no padding
+     * k=s=16 且 p=0 → 相邻窗口零重叠，每个 16×16×3 像素块恰好被
+     * 一个卷积核看一次，压成一个 768 维向量（"视觉词元化"） */
     ds_conv2d(patches, image_chw, weight, bias, 3, embed_dim, img_h, img_w,
               16, 16, 16, 0);
 
     if (ds_dump_enabled()) {
         /* Detailed patch_embed diagnostics */
-        /* 1. Per-channel unique value count for first few channels */
+        /* 1. Per-channel unique value count for first few channels
+         * 每个通道统计不同取值个数：权重加载正确时输出应几乎各不相同；
+         * unique=1（全同）几乎必然意味着权重没加载上 */
         for (int ch = 0; ch < 3; ch++) {
             int unique = 1;
-            float *ch_data = patches + ch * n_patches;
+            float *ch_data = patches + ch * n_patches;  /* CHW：通道 ch 的平面 */
             /* Simple unique count: sort and count transitions */
             float *tmp = (float *)malloc(n_patches * sizeof(float));
             memcpy(tmp, ch_data, n_patches * sizeof(float));
-            /* Count unique by naive O(n^2) — n_patches=4096, cheap enough */
+            /* Count unique by naive O(n^2) — n_patches=4096, cheap enough
+             * 只在 dump 模式跑，不为性能优化 */
             unique = 0;
             for (int i = 0; i < n_patches; i++) {
                 int is_new = 1;
@@ -1349,16 +1576,20 @@ static float *sam_patch_embed(const float *image_chw, int img_h, int img_w,
         }
 
         /* 2. Verify first output patch manually: output[oc, 0] = sum(weight[oc,ic]*input[ic,0:16,0:16]) + bias[oc] */
-        /* Input patch: image_chw[c, 0:16, 0:16] for c=0..2 */
+        /* Input patch: image_chw[c, 0:16, 0:16] for c=0..2
+         * 手工取出图像左上角 16×16×3 像素块（与卷积核滑窗的第一站相同） */
         float *input_patch = (float *)malloc(3 * 16 * 16 * sizeof(float));
         for (int c = 0; c < 3; c++)
             for (int y = 0; y < 16; y++)
                 for (int x = 0; x < 16; x++)
+                    /* CHW 寻址：通道平面内按行主序取 16×16 */
                     input_patch[c * 256 + y * 16 + x] = image_chw[c * img_h * img_w + y * img_w + x];
         ds_dump_tensor("input_patch_0_0", input_patch, 3 * 16 * 16, "[3, 16, 16]");
 
         /* Manual conv for channel 0: dot(weight[0], input_patch) + bias[0] */
-        /* weight layout: [768, 3*16*16] = [out_ch, in_ch * kH * kW] */
+        /* weight layout: [768, 3*16*16] = [out_ch, in_ch * kH * kW]
+         * 权重内层已摊平成 768 维向量 → 一次点积即一个输出通道，
+         * 与 ds_conv2d 的输出 patches[0] 对不上就说明卷积布局有 bug */
         float manual_out = bias[0];
         int patch_size_sq = 3 * 16 * 16;
         for (int p = 0; p < patch_size_sq; p++) {
@@ -1367,7 +1598,7 @@ static float *sam_patch_embed(const float *image_chw, int img_h, int img_w,
         fprintf(stderr, "[DUMP] patch_embed manual ch0 patch(0,0) = %.6f, conv2d output = %.6f\n",
                 manual_out, patches[0]);
 
-        /* Dump weight and bias stats */
+        /* Dump weight and bias stats：均值/绝对值均值异常（如全 0）= 加载问题 */
         float w_sum = 0, w_abs_sum = 0;
         for (int i = 0; i < embed_dim * 3 * 16 * 16; i++) {
             w_sum += weight[i];
@@ -1386,8 +1617,8 @@ static float *sam_patch_embed(const float *image_chw, int img_h, int img_w,
     }
 
     /* Also return the patch embeds for CLIP input (before adding pos embed) */
-    /* patches is in [768, n_patches] format (CHW) */
-
+    /* patches is in [768, n_patches] format (CHW)
+     * 注意返回的是 CHW 布局：位置编码相加处会转成 token-major */
     return patches;
 }
 
@@ -1416,7 +1647,9 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
      * 原子自增保证 9 个 crop 线程各自拿到唯一 slot。 */
     int _sam_call_idx = __sync_fetch_and_add(&g_sam_call_idx, 1);
 
-    /* Patch embedding */
+    /* Patch embedding
+     * [3, img_h, img_w] float CHW → [768, grid_h, grid_w]（CHW 布局）：
+     * 1024² 输入 grid=64×64，768² 裁剪 48×48，640² 裁剪 40×40 */
     int grid_h, grid_w;
     float *patch_spatial = sam_patch_embed(image_chw, img_h, img_w,
                                             vt->sam_patch_embed_weight,
@@ -1424,7 +1657,9 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                                             &grid_h, &grid_w);
     int n_patches = grid_h * grid_w;
 
-    /* Save patch_embeds for CLIP input (in [768, n_patches] format) */
+    /* Save patch_embeds for CLIP input (in [768, n_patches] format)
+     * V1/V3 的 CLIP 不用自己的 patch_embedding Conv2d，直接吃 SAM 的
+     * conv 输出（加位置编码之前）——所以要在加 pos 前另存一份 */
     if (out_patch_embeds) {
         *out_patch_embeds = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
         memcpy(*out_patch_embeds, patch_spatial, n_patches * DS_SAM_EMBED_DIM * sizeof(float));
@@ -1443,7 +1678,8 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                 _sam_call_idx, n_patches, img_w, img_h);
     }
 
-    /* Add positional embedding (with interpolation for non-1024 inputs) */
+    /* Add positional embedding (with interpolation for non-1024 inputs)
+     * token-major 缓冲 [n_patches, 768]：位置编码按 (row,col) 网格查表 */
     float *x = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
 
     /* All versions (V1/V2/V3): the checkpoint stores pos_embed as a 2D spatial
@@ -1456,13 +1692,15 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
      * the end of the 4096-row tensor. */
     {
         int src_grid = cfg->image_size / DS_SAM_PATCH_SIZE;  /* 64 */
-        int tgt_grid = grid_h;  /* may differ from src_grid for 768/640 inputs */
+        int tgt_grid = grid_h;  /* may differ from src_grid for 768/640 inputs
+                                 * （48 或 40，决定要不要插值） */
 
-        float *pos_embed = vt->sam_pos_embed;
+        float *pos_embed = vt->sam_pos_embed;   /* checkpoint 原表 [1,64,64,768] */
         float *interp_pos = NULL;
 
         if (tgt_grid != src_grid) {
-            /* Try loading precomputed pos_embed from model_dir (avoids C interpolation mismatch) */
+            /* Try loading precomputed pos_embed from model_dir (avoids C interpolation mismatch)
+             * 预计算文件优先：与 rel_pos 同理，规避 C/PyTorch 浮点级差异 */
             char pe_path[1024];
             snprintf(pe_path, sizeof(pe_path), "%s/pos_embed_%dx%d.bin", vt->model_dir, tgt_grid, tgt_grid);
             FILE *pf = fopen(pe_path, "rb");
@@ -1471,6 +1709,7 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                 size_t nread = fread(interp_pos, sizeof(float),
                                       tgt_grid * tgt_grid * DS_SAM_EMBED_DIM, pf);
                 fclose(pf);
+                /* 字节数不符 → 文件视为无效，退回运行时插值 */
                 if ((int)nread == tgt_grid * tgt_grid * DS_SAM_EMBED_DIM) {
                     pos_embed = interp_pos;
                     if (ds_verbose >= 1)
@@ -1482,16 +1721,20 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                     pos_embed = interp_pos;
                 }
             } else {
-                /* Fallback to C bicubic interpolation */
+                /* Fallback to C bicubic interpolation
+                 * 实测四代模型目录都未附带该文件，实际总走这条路 */
                 interp_pos = interpolate_pos_embed(pos_embed, src_grid, tgt_grid, DS_SAM_EMBED_DIM);
                 pos_embed = interp_pos;
             }
         }
 
         for (int p = 0; p < n_patches; p++) {
+            /* 一维 token 下标 → 二维网格坐标（行主序） */
             int row = p / grid_w;
             int col = p % grid_w;
             for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
+                /* patch_spatial 是 CHW（通道在外），pos_embed 是 HWC/token-major：
+                 * 这一加顺手完成 CHW→token-major 的转置 */
                 x[p * DS_SAM_EMBED_DIM + d] = patch_spatial[d * n_patches + p]
                     + pos_embed[(row * tgt_grid + col) * DS_SAM_EMBED_DIM + d];
             }
@@ -1521,7 +1764,7 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
             }
         }
 
-        if (interp_pos) free(interp_pos);
+        if (interp_pos) free(interp_pos);   /* 原表不 free（mmap 零拷贝指针） */
     }
     free(patch_spatial);
 
@@ -1529,6 +1772,8 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         fprintf(stderr, "SAM patch embed: %dx%d -> %d patches (grid %dx%d)\n",
                 img_h, img_w, n_patches, grid_h, grid_w);
 
+    /* 12 层 Transformer 主循环：每层 next 为输出，循环尾用指针交换
+     * 免掉一次整块 memcpy（x 变成本层输出，再喂给下一层） */
     double _sam_t0 = 0, _sam_t1 = 0; struct timespec _sam_ts; clock_gettime(CLOCK_MONOTONIC, &_sam_ts); _sam_t0 = _sam_ts.tv_sec + _sam_ts.tv_nsec/1e9;
     for (int l = 0; l < 12; l++) {
         float *next = (float *)malloc(n_patches * DS_SAM_EMBED_DIM * sizeof(float));
@@ -1552,6 +1797,7 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
             fprintf(stderr, "Dumped SAM slot%d layer %d I/O for comparison\n", _dump_slot, l);
         }
         
+        /* 指针交换：旧缓冲释放，输出成为下一层输入（核心循环习惯写法） */
         free(x);
         x = next;
 
@@ -1564,7 +1810,9 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
                     (l == 2 || l == 5 || l == 8 || l == 11));
     }
 
-    /* Reshape to spatial [768, grid_h, grid_w] for neck */
+    /* Reshape to spatial [768, grid_h, grid_w] for neck
+     * token-major [4096,768] 转回通道优先 CHW——neck 的两个卷积按
+     * [C, H·W] 布局消费特征图 */
     float *spatial = (float *)malloc(DS_SAM_EMBED_DIM * n_patches * sizeof(float));
     for (int p = 0; p < n_patches; p++) {
         for (int d = 0; d < DS_SAM_EMBED_DIM; d++) {
@@ -1587,10 +1835,11 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
 
     /* SAM downsample: [256, H, W] -> [512, H/2, W/2] -> [ds2_dim, H/4, W/4] */
     int ds_h, ds_w;
-    int ds2_dim = cfg->sam_ds2_dim;
+    int ds2_dim = cfg->sam_ds2_dim;   /* V1/V3=1024，V2=896（net_3 输出通道） */
     float *ds_out = sam_downsample_forward(neck_out, grid_h, grid_w, vt, ds2_dim, &ds_h, &ds_w);
     free(neck_out);
 
+    /* 最终 token 数：16×16=256（1024²）或 12×12=144（768²） */
     int ds_spatial = ds_h * ds_w;
 
     /* Dump downsample output for debugging */
@@ -1601,7 +1850,9 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
         if (f) { fwrite(ds_out, sizeof(float), ds2_dim * ds_spatial, f); fclose(f); }
     }
 
-    /* Convert [ds2_dim, ds_h*ds_w] -> [ds_h*ds_w, ds2_dim] for downstream use */
+    /* Convert [ds2_dim, ds_h*ds_w] -> [ds_h*ds_w, ds2_dim] for downstream use
+     * 交付格式：行主序 [n_tokens, dim] token 序列——下游 DeepEncoder /
+     * Projector 每行吃一个视觉 token（与文本 token 同构） */
     float *tokens = (float *)malloc(ds_spatial * ds2_dim * sizeof(float));
     for (int p = 0; p < ds_spatial; p++) {
         for (int d = 0; d < ds2_dim; d++) {
@@ -1626,10 +1877,17 @@ static float *sam_forward_from_chw(ds_ctx_t *ctx, const float *image_chw,
  * converts to float CHW, then runs SAM forward.
  * Used for multi-crop encoding where each crop is 768x768.
  * ======================================================================== */
+/* ds_sam_forward_image - 从预处理好的 ds_image_t 直接跑 SAM（docs/06 §5 多裁剪）
+ * 多 crop 编码的入口：每个裁剪（如 768×768）已由 ds_image 模块切好，
+ * 这里只负责 uint8→float CHW 归一化（mean=std=0.5 → [-1,1]）再走
+ * sam_forward_from_chw。位置编码/rel_pos 的插值在内部自动完成。
+ * 注意：本函数不做 resize/pad——输入必须已是目标尺寸。
+ */
 float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
                              int *out_n_tokens, float **out_patch_embeds) {
     if (!img || !img->pixels) return NULL;
-    g_sam_is_v2 = (ctx->config.model_version == 2);
+    g_sam_is_v2 = (ctx->config.model_version == 2);   /* 标记本次调用的模型版本 */
+    /* uint8 HWC → float32 CHW + 归一化，SAM 卷积期望的平面布局 */
     float *image_chw = ds_image_to_float_chw(img);
     if (!image_chw) return NULL;
 
@@ -1647,7 +1905,7 @@ float *ds_sam_forward_image(ds_ctx_t *ctx, const ds_image_t *img,
 
     float *tokens = sam_forward_from_chw(ctx, image_chw, img->height, img->width,
                                           out_n_tokens, out_patch_embeds);
-    free(image_chw);
+    free(image_chw);   /* float 中间缓冲用完即弃 */
     return tokens;
 }
 
@@ -1678,9 +1936,10 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
     ds_config_t *cfg = &ctx->config;
     g_sam_is_v2 = (cfg->model_version == 2 || cfg->model_version == 3);
 
-    /* Preprocess: resize/pad to target image size (e.g. 1024x1024) */
+    /* Preprocess: resize/pad to target image size (e.g. 1024x1024)
+     * 栈上临时结构包住外部像素——pad 之前不为图像本身分配内存 */
     ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
-    int target_size = cfg->image_size;
+    int target_size = cfg->image_size;   /* 1024：V1/V2/V3 全局图统一尺寸 */
 
     ds_image_t *resized_img = NULL;
     if (width != target_size || height != target_size) {
@@ -1706,11 +1965,14 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
         }
     }
 
-    /* Convert to float CHW and run SAM forward */
+    /* Convert to float CHW and run SAM forward
+     * 图恰好是 target_size 时（无 pad），直接用原图 */
     ds_image_t *effective_img = resized_img ? resized_img : &img;
     float *image_chw = ds_image_to_float_chw(effective_img);
 
-    /* Save resized pixels for CLIP V1 (which needs raw RGB input) */
+    /* Save resized pixels for CLIP V1 (which needs raw RGB input)
+     * SAM 吃 float 归一化版本，CLIP-V1 吃这份 uint8 原色版本——
+     * 同一张预处理图，两种消费方式 */
     if (out_resized_pixels && effective_img->pixels) {
         size_t sz = (size_t)effective_img->width * effective_img->height * effective_img->channels;
         *out_resized_pixels = (unsigned char *)malloc(sz);
@@ -1721,9 +1983,11 @@ float *ds_visual_tokenizer_forward(ds_ctx_t *ctx, const unsigned char *pixels,
         }
     }
 
+    /* pad 出来的临时图释放（像素已另存给调用方 / 已转 float） */
     if (resized_img) ds_image_free(resized_img);
     if (!image_chw) return NULL;
 
+    /* 全局图恒为 target_size×target_size：SAM 内部无需插值位置编码 */
     float *tokens = sam_forward_from_chw(ctx, image_chw, target_size, target_size,
                                           out_n_tokens, out_patch_embeds);
     free(image_chw);

@@ -254,7 +254,8 @@ static void dense_ffn_forward(float *output, const float *x,
     if (own_up) up_buf = (float *)malloc(intermediate * sizeof(float));
     if (own_swiglu) swiglu_buf = (float *)malloc(intermediate * sizeof(float));
 
-    /* Gate + Up projections */
+    /* Gate + Up 投影：两个 [6848,1280] 的 BF16 权重矩阵各做一次 matvec
+     * （rows=1 表示只算当前这个 token 的一行；BF16→F32 在内核内逐元素完成） */
     ds_linear_nobias_bf16(gate_buf, x, layer->dense_gate_weight_bf16, 1, hidden, intermediate);
     ds_linear_nobias_bf16(up_buf, x, layer->dense_up_weight_bf16, 1, hidden, intermediate);
 
@@ -426,6 +427,9 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
      * 任一不满足 → 回退 CPU 路径（无任何降级提示，属正常分派而非错误）。
      * r2 任务3 移除连续块拷贝后 gate_up_fused_bf16 恒为 NULL，
      * 此 GPU 路径当前处于休眠状态，保留以支持未来重建 fused 布局。 */
+    /* 专家输出暂存 [top_k, hidden]：第 k 行是第 k 个选中专家对 x 的输出。
+     * 优先复用调用者传入的预分配缓冲；没有则 calloc（moe_combine 处依赖
+     * "缓冲进入本函数时全零"的不变量，见该处清零注释） */
     float *expert_outputs = expert_outputs_buf ? expert_outputs_buf :
                             (float *)calloc(top_k * hidden, sizeof(float));
 
@@ -745,10 +749,13 @@ shared_experts:
  */
 static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
                                    int layer_idx, int pos) {
-    ds_moe_decoder_t *dec = &ctx->decoder;
-    ds_config_t *cfg = &ctx->config;
-    ds_dec_layer_t *layer = &dec->layers[layer_idx];
+    ds_moe_decoder_t *dec = &ctx->decoder;            /* 解码器整体：12 层权重 + final norm */
+    ds_config_t *cfg = &ctx->config;                  /* 模型超参：维度/头数/专家数等 */
+    ds_dec_layer_t *layer = &dec->layers[layer_idx];  /* 本层全部权重（注意力 + FFN/MoE） */
 
+    /* 维度速记：hidden=1280；Q 侧 10 头×head_dim=128 → q_dim=1280，
+     * KV 侧 10 头×128 → kv_dim=1280（本模型 MHA，Q/KV 头数相同、无 GQA 压缩）。
+     * q/k/v 是 hidden 长的扁平数组，按头切开才视作 [n_heads, head_dim]。 */
     int hidden = cfg->dec_hidden;
     int n_heads = cfg->dec_heads;
     int n_kv_heads = cfg->dec_kv_heads;
@@ -761,6 +768,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
      * 本模型 MHA 无 GQA，n_kv_heads == n_heads == 10。 */
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* 性能打点（--profile 时启用）：t_layer_start 记本层总起点，t0 记子阶段（QKV/注意力等）起点 */
     double t_layer_start = 0, t0 = 0;
     if (ctx->profile_enabled) t_layer_start = ds_time_sec();
 
@@ -926,14 +934,16 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     /* wo: [1280,1280] BF16 matvec，把 10 个 head 的拼接输出混合回残差流 */
     if (ctx->profile_enabled) ctx->perf_layer_proj_ms[layer_idx] += (ds_time_sec() - t0) * 1000.0;
 
-    /* Post-attention: fused residual add + RMS norm.
-     * This combines out = x + proj_out and norm_out = rms_norm(out, weight)
-     * into a single operation, eliminating one pass over hidden=1280 elements. */
+    /* 注意力子层收尾：融合的 残差相加 + RMSNorm。
+     * 一次内核同时完成 out = x + proj_out（残差回流主干）与
+     * norm_out = rms_norm(out, post_attn_norm)（供 FFN 用的 Pre-Norm 输入），
+     * 相比分开两步少一遍 1280 元素的读写 pass。
+     * 参数方向：out 收残差结果，x_norm 收归一化结果，x 是残差来源。 */
     ds_residual_rms_norm(out, x_norm, x, proj_out, layer->post_attn_norm, hidden, cfg->dec_rms_norm_eps);
 
     /* MLP (dense FFN for layer 0, MoE for layers 1-11) */
     if (ctx->profile_enabled) t0 = ds_time_sec();
-    float *mlp_out = ctx->dec_expert_out;  /* reuse preallocated buffer */
+    float *mlp_out = ctx->dec_expert_out;  /* 复用 ctx 预分配缓冲，decode 每步免 malloc */
     mlp_forward(mlp_out, x_norm, layer, cfg, ctx, layer_idx,
                 ctx->dec_dense_gate, ctx->dec_dense_up, ctx->dec_dense_swiglu,
                 ctx->moe_expert_gate_buf, ctx->moe_expert_up_buf,
@@ -1306,8 +1316,12 @@ int ds_decoder_prefill(ds_ctx_t *ctx, const float *input_embeds, int seq_len) {
              * we group tokens by expert ID and process each group with a single sgemm call.
              * With top-6 from 64 experts, each expert handles ~seq_len*6/64 ≈ 80 tokens on average.
              * A single sgemm of [80, 896] @ [896, 1280] is much more efficient than 80 separate
-             * [1, 896] @ [896, 1280] BF16 matvecs. */
-            /* Count tokens per expert and build index lists */
+             * [1, 896] @ [896, 1280] BF16 matvecs.
+             * 这就是 prefill 侧的 Gather-Compute-Scatter 模式（见 ds_moe_decoder.h
+             * prefill 文档块、docs/05-性能优化实战篇）：按专家把 token "收集"成
+             * 连续行 → 一次 sgemm 批算 → 输出按路由权重"散回"各 token 行。 */
+            /* 统计每个专家被多少 token 选中（直方图），随后按直方图给每个
+             * expert 分配 token 索引表——先计数后填充的两趟扫描避免动态扩容 */
             int *expert_count = (int *)calloc(n_experts, sizeof(int));
             for (int s = 0; s < seq_len; s++) {
                 int *tk_idx = all_top_indices + s * top_k;
@@ -1588,7 +1602,9 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
         }
     }
 
-    /* Process through all layers */
+    /* Process through all layers
+     * 双缓冲：x（dec_x）与 out（dec_layer_out）交替，第 l 层读 x 写 out，
+     * 层末交换指针免 memcpy——省去每层一次 1280 float 的整块拷贝 */
     float *out = ctx->dec_layer_out;
     for (int l = 0; l < cfg->dec_layers; l++) {
         decoder_layer_forward(ctx, x, out, l, ctx->kv_cache_len);  /* 第 l 层：读 x 写 out */
@@ -1645,6 +1661,13 @@ int ds_decoder_forward(ds_ctx_t *ctx, const float *input_embed) {
     /* LM head: compute logits then sample with optional repetition penalty */
     int vocab = cfg->vocab_size;
     float *logits = ctx->dec_logits;  /* [vocab_size] buffer */
+    /* Tied embeddings（输入输出嵌入绑定）：lm_head 未单独存放时，
+     * 直接用词嵌入矩阵 tok_embeddings 充当输出投影。
+     * 【为什么可行】查嵌入表 = 取 W 的第 t 行（one-hot × W），
+     * LM head = x @ Wᵀ（x 与 W 每一行做点积）——同一矩阵的两种转置视角；
+     * 绑定省一份 [129280,1280] 参数（~331MB），且语义自洽：
+     * token v 的 logit = 最终隐状态 x 与 v 的嵌入向量的内积，
+     * 即"用什么向量表示 token，就用同一组向量度量输出相似度"。 */
     const uint16_t *lm_w = dec->lm_head_bf16 ? dec->lm_head_bf16 : dec->tok_embeddings_bf16;
     float rp = ctx->repeat_penalty;  /* Repetition penalty (used in both fast and full paths) */
 
@@ -1815,7 +1838,9 @@ full_logits_path:
         }
         ctx->perf_lm_head_ms += (ds_time_sec() - t_lm) * 1000.0;
     } else {
-        /* Non-profile path: same sgemm optimization */
+        /* Non-profile path: same sgemm optimization
+         * 与上方计时段落逐句相同——刻意复制而非抽成函数，
+         * 让不开启 profile 的热路径少一层分支与调用开销 */
         if (dec->lm_head_bf16) {
             if (!ctx->lm_head_f32_ready) {
                 size_t n = (size_t)vocab * hidden;
@@ -1864,8 +1889,10 @@ full_logits_path:
 
     /* Apply repetition penalty (rp already defined above) */
     if (rp > 1.0f && ctx->token_history && ctx->token_history_len > 0) {
-        /* For each previously generated token, divide its logit by penalty
-         * (standard HuggingFace repetition penalty implementation) */
+        /* 重复惩罚（HF 标准语义，对历史中每个出现过的 token 施加）：
+         * logit > 0 时 ÷rp、logit < 0 时 ×rp——两种情况都把分数往 0 压
+         * （抑制重复但不翻转正负号）。与 fast path 的"选择性惩罚"（只补算
+         * 历史 token 的 logit）不同：这里全量 logits 已在内存，按下标直接改写。 */
         for (int i = 0; i < ctx->token_history_len; i++) {
             int tid = ctx->token_history[i];
             if (tid >= 0 && tid < vocab) {
@@ -1926,7 +1953,9 @@ full_logits_path:
         if (t >= 0 && t < vocab) logits[t] = -1e30f;
     }
 
-    /* Find argmax from logits */
+    /* Find argmax from logits
+     * 贪心解码取最大 logit 的下标；argmax 对 softmax 单调不变，
+     * 无需先做 softmax 归一化（详见 docs/13 §8） */
     int token = 0;
     float best = logits[0];
     for (int i = 1; i < vocab; i++) {
@@ -2024,7 +2053,7 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
 
     for (int l = 0; l < cfg->dec_layers; l++) {
         ds_dec_layer_t *layer = &dec->layers[l];
-        int cache_offset = ctx->kv_cache_len;
+        int cache_offset = ctx->kv_cache_len;   /* 本批第 0 个 token 的全局 KV 位置 */
 
         /* Input RMSNorm (batched) */
         ds_rms_norm(x_norm, x, layer->input_norm, n_tokens, hidden, cfg->dec_rms_norm_eps);
@@ -2041,7 +2070,9 @@ void ds_decoder_forward_batch(ds_ctx_t *ctx, const float *input_embeds,
         if (layer->k_norm_weight)
             ds_rms_norm_per_head(K, layer->k_norm_weight, n_tokens, n_kv_heads, head_dim, cfg->dec_rms_norm_eps);
 
-        /* RoPE */
+        /* RoPE：base = cache_offset，本批 token 的位置从 KV 缓存尾部连续编号
+         * （token s 的位置 = cache_offset + s），cos/sin 取 base 处表项后，
+         * ds_apply_rope_neox 沿 seq 维逐 token 向前推进 */
         ds_apply_rope_neox(Q, ctx->rope_cache_cos + cache_offset * head_dim,
                            ctx->rope_cache_sin + cache_offset * head_dim,
                            n_tokens, n_heads, head_dim);
