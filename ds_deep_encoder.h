@@ -59,26 +59,35 @@
 
 #include "ds_ocr.h"
 
-/* ds_clip_encoder_forward — CLIP ViT-L/14 前向传播（V1/V3 专用）
+/* ds_clip_encoder_forward — CLIP ViT-L/14 前向传播（V1/V3/V4 视觉侧）
  *
- * 两种调用模式:
+ * 实现现状（以 ds_deep_encoder.c 为准）: V1/V3/V4 一律走"SAM 特征直入"路径——
+ *   SAM 下采样输出 [n_sam_tokens, 1024] 直接当作 CLIP 的 patch_embeds。
+ *   CLIP 自带的 Conv2d(3→1024, k=14, s=14) patch_embedding 权重加载了但从不使用；
+ *   rgb_pixels/width/height/channels 四个参数保留只为兼容旧签名，函数内 (void) 丢弃。
+ *   【为什么绕过 patch_embed】SAM 已完成"patch 化 + 投影到 token 序列"，CLIP 再从
+ *   像素按 14×14 切一遍既与 SAM 网格不兼容也浪费算力；CLIP 只负责叠加语义先验
+ *   （docs/06-视觉编码器篇.md §5.1）。
  *
- * V1 模式: 传入 rgb_pixels（原始RGB像素），CLIP 使用自身的 patch_embedding
- *   处理流程: RGB像素 → Conv2d(3→1024, k=14, s=14) → CLIP Transformer → 输出
- *   传参: rgb_pixels != NULL, sam_features = NULL
+ * 处理流程:
+ *   [CLS; SAM特征] → +位置编码（257 行表；网格 ≠ 16×16 时抗锯齿 bicubic 插值）
+ *   → Pre-LN → 24 层 Transformer（16 头×64 维，双向注意力，GELU 用 erf 精确式）
+ *   → 剥掉 CLS → [N,1024] → 沿特征维拼接 SAM 特征 → [N,2048]
+ *   → projector（单层线性 2048→1280）→ 16×16 网格逐行插 image_newline
+ *   → 尾部追加 view_seperator
  *
- * V3 模式: 传入 sam_features（SAM视觉特征），CLIP 绕过 patch_embedding
- *   处理流程: SAM特征 → 添加CLS → +位置编码 → CLIP Transformer → 输出
- *   传参: rgb_pixels = NULL, sam_features != NULL
- *   【V3为什么绕过patch_embed?】因为SAM已经完成了patch化+投影，CLIP做二次精炼
+ * 【为什么 CLIP 用双向注意力】图像 patch 之间没有"未来"，每个 patch 需要看到
+ *   全图上下文才能聚合语义；与解码器语言侧的因果注意力（只看过去）刻意相反。
  *
- * 输出: 经过 Projector 投影后的 token 序列 [n_output_tokens, dec_hidden]
- *       dec_hidden = 1280（与解码器隐藏维度一致）
- *       输出包含 image_newline 和 view_seperator，可直接送入解码器
+ * 【拼接顺序注意】与 Python 一致为 cat(clip_output, sam_features, dim=-1)——
+ *   CLIP 在前、SAM 在后。本文件头部示意图写的"Concat(SAM特征, CLIP特征)"顺序
+ *   与实际代码相反，以代码/Python 为准（docs/06 §5.2 的维度账也是 1024+1024）。
  *
- * out_seq_len: 输出序列总长度（含特殊token）
- *   - V1: 273 = 16行×(16patches+1newline) + 1view_sep
- *   - V3: 273 或 111（取决于输入尺寸）
+ * 输出: [out_seq_len, 1280] token 序列（调用者 free），可直接送入解码器；
+ * out_seq_len:
+ *   - 1024² 全局图: 273 = 16 行×(16 patch + 1 newline) + 1 view_sep
+ *   - 640² 裁剪:    111 = 10×(10+1) + 1
+ * 【参考】docs/06-视觉编码器篇.md §5-§8；PyTorch 等价物: HF CLIPModel.vision_model
  */
 float *ds_clip_encoder_forward(ds_ctx_t *ctx,
                                 const unsigned char *rgb_pixels, int width, int height, int channels,
@@ -108,6 +117,15 @@ float *ds_clip_encoder_forward(ds_ctx_t *ctx,
  * DeepEncoder V2 加入因果流查询，通过因果注意力逐个"收集"视觉信息，
  * 输出天然具有顺序性，更适合解码器的自回归生成。
  * 类比: 双向注意力 = 全员开会讨论; 因果查询 = 逐个汇报总结
+ *
+ * 【混合注意力在代码里的落点】第 qi 个 token 的可见域上界 vis_end:
+ *   qi < n_tokens（视觉段）→ vis_end = n_tokens   双向: 全部视觉 token 互见
+ *   qi ≥ n_tokens（查询段）→ vis_end = qi + 1     因果: 只看 ≤ 自身
+ *   （查询天然覆盖全部视觉段 + 之前的查询——两种掩码只差这一个上界，
+ *    实现 见 ds_deep_encoder.c 的 enc_attn_process_head()）
+ *
+ * 【参考】docs/06-视觉编码器篇.md §9（V2 行：GQA 14Q/2KV、RoPE θ=10⁶、
+ * SwiGLU 4864）；架构等价物: Qwen2（0.5B）解码层 + 混合注意力掩码
  */
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
                                int n_tokens, int *out_seq_len,
@@ -119,26 +137,33 @@ float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
  *   enc_type=1 → ds_clip_encoder_forward()（V1/V3 CLIP编码器）
  *   enc_type=2 → ds_encoder_forward_v2()（V2 DeepEncoder编码器）
  *
- * 这是 ds_ocr.c 中调用的统一入口，避免调用方关心版本差异
+ * 这是 ds_ocr.c 中调用的统一入口，避免调用方关心版本差异。
+ * 注意: V1 实际由 ds_ocr.c 直接调 ds_clip_encoder_forward（传原始像素），
+ * 本入口的 CLIP 分支只服务 V3/V4（sam_features 直入）。
  */
 float *ds_encoder_forward(ds_ctx_t *ctx, const float *visual_tokens,
                            int n_tokens, int *out_seq_len,
                            int n_causal_queries, const float *causal_queries);
 
-/* ds_encoder_load — 加载编码器权重
+/* ds_encoder_load — 占位接口（当前为空实现，恒返回 0）
  *
- * V1/V3: 加载 CLIP ViT-L/14 权重 (F32格式，较小，预转换高效)
+ * 注意: 权重加载并不发生在这里！真实加载在 ds_ocr.c 的 ds_load() 中随整模型
+ * 统一完成（LOAD_F32 到 ctx->clip_encoder / ctx->encoder / ctx->projector）。
+ * 下方清单即 ds_ocr.c 实际装载的张量集合，保留此函数只为 API 完整性。
+ *
+ * V1/V3: CLIP ViT-L/14 权重 (F32格式，较小，预转换高效)
  *   - class_embedding, patch_embedding, position_embedding
+ *     （patch_embedding 加载后从不使用——CLIP 直喂 SAM 特征，见上文）
  *   - pre_layernorm
  *   - 24层 Transformer (QKV/投影/FFN/LayerNorm)
  *   - post_layernorm (可选)
  *
- * V2: 加载 DeepEncoder V2 权重 (F32格式)
+ * V2: DeepEncoder V2 权重 (F32格式)
  *   - 24层 Transformer (Q/K/V/O投影 + SwiGLU FFN + LayerNorm)
  *   - 最终 norm
  *   - 因果流查询嵌入 (query_1024, query_768)
  *
- * 公共: 加载 Projector 权重 (F32: weight[bias])
+ * 公共: Projector 权重 (F32: weight/bias)
  *   - V1/V3: [1280, 2048] (CLIP 1024 + SAM 1024 拼接后投影)
  *   - V2: [1280, 896] (DeepEncoder输出直接投影)
  */
