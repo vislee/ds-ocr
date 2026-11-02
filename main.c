@@ -51,17 +51,21 @@
 #include <strings.h>            /* strcasecmp */
 #include <sys/types.h>          /* ssize_t (getline) */
 
-/* stream_token — Token流式输出回调
+/* stream_token — Token流式输出回调（ds_token_cb 签名，见 ds_ocr.h）
  *
- * 每当解码器生成一个新token并解码为文本后，此函数被调用。
- * 效果: 将解码出的文本片段(piece)立即打印到stdout，实现"边生成边输出"。
- * 类似于 ChatGPT 的逐字显示效果。
- *
- * 为什么用 fflush(stdout)?
- *   stdout 默认是行缓冲的（遇到\n才刷新），但OCR文本可能很长没有换行，
- *   fflush确保每个token都立即显示，不等待缓冲区满。
- *
- * userdata: 未使用（(void)userdata 消除编译器警告）
+ * 【算法/逻辑】每当解码器生成一个新token并解码为文本后，此函数被调用。
+ *   效果: 将解码出的文本片段(piece)立即打印到stdout，实现"边生成边输出"。
+ *   类似于 ChatGPT 的逐字显示效果。
+ * 【参数】piece: 本次生成 token 的 UTF-8 文本片段；userdata: 未使用
+ *   （(void)userdata 消除编译器警告）。
+ * 【为什么】用 fflush(stdout)?  stdout 默认是行缓冲的（遇到\n才刷新），
+ *   但OCR文本可能很长没有换行，fflush确保每个token都立即显示，不等待
+ *   缓冲区满。
+ *   本回调仅在 V1/V2 非静默时由 main() 挂载：V3/V4 原始流含幻觉前缀
+ *   （如 "[No text detected]"），必须等后处理完才能见人，不能逐 token
+ *   透出；--silent 时换成进度打点回调 stream_progress_cb。
+ * 【参考】README_zh.md "流式回调" C API 示例；docs/04-完整推理流程篇.md
+ *   "Decode 循环" 一节。
  */
 static void stream_token(const char *piece, void *userdata) {
     (void)userdata;
@@ -89,7 +93,10 @@ typedef struct {
 
 static ds_stream_progress_t g_stream_progress;
 
-/* stream_progress_breakline — 进度点在行中时先结束该行（重试提示前调用） */
+/* stream_progress_breakline — 进度点在行中时先结束该行（重试提示前调用）
+ * 【为什么】进度点 "·32 ·64…" 与后续状态行同在 stderr；若不先换行，
+ *   重试提示 / ✓ 完成行会接在进度点后面，输出难以阅读。started 复位后
+ *   下次进度会重新打 "解码" 前缀。 */
 static void stream_progress_breakline(void) {
     if (g_stream_progress.started) {
         fputc('\n', stderr);
@@ -97,7 +104,15 @@ static void stream_progress_breakline(void) {
     }
 }
 
-/* stream_progress_cb — 每 N 个 token 在 stderr 打一个进度点（内容忽略） */
+/* stream_progress_cb — 每 N 个 token 在 stderr 打一个进度点（内容忽略）
+ * 【算法/逻辑】计数器递增；首次调用先打 "解码" 前缀（避免一行只有点没有
+ *   说明），之后每 32 token 打 "·N"；超过 DS_STREAM_PROGRESS_SLOW_AFTER=512
+ *   后降频为每 128 token 一个点——长输出时点本身也会刷屏。piece 一律忽略。
+ * 【参数】piece: token 文本（弃用）；userdata: ds_stream_progress_t 计数区。
+ * 【为什么】只打点、不透出文本：V3/V4 原始 token 流含幻觉前缀/布局标签，
+ *   正文必须等后处理；但大图识别可长达数十秒，毫无动静看起来像卡死
+ *   （README_zh.md "交互模式示例" 一节）。走 stderr 保证 stdout 只有识别
+ *   文本，管道重定向不受污染。 */
 static void stream_progress_cb(const char *piece, void *userdata) {
     (void)piece;
     ds_stream_progress_t *p = (ds_stream_progress_t *)userdata;
@@ -114,7 +129,13 @@ static void stream_progress_cb(const char *piece, void *userdata) {
     }
 }
 
-/* stream_progress_begin — 识别前挂上进度回调（已有正文流式回调时不挂） */
+/* stream_progress_begin — 识别前复位计数并挂上进度回调
+ * 【算法/逻辑】每次识别前把 count/started/retried 清零，再挂回调。
+ * 【为什么】仅当 ctx->token_cb 为空时才挂：V1/V2 非静默已有 stream_token
+ *   逐 token 输出正文（用户看得见动静），再挂打点就重复；V3/V4 或
+ *   --silent 时 token_cb 为空，由本回调提供"还活着"的反馈。
+ *   retried 记录本次识别是否发生过退化重试，供 stream_progress_end 的
+ *   ✓ 行标注。 */
 static void stream_progress_begin(ds_ctx_t *ctx) {
     g_stream_progress.count = 0;
     g_stream_progress.started = 0;
@@ -123,7 +144,14 @@ static void stream_progress_begin(ds_ctx_t *ctx) {
         ds_set_token_callback(ctx, stream_progress_cb, &g_stream_progress);
 }
 
-/* stream_progress_end — 摘除进度回调并输出完成信号 */
+/* stream_progress_end — 摘除进度回调并输出完成信号
+ * 【算法/逻辑】先以指针相等判断当前挂的是否为本进度回调（防止误摘正文
+ *   回调 stream_token），是则置空；再结束进度行；最后打完成行
+ *   "✓ N tok, X.Xs"（N=perf_text_tokens，X=perf_total_ms/1000）到 stderr，
+ *   本次发生过退化重试时附 "（含 1 次退化重试）" 标注。
+ * 【为什么】last_output_loopy 说明引擎解码中途检测到内容循环并已提前
+ *   终止——提示环境变量 DS_NO_EARLY_STOP=1 可关闭早停，并给出截断时的
+ *   token 数，便于用户判断页尾丢了多少内容。 */
 static void stream_progress_end(ds_ctx_t *ctx) {
     if (ctx->token_cb == stream_progress_cb)
         ds_set_token_callback(ctx, NULL, NULL);
@@ -141,7 +169,13 @@ static void stream_progress_end(ds_ctx_t *ctx) {
  * 识别辅助函数 — 单次模式与 --stream 交互模式共用
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* model_version_name — 模型版本的可读名称（交互模式横幅用） */
+/* model_version_name — 模型版本号 → 可读名称（交互模式横幅用）
+ * 【算法/逻辑】ctx->config.model_version 由 ds_load() 读模型目录下
+ *   config.json 自动判得（见 ds_ocr.c detect_model_version），CLI 无需
+ *   版本参数。映射: 1=DeepSeek-OCR, 2=DeepSeek-OCR-2, 3=Unlimited-OCR,
+ *   4=Unlimited-OCR-2（DASH），default="Unknown" 兜底。
+ * 【为什么】横幅显示可读名称，让用户确认加载的确实是想要的模型目录
+ *   （四个模型都在 models/ 下，目录名与版本号容易混淆）。 */
 static const char *model_version_name(const ds_ctx_t *ctx) {
     switch (ctx->config.model_version) {
         case 1: return "DeepSeek-OCR";
@@ -152,17 +186,31 @@ static const char *model_version_name(const ds_ctx_t *ctx) {
     }
 }
 
-/* recognize_file_with_retry — 从图像文件识别 + V4 退化重试
- *
- * V4 退化翻转自愈: 解码近并列 argmax 偶发翻转（运行间内存布局差异），
- * 症状为畸形标签行。检测到即整体重跑一次（含编码），命中概率 p → p²。
- * 例外: 首次尝试已打满 token 上限 = 内容循环而非翻转（模型对循环输出
- * "自信"，与内存布局无关），重试只会再烧一份上限 token——跳过。
- * 交互模式下重试提示前先结束进度行，并为重试复位进度计数。 */
+/* stream_attempt_hit_cap — 判断本次识别是否已打满 -n 的 token 上限
+ * 【算法/逻辑】perf_text_tokens >= max_new_tokens 即视为打满。
+ * 【为什么】它是两个重试函数共用的"重试资格线"：打满上限说明首次尝试是
+ *   被上限截断的（内容循环的典型表现），重试大概率再次打满，白烧一份
+ *   上限 token——跳过；未打满却触发退化/循环信号的才是值得重跑的偶发态
+ *   （详见 recognize_file_with_retry / recognize_pixels_with_retry）。 */
 static int stream_attempt_hit_cap(const ds_ctx_t *ctx) {
     return ctx->perf_text_tokens >= ctx->max_new_tokens;
 }
 
+/* recognize_file_with_retry — 从图像文件识别 + V4 退化重试
+ * 【算法/逻辑】ds_recognize() 走完整流水线（图像加载→SAM→编码器→投影→
+ *   预填充→解码）。仅当 V4 且 last_output_degenerate（畸形标签行——解码
+ *   近并列 argmax 偶发翻转，运行间内存布局差异所致）时整体重跑一次
+ *   （含编码），翻转命中概率 p → p²。重试提示前先结束进度行，并复位
+ *   交互模式的进度计数（retried=1 供 ✓ 行标注）。
+ * 【为什么】例外: 首次尝试已打满 token 上限 = 内容循环而非翻转（模型对
+ *   循环输出"自信"，与内存布局无关），重试只会再烧一份上限 token——跳过。
+ *   注意与 recognize_pixels_with_retry 的差异: 本函数只对 degenerate
+ *   重试、不对 loopy（内容循环）重试——单图打满上限多因 -n 太小或模型
+ *   固有退化，重试无益；PDF 长会话的循环才是可自愈的解码边界效应。
+ * 【参数】ctx: 已加载模型的上下文；path: 图片路径（PNG/JPEG/WebP/BMP/TIFF）。
+ * 【返回】malloc 的识别文本（调用者负责 free），失败返回 NULL。
+ * 【参考】单次模式（main）与 --stream 模式（run_stream_mode）共用；
+ *   docs/14-V4与DASH注意力篇.md（V4 解码与退化护栏）。 */
 static char *recognize_file_with_retry(ds_ctx_t *ctx, const char *path) {
     char *text = ds_recognize(ctx, path);
     if (text && ctx->config.model_version == 4 && ctx->last_output_degenerate) {
@@ -190,7 +238,12 @@ static char *recognize_file_with_retry(ds_ctx_t *ctx, const char *path) {
  * 就被截断，页尾整段内容丢失（如 B.2.3.7.2 预期结果整段缺失）；而单独
  * 重跑同页 6/6 全部正常（8字滑窗命中率 96.8%）——循环是长会话下的解码
  * 边界效应，重试即自愈。早停页通常 5-9s，重试代价可控。
- * 打满 -n 上限的页不重试: 上限本身就是止损手段，重试大概率再次打满。 */
+ * 打满 -n 上限的页不重试: 上限本身就是止损手段，重试大概率再次打满。
+ * 【参数】pixels/width/height/channels: 已渲染的 RGB 位图（ds_pdf 输出，
+ *   channels=3）；返回 malloc 文本（调用者 free），失败 NULL。
+ * 【为什么】比 recognize_file_with_retry 多接受 loopy 触发: PDF 多页连续
+ *   识别属长会话场景，循环是解码边界效应而非模型固有退化，重试即自愈
+ *   （见上实测数据）；单图模式则不然（见前者的差异说明）。 */
 static char *recognize_pixels_with_retry(ds_ctx_t *ctx, const unsigned char *pixels,
                                           int width, int height, int channels) {
     char *text = ds_recognize_image(ctx, pixels, width, height, channels);
@@ -248,7 +301,14 @@ static int text_looks_loopy(const char *text) {
  * 检测，会在输出尾部留下 2-4 圈重复垃圾（如 `附录/（资料库）` 交替数组、
  * `$ x_{1}=2 $`×4）。对已判定循环的页，把周期尾环折叠到只剩一圈。 */
 
-/* norm_line_eq — 两行归一化（去数字/空白/[]/,/.）后比较是否同形 */
+/* norm_line_eq — 两行归一化（跳过数字/空白/[]/,/.）后逐字符比较是否同形
+ * 【算法/逻辑】双指针同步扫描两行：各自跳过被忽略字符（数字 0-9、空格、
+ *   制表符、[ ] , .）后比较当前字符，任一行先耗尽则结束；两行同时耗尽
+ *   才算同形。
+ * 【为什么】循环圈常带逐圈抖动的坐标标签（如 <|det|>title [x1,y1,…]），
+ *   逐字节比较判不出"同一行在重复"；剥离数字与上述标点后，纯文字主体
+ *   相同即视为同形。供 trim_loopy_tail_p（周期环检测）与
+ *   collapse_dup_lines（连续同形行折叠）共用；只比较、不修改原行。 */
 static int norm_line_eq(const char *a, size_t alen, const char *b, size_t blen) {
     size_t i = 0, j = 0;
     for (;;) {
@@ -271,7 +331,8 @@ static int norm_line_eq(const char *a, size_t alen, const char *b, size_t blen) 
  * 周期；取删行数最多的 p。所有索引有闭式边界，无越界。
  * min_periods: 折叠所需的最少周期数。未标记页用 3（黄金标签最大连重复
  * =1，两倍安全边际；V4 的"标题块+全文块"合法双写、文档重复链接行均
- * ≤2 连重复不受影响）；已判定循环页用 2（该页已确认是垃圾，激进清理）。 */
+ * ≤2 连重复不受影响）；已判定循环页用 2（该页已确认是垃圾，激进清理）。
+ * 【返回】折叠后的新长度（text 已就地截断并补 '\0'）。 */
 static size_t trim_loopy_tail_p(char *text, size_t len, int min_periods) {
     for (int pass = 0; pass < 16; pass++) {
         const char *starts[64];
@@ -324,7 +385,10 @@ static size_t trim_loopy_tail_p(char *text, size_t len, int min_periods) {
  * 仅作用于已判定循环的页（激进档），未标记页仍走保守 trim(3)。 */
 
 /* is_cjk_punct3 — 3字节CJK标点: 全角标点块（，．：；？！FF00-FFEF）
- * 或CJK符号块（、。〈〉《》3000-303F）*/
+ * 或CJK符号块（、。〈〉《》3000-303F）
+ * 【实现】只查 UTF-8 首两字节（EF BC → U+FFxx；E3 80 → U+30xx），
+ *   第三字节任意——覆盖整块而非逐个枚举字符；调用方须保证 p[0..2]
+ *   可读（3 字节完整），函数自身不查 i+2 < len。 */
 static int is_cjk_punct3(const unsigned char *p) {
     if (p[0] == 0xEF && p[1] == 0xBC) return 1;
     if (p[0] == 0xE3 && p[1] == 0x80) return 1;
@@ -508,7 +572,12 @@ static void defrase_text(char *text) {
     free(tmp);
 }
 
-/* collapse_dup_lines — 折叠连续同形行到一行（已判定循环页的激进清理） */
+/* collapse_dup_lines — 折叠连续同形行到一行（已判定循环页的激进清理）
+ * 【算法/逻辑】逐行扫描，当前行与上一保留行 norm_line_eq 同形则丢弃，
+ *   否则保留；末尾多余换行一并去除。
+ * 【为什么】用 norm_line_eq 而非逐字节相等：坐标抖动圈（数字不同、文字
+ *   相同）也能折叠，连续空行也随之并为一行。与 trim_loopy_tail_p 互补：
+ *   这里管"行间相邻重复"，周期环交由后者处理。 */
 static void collapse_dup_lines(char *text) {
     if (!text) return;
     size_t len = strlen(text);
@@ -539,7 +608,14 @@ static void collapse_dup_lines(char *text) {
 
 /* cleanup_loopy_output — 分层清理: 未标记页保守（≥3 周期），已判定循环页
  * 激进（连重行折叠 + ≥2 周期尾环折叠）。正常页的合法重复（Hello×2、
- * Back to TOC×2）只出现在未标记页，不受影响。 */
+ * Back to TOC×2）只出现在未标记页，不受影响。
+ * 【算法/逻辑】flagged = 引擎侧 loopy 早停 或 degenerate 畸形标签信号
+ * （last_output_loopy / last_output_degenerate，见 ds_ocr.h）。激进档按
+ *   行内段去重（defrase_text）→ 行间相邻折叠（collapse_dup_lines）→
+ *   内容级滑窗（collapse_dup_subject，处理非相邻重复）→ 尾环折叠
+ *   （trim_loopy_tail_p, min_periods=2）顺序执行；保守档只做尾环折叠
+ *   （min_periods=3）。先易后难：前面的步骤减少行数，后面的周期/滑窗
+ *   检测更准。 */
 static void cleanup_loopy_output(const ds_ctx_t *ctx, char *text) {
     if (!text) return;
     int flagged = ctx->last_output_loopy || ctx->last_output_degenerate;
@@ -600,7 +676,18 @@ static void print_ocr_result(const ds_ctx_t *ctx, const char *text, int verbosit
     }
 }
 
-/* print_perf_summary — 输出性能统计（--profile 时附加逐层Profiler） */
+/* print_perf_summary — 输出性能统计（--profile 时附加逐层Profiler）
+ * 【算法/逻辑】verbosity>=1 时打一行阶段耗时: 总耗时/正文 token 数/解码
+ *   速率（tok/s = 1000 × perf_text_tokens / perf_decode_ms），及
+ *   Encoding(SAM + Encoder)/Prefill/Decode 拆分；profile 且
+ *   ctx->profile_enabled 时再打 Profiler 段: 先把 12 层的 QKV/Attention/
+ *   Out proj/MLP(MoE) 累加，连同 LM head/Sampling 一起给出占解码总耗时
+ *   的百分比；再按层打每步平均耗时（累计值 ÷ perf_decode_steps）。
+ * 【为什么】统计一律走 stderr，stdout 保持只有识别文本（管道/重定向
+ *   友好）；--silent（verbosity=0）连统计一起关——README_zh "CLI 选项"
+ *   表中 --silent 的语义。逐层拆分用于定位解码瓶颈，对应
+ *   docs/05-性能优化实战篇.md；docs/00-零基础起步篇.md 5.3 的 --profile
+ *   实验输出即本函数。 */
 static void print_perf_summary(const ds_ctx_t *ctx, int profile, int verbosity) {
     if (verbosity >= 1) {
         double tokens_per_sec = 0.0;
@@ -654,7 +741,11 @@ static void print_perf_summary(const ds_ctx_t *ctx, int profile, int verbosity) 
     }
 }
 
-/* is_pdf_path — 按扩展名判断是否 PDF（.pdf，大小写不敏感） */
+/* is_pdf_path — 按扩展名判断是否 PDF（.pdf，大小写不敏感）
+ * 【为什么】PDF 不能交给 stb_image 解码，须转交 ds_pdf 逐页渲染为 RGB
+ *   位图再进识别管线（macOS 用 CoreGraphics，非 macOS 为桩实现，打开
+ *   即失败）。CLI 层用扩展名而非魔数判别是刻意简化：误判的最坏结果
+ *   只是 ds_pdf_open 报错返回，不影响图片路径。 */
 static int is_pdf_path(const char *path) {
     size_t len = strlen(path);
     return len >= 4 && strcasecmp(path + len - 4, ".pdf") == 0;
@@ -664,7 +755,11 @@ static int is_pdf_path(const char *path) {
  * 某行作为页首（或页尾）非空行在 ≥3 页逐字节重复 ⇒ 运行页眉（页脚），
  * 从所有页移除该行——页眉是每页版面装饰，不是文档内容。
  * 页码类页脚因逐页数字不同不聚簇，天然不受影响。
- * DS_KEEP_PAGE_HEADERS=1 保留页眉页脚。 */
+ * DS_KEEP_PAGE_HEADERS=1 保留页眉页脚。
+ * 【参数】texts: n 个页文本指针（原地修改，缓冲区须可写且有余量）；n: 页数
+ *   （上限 256，超出截断——静态数组 first_off 等按 256 定容）。
+ * 【为什么】n<4 直接返回: 判定要求某行 ≥3 页重复，样本太少必误判。
+ * 【参考】README_zh.md "PDF 会逐页识别……多页输出自动做三件清理" ②。 */
 static void strip_running_header_footer(char **texts, int n) {
     if (n < 4 || getenv("DS_KEEP_PAGE_HEADERS")) return;
 
@@ -772,7 +867,10 @@ static void strip_running_header_footer(char **texts, int n) {
 /* page_is_blank — 渲染页墨水覆盖率检测（非白像素 <0.3% 视为空白页）
  * 空白页/分隔页送进模型只会得到幻觉输出（并触发循环防护、浪费时长），
  * 跳过是唯一正确处理。0.3% 阈值: 文本页墨迹 2-10%，仅页码页 ~0.06%
- * （页码属版面装饰，跳过与页眉/页脚去重哲学一致）。 */
+ * （页码属版面装饰，跳过与页眉/页脚去重哲学一致）。
+ * 【算法/逻辑】y/x 两个方向都隔行采样（步长 2，只查 1/4 像素）足够估计
+ *   占比；"墨水" = min(R,G,B) < 200 的采样点；判定式 ink*1000 <
+ *   checked*3 等价于 ink/checked < 0.3%（整数乘法避免浮点除法）。 */
 static int page_is_blank(const unsigned char *px, int w, int h) {
     size_t checked = 0, ink = 0;
     for (int y = 0; y < h; y += 2) {
@@ -793,7 +891,10 @@ static int page_is_blank(const unsigned char *px, int w, int h) {
  * 每页独立走完整流水线（渲染→SAM→编码→解码），页与页之间无上下文。
  * 页分隔/进度/状态走 stderr，识别结果走 stdout——重定向 stdout 即得纯文本。
  * 这些 stderr 反馈不受 --silent 压制：长时间识别若毫无动静看起来像卡死。
- */
+ * 【参数】path: PDF 路径；profile/verbosity: 透传给每页的
+ *   print_perf_summary 与 print_ocr_result。
+ * 【参考】README_zh.md "PDF 会逐页识别……多页输出自动做三件清理"；
+ *   docs/04-完整推理流程篇.md（单页识别管线与 V3/V4 后处理）。 */
 static void recognize_pdf_stream(ds_ctx_t *ctx, const char *path,
                                   int profile, int verbosity) {
     ds_pdf_doc_t *doc = ds_pdf_open(path);
@@ -863,9 +964,12 @@ static void recognize_pdf_stream(ds_ctx_t *ctx, const char *path,
         if (text) {
             char label[32];
             snprintf(label, sizeof(label), "第 %d 页", i + 1);
+            /* 先告警后清理: warn_loopy_output 要在原始文本上判断（清理可能
+             * 已把重复行折掉，告警会漏报）；仅对非早停页告警（早停页已由
+             * stream_progress_end 的 ⚠ 行说明） */
             if (!ctx->last_output_loopy)
                 warn_loopy_output(ctx, text, label);
-            cleanup_loopy_output(ctx, text);
+            cleanup_loopy_output(ctx, text);   /* 激进档仅当引擎判定 loopy/degenerate */
             page_texts[i] = text;
         } else {
             fprintf(stderr, "第 %d/%d 页识别失败\n", i + 1, pages);
@@ -888,7 +992,9 @@ static void recognize_pdf_stream(ds_ctx_t *ctx, const char *path,
  * --stream 交互模式（REPL）
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* stream_help — 交互模式命令帮助 */
+/* stream_help — 交互模式命令帮助（stderr，保持 stdout 纯净）
+ * 【参数】model_mode: 1=模型模式（支持 PDF 逐页识别，帮助中列出），
+ *   0=Apple Vision 模式（仅图片，帮助里不提 PDF——后端不支持）。 */
 static void stream_help(int model_mode) {
     fprintf(stderr,
         "命令:\n"
@@ -906,7 +1012,16 @@ static void stream_help(int model_mode) {
  * 其余输入给出提示。EOF (Ctrl-D) 视为退出。
  *
  * use_platform_ocr=1 时为 Apple Vision 模式（无 ctx，仅图片）。
- */
+ * 【算法/逻辑】循环: 打提示符 → getline 读一行 → 去首尾空白 → 分派:
+ *   q/quit/exit 退出；h/help 帮助；@<路径> 识别（路径可含空格，或成对
+ *   引号包裹）；其余输入报用法提示。@ 路径按 is_pdf_path 分流: PDF →
+ *   recognize_pdf_stream（Vision 模式不支持）；图片 → Vision 后端或
+ *   recognize_file_with_retry（清理→告警→输出→统计）。EOF (Ctrl-D 或
+ *   管道结束) 视为退出。
+ * 【为什么】提示符/横幅/帮助一律走 stderr，stdout 只有识别文本——本模式
+ *   的输出契约（见文件头注释）；提示符即使 --silent 也保留（识别数十秒
+ *   毫无动静像卡死）。getline 缓冲区 line/cap 跨循环复用，退出时统一
+ *   free（getline 按需 realloc）。 */
 static int run_stream_mode(ds_ctx_t *ctx, int use_platform_ocr, int platform_accurate,
                             int profile, int verbosity) {
     if (use_platform_ocr) {
@@ -988,6 +1103,8 @@ static int run_stream_mode(ds_ctx_t *ctx, int use_platform_ocr, int platform_acc
             stream_progress_end(ctx);
             if (text) {
                 cleanup_loopy_output(ctx, text);
+                /* 与 PDF 路径顺序相反: 此处先清理后告警，告警基于清理后的
+                 * 文本（text_looks_loopy 需要连续 ≥3 行重复，折叠过就不算） */
                 if (!ctx->last_output_loopy)
                     warn_loopy_output(ctx, text, "");
                 print_ocr_result(ctx, text, verbosity);
@@ -1005,21 +1122,32 @@ static int run_stream_mode(ds_ctx_t *ctx, int use_platform_ocr, int platform_acc
 
 /* usage — 打印帮助信息
  *
- * 各选项的详细说明:
- *   -d <dir>       模型目录，需包含 *.safetensors 和 config.json
- *   -i <file>      输入图像路径（--stream 模式下可省略）
+ * 各选项的详细说明（英文正文以 stderr 打印，此处为中文对照）:
+ *   -d <dir>       模型目录，需包含 *.safetensors（可多分片）和 config.json；
+ *                  V1/V2/V3/V4 由 config.json 内容自动判别（见 main 的 ds_load 注释）
+ *   -i <file>      输入图像路径（PNG/JPEG/WebP/BMP/TIFF；.pdf 逐页渲染识别）；
+ *                  --stream 模式下可省略
  *   --stream       交互模式: 输入 @<文件> 回车识别图片/PDF，q 退出
  *   -t <n>         线程数（默认: 所有CPU核心，Apple M2 Pro = 8核心）
- *   -n <n>         最大生成token数（默认: 4096，OCR通常200-500足够）
+ *   -n <n>         最大生成token数（默认: 4096；正常文档页 ~1000 token 内
+ *                  完成，内容循环页会一路打满——批量场景可调小止损，
+ *                  被截页再单独用更高 -n 重跑）
  *   --temp <f>     采样温度（0=贪心解码，>0增加随机性，OCR推荐0）
- *   --rp <f>       重复惩罚（1.0=无惩罚，1.1-1.5常用，>1减少重复）
- *   --ngram <n>    N-gram阻断（0=禁用，20-35可防止退化解）
- *   --min-tokens   最少生成token数（防止过早输出EOS）
- *   --vision       使用macOS原生Vision OCR（不需要模型文件）
+ *   --rp <f>       重复惩罚（1.0=无惩罚，1.1-1.5常用，>1减少重复；
+ *                  注意实测对 V4 内容循环无效，见 warn_loopy_output）
+ *   --ngram <n>    N-gram阻断（0=禁用，20-35可防止退化解；V3 缺省会
+ *                  自动置 35，对齐 Python SlidingWindowNoRepeatNgramProcessor）
+ *   --min-tokens   最少生成token数，期间抑制 EOS（防止过早输出EOS；
+ *                  CLI 未给时用 ctx 内置默认: V3/V4=32、V1/V2=0）
+ *   --vision       使用macOS原生Vision OCR（不需要模型文件；不支持 PDF）
+ *   --vision-fast  同上但用快速识别模式（精度略降、速度更快）
+ *   --raw-layout   V4 专用: 保留原生结构化输出，跳过版面净化
+ *                  （净化同时是退化重试的信号源，故开启后重试失效）
  *   --profile      启用逐层性能剖析（输出每层QKV/Attn/Proj/MLP耗时）
- *   --int4         INT8量化MoE专家权重（内存带宽减半，精度略降）
+ *   --int4         INT8量化MoE专家权重（--int4 为历史名，实际是逐行INT8；
+ *                  存储约为 BF16 一半，精度略降）
  *   --debug        调试输出（显示每步生成的token）
- *   --silent       静默模式（仅输出识别结果）
+ *   --silent       静默模式（仅输出识别结果；--stream 下提示符/进度仍走 stderr）
  */
 static void usage(const char *prog) {
     fprintf(stderr, "ds_ocr — DeepSeek-OCR document recognition (pure C)\n");
@@ -1046,25 +1174,43 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -h            Show this help\n");
 }
 
+/* main — CLI 入口: 参数解析 → 模式分派 → 清理
+ * 【算法/逻辑】1) 逐个解析 argv（未知选项报错并 usage 后退出）；2) 校验
+ *   必选项（模型目录或 --vision；单次模式还须 -i）；3) 设全局 ds_verbose
+ *   与 BF16 模拟开关；4) --vision 走平台 OCR 快捷路径（不加载模型，PDF
+ *   不支持）；5) 否则 ds_load 加载模型、应用推理设置、按版本挂流式回调；
+ *   6) 按 --stream / PDF / 单图三路分派执行；7) 输出结果与统计，ds_free 释放。
+ * 【为什么】模式分派集中在参数解析之后而非解析期——先把所有选项收集齐，
+ *   交互模式才能复用单次模式的全部辅助函数（识别/重试/进度/清理/统计
+ *   是同一套，见文件头"程序流程"）。
+ * 【返回】0 成功；1 用法错误、模型加载失败或识别失败；-h/--help 亦返回 0。
+ * 【参考】docs/00-零基础起步篇.md 5.2（四条命令）/6.2（阅读路线）；
+ *   README_zh.md "CLI 选项" 表。 */
 int main(int argc, char **argv) {
     /* ── 命令行参数变量（带默认值）── */
-    const char *model_dir = NULL;       /* 模型目录路径 */
-    const char *input_image = NULL;     /* 输入图像路径 */
-    int verbosity = 1;                  /* 输出详细度: 0=静默, 1=正常, 2=调试 */
+    const char *model_dir = NULL;       /* 模型目录路径（含 *.safetensors + config.json） */
+    const char *input_image = NULL;     /* 输入图像路径（--stream 下可省略） */
+    int verbosity = 1;                  /* 输出详细度: 0=静默(--silent), 1=正常, 2=调试(--debug) */
     int n_threads = 0;                  /* 线程数: 0=自动(=CPU核心数) */
     int max_new_tokens = 4096;          /* 最大生成token数 */
-    int raw_layout = 0;                 /* V4: 保留原生结构化输出 */
+    int raw_layout = 0;                 /* --raw-layout: V4 保留原生结构化输出（跳过版面净化；
+                                         * 净化是退化重试的信号源，开启后 last_output_degenerate
+                                         * 恒为 0，重试链路随之失效——见 ds_ocr.c 后处理） */
     float temperature = 0.0f;           /* 采样温度: 0=贪心(确定性) */
     float repeat_penalty = 1.0f;        /* 重复惩罚: 1.0=无惩罚 */
-    int no_repeat_ngram_size = 0;       /* N-gram阻断: 0=禁用 */
-    int min_new_tokens = -1;            /* 最少token数: -1=使用ctx默认值 */
+    int no_repeat_ngram_size = 0;       /* N-gram阻断: 0=禁用（V3 缺省会在加载后自动置 35） */
+    int min_new_tokens = -1;            /* 最少token数: -1=沿用 ctx 内置默认
+                                         * （ds_load: V3/V4=32、V1/V2=0）；--min-tokens 覆盖 */
     int use_platform_ocr = 0;           /* 使用macOS Vision OCR后端 */
     int platform_accurate = 1;          /* Vision OCR精度模式: 1=高精度, 0=快速 */
     int profile = 0;                    /* 启用逐层Profiler */
     int int4 = 0;                       /* 启用INT4/INT8量化 */
     int stream_mode = 0;                /* --stream 交互模式 */
 
-    /* ── 解析命令行参数 ── */
+    /* ── 解析命令行参数 ──
+     * 约定: 带值选项须紧跟参数值（先查 i+1 < argc 再 ++i 消费，缺值时
+     * 落入"未知选项"分支报错退出）；-h/--help 返回 0，未知选项与校验
+     * 失败返回 1。开关类选项重复出现时后者覆盖前者，顺序无关。 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             model_dir = argv[++i];
@@ -1143,6 +1289,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (stream_mode) {
+            /* Vision 交互模式: 无 ctx（不加载模型）、无逐层计时（profile 传 0） */
             return run_stream_mode(NULL, 1, platform_accurate, 0, verbosity);
         }
         char *text = ds_platform_ocr_file(input_image, platform_accurate, verbosity);
@@ -1161,7 +1308,13 @@ int main(int argc, char **argv) {
 
     /* ── 加载模型 ──
      * ds_load() 执行以下步骤:
-     *   1. detect_model_version() — 检测V1/V2/V3版本
+     *   1. detect_model_version() — 读 <dir>/config.json 自动判别版本，
+     *      一个二进制兼容全部四个模型（顺序敏感）:
+     *        "dash"/training_stage/sparse_attention_config → V4
+     *        （须先于 V3 检测——V4 的 config 同样含 UnlimitedOCR/
+     *         sliding_window_size 字段）;
+     *        sliding_window_size/UnlimitedOCR → V3;
+     *        DeepEncoderV2/causal_flow → V2; 其余 → V1
      *   2. init_config() — 初始化模型配置参数
      *   3. multi_safetensors_open() — mmap加载权重文件
      *   4. load_all_weights() — 解析并加载所有权重
@@ -1183,9 +1336,13 @@ int main(int argc, char **argv) {
     if (min_new_tokens >= 0) ctx->min_new_tokens = min_new_tokens;
     if (profile) ctx->profile_enabled = 1;
     if (int4) {
-        /* INT4量化: 将BF16专家权重量化为INT8格式
-         * 减少解码时内存带宽约4倍，精度损失极小
-         * 量化在加载后一次性完成，不影响后续推理速度 */
+        /* INT4量化: 将BF16专家权重量化为逐行INT8（--int4 名称系历史遗留，
+         * 结构体 ds_int4_block_t 同理保留旧名）。存储每值 1 字节 vs BF16
+         * 2 字节 ≈ 省一半内存/带宽（ds_quantize.h 存储公式，usage 英文
+         * "2x less memory bandwidth" 一致）；真实权重量化误差 RMS < 0.01，
+         * 精度损失极小。量化在加载后一次性完成，不影响后续推理速度。
+         * 注意: ds_ocr.h API 注释写 "~4x"，与量化模块的 ~2x 不一致，
+         * 以 ds_quantize.c 的实现为准。 */
         ctx->int4_enabled = 1;
         ds_quantize_moe_int4(ctx);
     }

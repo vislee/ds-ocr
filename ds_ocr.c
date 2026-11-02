@@ -65,6 +65,11 @@
 #include <sys/time.h>/* gettimeofday — 毫秒级计时 */
 #include <sys/stat.h>/* stat — 文件状态检查 *//* RSS 探针（DS_RSS_PROBE=1）: 定位峰值时刻 */
 #include <sys/resource.h>
+
+/* ds_rss_probe — 峰值内存探针（DS_RSS_PROBE=1 时启用）
+ * 打印进程峰值常驻内存 ru_maxrss 到 stderr，用于定位内存高水位出现在哪个
+ * 阶段（05-性能优化实战篇 §10.4：实测峰值在"加载结束"即成立，专家块拷贝
+ * 是主因——ru_maxrss 是高水位，事后 madvise 救不回来）。非诊断运行零开销。 */
 static void ds_rss_probe(const char *tag) {
     if (!getenv("DS_RSS_PROBE")) return;
     struct rusage ru;
@@ -105,9 +110,10 @@ int g_dump_crop_id = -1;
  * Timing Helper — 毫秒级计时器
  * ======================================================================== */
 
-/* now_ms: 获取当前时间的毫秒数（基于gettimeofday）
- * 用于测量推理各阶段耗时：编码、prefill、decode
- */
+/* now_ms - 获取当前墙钟时间的毫秒数
+ * 【为什么用墙钟而非 CPU 时间】推理是内存带宽受限的（大量 page fault、
+ * mmap 缺页等待），CPU time 会漏掉等待时间；gettimeofday 微秒级分辨率
+ * 足够测量编码/prefill/decode 各阶段（秒级）耗时。 */
 static double now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -137,15 +143,16 @@ static double now_ms(void) {
  *      '<' 之前的文本安全输出，'<..' 之后继续缓冲
  * ======================================================================== */
 
-/* ds_try_strip_det_tag: 尝试从缓冲区中移除完整的det/ref标签
- *
- * 检测两种标签模式:
- *   1. 独立 <|det|>...<|/det|> — 检测框标签（含标签名和坐标）
+/* ds_try_strip_det_tag - 尝试从缓冲区开头移除一个完整的 det/ref 标签块
+ * 【算法】只匹配 buf[0] 起始的两种模式:
+ *   1. 独立 <|det|>...<|/det|> — 检测框标签（标签名+坐标整体属于标签块）
  *   2. <|ref|>...<|/ref|><|det|>...<|/det|> — 引用+检测对
- *
- * 返回值: 消耗的字符数（0=未找到完整标签）
- * 找到完整标签时，buf原地修改，*out_new_len设为新长度
- */
+ * 【返回】消耗的字符数（0=缓冲区开头没有完整标签）；命中时 *out_new_len=0
+ *         ——标签块连同内部坐标整体丢弃（对齐 Python outputs.replace(...)）
+ * 【为什么整体丢弃】用户只要正文，坐标/引用内容对终端用户是噪声
+ *      （docs/08 §6.1）。只匹配开头是因为流式层在上层 while 循环里反复
+ *      调用它，逐个吃掉缓冲区前缀处的连续标签。
+ * 【参数】buf/buf_len: 缓冲区及其长度；out_new_len: 命中后剩余长度（恒 0） */
 static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
     /* 尝试匹配独立 <|det|>...<|/det|> 模式 */
     /* 从位置7开始搜索<|/det|>结束标签 */
@@ -185,15 +192,16 @@ static int ds_try_strip_det_tag(char *buf, int buf_len, int *out_new_len) {
     return 0;  /* 缓冲区中尚未出现完整标签模式 */
 }
 
-/* ds_stream_filter_det: 流式token经过det标签过滤器
- *
- * 逐个将解码后的token送入缓冲区累积，当判断缓冲区内容为完整标签时丢弃；
- * 否则将非标签的安全前缀（'<'之前的内容）通过回调输出。
- *
- * 为什么不能逐token判断?
- *   BPE分词可能将一个标签切分成多个token，如 "<|de" + "t|>"
- *   缓冲后才能正确识别完整的标签边界
- */
+/* ds_stream_filter_det - 流式 token 的 det 标签过滤器（流式层，V3 专用）
+ * 【定位】两级后处理中的"流式层"：只管实时显示好看；权威输出缓冲
+ *         output 全程保留原始文本，终态层（ds_recognize_image 尾部）从
+ *         原始文本独立重放清理——两层 bug 互不污染（docs/08 §6.4）。
+ * 【参数】piece: 本步解码出的 UTF-8 文本片段；内部缓冲 ctx->_det_buf[256]。
+ * 【为什么必须缓冲】BPE 可能把一个标签切成多个 token（"<|de"+"t|>…"），
+ *         逐 token 判断必错；缓冲后才能确认完整标签边界。
+ * 【注意】CLI 只给 V1/V2 挂回调（main.c）；此 V3 分支服务于 API 用户
+ *         自行挂回调的场景——V3/V4 的幻觉前缀无法逐 token 判定，官方
+ *         推荐等终态清理。非 V3 模型直接透传，零缓冲开销。 */
 static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
     if (!ctx || !piece || !ctx->token_cb) return;
     if (ctx->config.model_version != 3) {
@@ -311,7 +319,11 @@ static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
                 break;
             }
         }
-        /* But also check if '<' could be part of a partial "<|" tag start */
+        /* But also check if '<' could be part of a partial "<|" tag start
+         * det/ref 标签都形如 "<|det|>"（'<' 后必跟 '|'）：扫描缓冲区内每个
+         * '<'——其后已是 '|' 的话该位置之后可能是标签主体，不能 flush；
+         * '<' 恰在缓冲区末尾时下一字符未知，同样扣留。其余 '<'（如 "a<b"）
+         * 不是标签起点，属安全文本。 */
         int has_partial_tag = 0;
         for (int i = 0; i < buf_len; i++) {
             if (buf[i] == '<') {
@@ -382,21 +394,31 @@ static void ds_stream_filter_det(ds_ctx_t *ctx, const char *piece) {
 
 typedef struct {
     ds_ctx_t *ctx;
-    ds_image_t *crop;
-    int crop_id;
-    int tokens_per_crop;
-    float *sam_tokens;
-    int n_sam_tokens;
-    float *enc_tokens;
-    int n_enc_tokens;
-    double sam_time;
-    double enc_time;
-    int failed;
+    ds_image_t *crop;          /* 本 worker 负责的裁剪图像（只读） */
+    int crop_id;               /* 裁剪序号（调试 dump 用，全局图固定 6/-1） */
+    int tokens_per_crop;       /* 期望 token 数：V2 局部 144 / 全局 256；V3/V4 复用传 ggrid=16 */
+    float *sam_tokens;         /* 输出: SAM 特征（worker 内部用完即 free，置 NULL） */
+    int n_sam_tokens;          /* SAM token 数 */
+    float *enc_tokens;         /* 输出: 编码+投影后的 [n,1280] 特征（主线程接管并 free） */
+    int n_enc_tokens;          /* 编码输出 token 数 */
+    double sam_time;           /* 本 crop SAM 前向耗时（perf 汇总用） */
+    double enc_time;           /* 本 crop 编码器前向耗时 */
+    int failed;                /* 1 = SAM 或编码器前向失败 */
     int gate_win;   /* 本 crop 的 SAM/编码器并行预算（线程局部钉住） */
     int gate_gbl;
     int gate_enc;
 } crop_task_t;
 
+/* crop_worker - V2 局部裁剪编码线程主体（768×768 局部裁剪）
+ * 【流水线】SAM(768²) → [144,896] 特征 → DeepEncoder V2（144 路因果流查询
+ *           causal_query_768_embeddings）→ [144,1280] 投影后 token
+ * 【参数】arg: crop_task_t*。结果写回 t->enc_tokens/t->n_enc_tokens；
+ *         任一步失败置 t->failed=1。sam_tokens 中间结果用完即 free。
+ * 【为什么一线程一 crop】各裁剪编码完全独立（只读共享权重、线程局部
+ *         缓冲），无需同步；gate_* 把 SAM 窗口/全局注意力与编码器 head
+ *         并行的线程预算钉在本 worker 线程局部，避免 N 个 crop × 内部
+ *         线程池的超额订阅（oversubscription）。
+ * 【参考】docs/05-性能优化实战篇.md §2（串行 ~50s → 并行 ~9s，5.5×） */
 static void *crop_worker(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
     ds_sam_thread_gates(t->gate_win, t->gate_gbl, t->gate_enc);
@@ -419,6 +441,16 @@ static void *crop_worker(void *arg) {
 /* Worker for V3 (Unlimited-OCR) local crop: SAM + CLIP + projector.
  * Stores the raw CLIP output (WITH newlines) — grid assembly happens on the
  * main thread after joining, so each crop's [100, 1280] block lands in place. */
+/* v3_crop_worker - V3/V4 局部裁剪编码线程主体（640×640 局部裁剪）
+ * 【流水线】SAM(640²) → [100,1024] → CLIP（SAM 特征直接作 patch_embeds）
+ *           → Concat+Projector → [111,1280]（含 image_newline，未去行分隔符）
+ * 【为什么带 newline 返回】ds_clip_encoder_forward 内部已按
+ *         10 行×(10+1)+1 布局插入 newline 与 view_sep（共 111 token）；
+ *         行内剥 newline、按 crop 网格 (cr,cc) 重排、再统一重插 newline
+ *         都必须在大网格坐标系下做，只有主线程 join 后知道全貌——
+ *         各 worker 无法自行完成（见 ds_recognize_image 的 grid assembly）。
+ * 【参数】同 crop_worker；crop_id==0 且 DS_DUMP_TILE0 时 dump 供与
+ *         Python dump/py_tile0_local.npy 对拍。 */
 static void *v3_crop_worker(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
     ds_sam_thread_gates(t->gate_win, t->gate_gbl, t->gate_enc);
@@ -455,6 +487,12 @@ typedef struct {
     int *next;
 } v3_pool_arg_t;
 
+/* v3_pool_worker - 动态取件池 worker：原子领件、干完即取下一个
+ * 【算法】__sync_fetch_and_add 原子自增共享计数 next，每个槽位恰好被
+ *         一个 worker 领取一次；无锁（各槽位由各自 crop 独占写）。
+ * 【为什么不用分批 join】旧实现按 CPU 数分批（30 crops = 14+14+2），
+ *         尾批只剩 2 个 crop 时 12 个核心空转一整个 crop 时长；
+ *         动态取件天然负载均衡。 */
 static void *v3_pool_worker(void *arg) {
     v3_pool_arg_t *p = (v3_pool_arg_t *)arg;
     for (;;) {
@@ -469,6 +507,17 @@ static void *v3_pool_worker(void *arg) {
  * 关键路径组件: 1024² SAM + CLIP 是波次里最重的单体任务，串行跑要
  * ~2.2s。作为独立 pthread 全速并行（门控 1/6/4），与 crop 池重叠执行。
  * 产出: 重排后的 gnl [ggrid×17, hidden]（enc_tokens 携带）。 */
+/* v3_global_worker - V3/V4 全局视图编码线程（1024² 全局图，关键路径）
+ * 【流水线】SAM(1024²) → [256,1024] → CLIP → [273,1280]
+ *           （16 行×(16+1)+1：含 newline 与末尾 view_sep）
+ *           → 剥 newline 取回 16×16=256 原始特征 → 按 16×(16+1) 重插
+ *           newline → gnl [272,1280]（含行分隔符、不含 view_sep——sep 在
+ *           concat 阶段统一追加一次）。
+ * 【为什么独立线程全速】1024² SAM 有 4 个 4096×4096 全注意力层，是波次里
+ *           最重的单体任务（~2.2s）；门控 (1,6,4) 给满预算与局部 crop 池
+ *           重叠执行，缩短关键路径。
+ * 【为什么先剥后插】保证与 Python 布局逐位一致：重排只以 global_raw 为
+ *           中间表示，不受 CLIP 前向内部布局细节影响。 */
 static void *v3_global_worker(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
     ds_sam_thread_gates(1, 6, 4);
@@ -507,7 +556,11 @@ static void *v3_global_worker(void *arg) {
     return NULL;
 }
 
-/* Worker for global crop (1024x1024) — uses causal_query_embeddings (256 queries) */
+/* crop_worker_global - V2 全局缩略图（1024×1024 pad 图）编码线程
+ * 与 crop_worker 同一流水线，仅两处不同：输入 1024²（SAM → 256 token），
+ * 使用 256 路因果流查询 causal_query_embeddings（非 768 版的 144 路）。
+ * 作为第 N+1 个 worker 与全部局部裁剪同时启动（v0.9 的 N+1 并行优化，
+ * docs/05 §2.2）。 */
 static void *crop_worker_global(void *arg) {
     crop_task_t *t = (crop_task_t *)arg;
     ds_sam_thread_gates(t->gate_win, t->gate_gbl, t->gate_enc);
@@ -543,6 +596,17 @@ static void *crop_worker_global(void *arg) {
 static void ds_v4_warn_degenerate(const char *t);
 static int ds_v4_strip_layout(char *t, int len, int *malformed_out);
 
+/* detect_model_version - 读 config.json 关键字判定模型版本
+ * 【算法】按 4→3→2→1 顺序匹配:
+ *   V4 (Unlimited-OCR-2): 含 "dash" / "training_stage" / "sparse_attention_config"
+ *   V3 (Unlimited-OCR):   含 sliding_window_size 或 unlimited-ocr 变体
+ *   V2 (DeepEncoder V2):  含 DeepEncoderV2 / causal_flow / enc_type:"2"
+ *   V1 (DeepSeek-OCR):    以上都不匹配 → 默认
+ * 【为什么 V4 必须先查】V4 的 config 同样含 "UnlimitedOCR"/
+ *   "sliding_window_size"，先查 V3 会把 V4 误判成 V3（docs/14 §1）。
+ * 【为什么自动检测】四版本共享 95% 代码，差异仅在编码器与解码注意力；
+ *   检测顺序让一个二进制兼容全部模型，用户无需手选版本。
+ * 【返回】1/2/3/4；config.json 打不开返回 -1。 */
 static int detect_model_version(const char *model_dir) {
     /* Check config.json for model type indicators */
     char path[1024];
@@ -580,6 +644,25 @@ static int detect_model_version(const char *model_dir) {
     return 1;
 }
 
+/* init_config - 按版本号填充架构超参数表（cfg 先清零）
+ * 【参数】cfg: 输出配置；version: detect_model_version 的结果（1/2/3/4）
+ * 【版本差异】
+ *   编码器: V2 = Qwen2-0.5B（hidden 896、GQA 14Q/2KV、RoPE θ=1e6、
+ *           256/144 路因果流查询），proj 输入 896，SAM ds2=896；
+ *           V1/V3/V4 = CLIP-L（hidden 1024、24 层），proj 输入 2048
+ *           （CLIP 1024 + SAM 1024 拼接），SAM ds2=1024。
+ *   解码器: 四版同构（12 层 MoE：64 路由专家 top-6 + 2 共享专家，
+ *           hidden 1280、词表 129280）。
+ *   V3: sliding_window_size=128（R-SWA 滑窗注意力）、无 per-head Q/K
+ *       RMSNorm、image_token_id=128815。
+ *   V4: 视觉侧与 V3 相同，但 sliding_window_size 强制 0——官方推理显式
+ *       关闭 R-SWA（_ring_window=None），若保留 128 会让 V3 的 R-SWA
+ *       路径错误接管 decode 注意力；实际注意力走 ds_dash 的 page2d RoPE
+ *       + DASH 块稀疏（dec_rope_theta 仅作 1D 兼容后备）。
+ * 【实现说明】本函数分两段：第一段按 version==2/3/else 填编码器字段
+ *   （V4 落入 else，取到与 V1 相同的 CLIP 参数）；第二段（下方 if 链）
+ *   再覆盖同名字段并补各版专属字段（sliding_window_size/has_qk_norm/
+ *   image_token_id 等）。两段对重叠字段赋值一致，重复无害。 */
 static void init_config(ds_config_t *cfg, int version) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->model_version = version;
@@ -661,6 +744,8 @@ static void init_config(ds_config_t *cfg, int version) {
     cfg->dec_rms_norm_eps = 1e-6f;
     cfg->dec_rope_theta = 10000.0f;
 
+    /* ── 第二段：版本专属字段（覆盖第一段同名编码器字段，取值一致；
+     *    并补 sliding_window_size / has_qk_norm / image_token_id 等）── */
     if (version == 4) {
         /* Unlimited-OCR-2: 与 V3 相同的视觉编码器 (SAM+CLIP-L) + linear projector，
          * 解码器换成 DASH 块稀疏注意力 + page2d 二维 RoPE。
@@ -764,7 +849,9 @@ static void init_config(ds_config_t *cfg, int version) {
  * ======================================================================== */
 
 /* 把 [p, p+bytes) 的 mmap 清洁文件页归还内核（拷贝完成后调用）。
- * MAP_PRIVATE 文件页此后触碰会从 page cache 廉价重入，正确性不变。 */
+ * MAP_PRIVATE 文件页此后触碰会从 page cache 廉价重入，正确性不变。
+ * 【实现】4095 掩码把起止地址对齐到 4KB 页边界（madvise 要求页对齐）；
+ * MADV_DONTNEED 释放物理页，进程 RSS 随之下降。 */
 void ds_drop_source_pages(const void *p, size_t bytes) {   /* 供 ds_moe_decoder.c 的 lm_head F32 化后丢弃源页 */
     if (!p || bytes == 0) return;
     uintptr_t a = ((uintptr_t)p) & ~(uintptr_t)4095;
@@ -772,6 +859,16 @@ void ds_drop_source_pages(const void *p, size_t bytes) {   /* 供 ds_moe_decoder
     madvise((void *)a, b - a, MADV_DONTNEED);
 }
 
+/* load_all_weights - 从已打开的 safetensors 分片加载全部权重到 ctx
+ * 【加载策略（为什么分两类）】
+ *   F32 预转换: SAM/CLIP/DeepEncoder/projector/norm —— 编码器是批量 sgemm
+ *     （prefill/一次前向），预转换的内存开销小（编码器权重占比小）；
+ *   BF16 零拷贝: 解码器 QKV/专家/lm_head/token 嵌入 —— decode 是内存带宽
+ *     受限的逐 token matvec，mmap 指针 + 按行即时转换最优（docs/03 §2.2/§3.3）。
+ * 【返回】0 成功；-1 = 必需 tensor 加载失败。可选 tensor（如 conv bias、
+ *   post_layernorm）缺失仅警告不报错（LOAD_F32_OPT）。
+ * 【router gate 双份】F32 与 BF16 各存一份：专家选择必须与 Python 的
+ *   BF16 autocast 逐位一致（ds_moe_router_bf16 用 BF16 版），F32 备用。 */
 static int load_all_weights(ds_ctx_t *ctx) {
     multi_safetensors_t *ms = (multi_safetensors_t *)ctx->safetensors;
     if (!ms) return -1;
@@ -794,6 +891,8 @@ static int load_all_weights(ds_ctx_t *ctx) {
         } \
     } while(0)
 
+    /* OPT 变体: tensor 缺失时静默跳过（可选权重——SAM neck conv bias、
+     * post_layernorm 等在部分版本中不存在） */
     #define LOAD_F32_OPT(name, target) do { \
         t = multi_safetensors_find(ms, name, &sf); \
         if (t) { \
@@ -931,6 +1030,9 @@ static int load_all_weights(ds_ctx_t *ctx) {
     /* ---- Decoder Weights (BF16) ---- */
     ds_moe_decoder_t *dec = &ctx->decoder;
 
+    /* LOAD_BF16: 仅当 tensor dtype 为 BF16 时取 mmap 零拷贝直接指针；
+     * 非 BF16 时只打警告、target 保持 NULL（宏并不真正转 F32），下游前向
+     * 对 NULL 指针各有兜底（如 lm_head 的 F32 副本路径）。 */
     #define LOAD_BF16(name, target) do { \
         t = multi_safetensors_find(ms, name, &sf); \
         if (t && safetensor_is_bf16(t)) { \
@@ -991,6 +1093,9 @@ static int load_all_weights(ds_ctx_t *ctx) {
             DEC_BF16(dense_down_weight_bf16, "mlp.down_proj.weight");
         } else {
             /* MoE for remaining layers */
+            /* 路由 gate 存 F32+BF16 双份: 路由分数决定选哪 6 个专家，
+             * Python autocast 下该矩阵走 BF16 计算——必须用 BF16 版做
+             * 逐位对齐（专家选择错一个，输出就整段跑偏）；F32 版备用。 */
             DEC_F32(gate_weight, "mlp.gate.weight");
             DEC_BF16(gate_weight_bf16, "mlp.gate.weight");
 
@@ -1051,6 +1156,16 @@ static int load_all_weights(ds_ctx_t *ctx) {
  * INT4 Quantization (called after ds_load, when --int4 flag is set)
  * ======================================================================== */
 
+/* ds_quantize_moe_int4 - MoE 专家权重 INT4 量化入口（--int4，ds_load 后调用）
+ * 【算法】对第 1..11 层（first_k_dense=1 之后）的路由专家 gate_up_fused/down
+ *         与共享专家同型权重做逐块 INT4 量化（ds_int4_quantize_bf16），
+ *         量化副本存 experts_int4/shared_*_int4，原 BF16 指针保留作回退；
+ *         layer 0 的 Dense FFN 跳过。
+ * 【为什么】decode 每步读 ~943MB 专家权重（docs/05 §7.1），INT4 把这部分
+ *         读带宽降约 4×；MoE 专家对低位宽不敏感，精度损失可忽略。
+ * 【注意】日志文案 "INT8" 沿用历史输出未改，实际是 INT4；统计里的
+ *         BF16 基线 expert_block_size 在 r2 去拷贝后恒为 0（见
+ *         load_all_weights 尾注），该比率项已无意义。 */
 int ds_quantize_moe_int4(ds_ctx_t *ctx) {
     if (!ctx || !ctx->int4_enabled) return 0;
     ds_config_t *cfg = &ctx->config;
@@ -1137,6 +1252,12 @@ int ds_quantize_moe_int4(ds_ctx_t *ctx) {
  * 比每步重新计算快得多，且结果完全精确
  * ======================================================================== */
 
+/* alloc_decoder_buffers - 分配 KV 缓存、decode 单 token 缓冲、MoE scratch、
+ *                         RoPE 查表，并写入推理默认参数
+ * 【返回】0 成功；-1 = KV 缓存分配失败（posix_memalign 失败）
+ * 【为什么全部预分配】decode 每步要跑 12 层 × (注意力+MoE)，若中途
+ *   malloc/free 会引入数万次系统调用与碎片；MoE 专家串行处理，各专家
+ *   可安全复用同一组 scratch 缓冲。 */
 static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ds_config_t *cfg = &ctx->config;
     int hidden = cfg->dec_hidden;
@@ -1193,7 +1314,11 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     ctx->dec_gate_scores = (float *)malloc(cfg->dec_n_routed_experts * sizeof(float));
 
     /* Repetition penalty: logits buffer and token history */
+    /* dec_logits [vocab]: prefill logits 与全量采样路径共用；贪心快速路径
+     * 从不更新它（docs/08 §4.2）——事后 EOS 重选只能在该路径上用 */
     ctx->dec_logits = (float *)malloc(cfg->vocab_size * sizeof(float));
+    /* 历史表容量 = KV 上限 + 512 余量；V3/V4 为 8704。同时服务重复惩罚
+     * （rp>1 时补算历史 token logit，docs/08 §2.3）与 n-gram 阻断（§3） */
     ctx->token_history_cap = max_seq + 512;
     ctx->token_history = (int *)malloc(ctx->token_history_cap * sizeof(int));
     ctx->token_history_len = 0;
@@ -1230,6 +1355,8 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     }
 
     /* RoPE cache */
+    /* 逆频率 θ^(-2i/d)：低维高频（位置敏感）、高维低频（长程依赖），
+     * 与 Transformer 论文标准 RoPE 一致；head_dim/2 个频率对应旋转对 */
     ctx->rope_inv_freq_half = head_dim / 2;
     ctx->rope_inv_freq = (float *)malloc(ctx->rope_inv_freq_half * sizeof(float));
     for (int i = 0; i < ctx->rope_inv_freq_half; i++) {
@@ -1248,6 +1375,8 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     free(positions);
 
     /* Encoder output buffer */
+    /* 容量按 V2 多裁剪上限场景: 256 全局 + 6×144 局部 = 1120 token；
+     * V3/V4 各分支自行 malloc（其 token 数可达数千，不受此缓冲约束） */
     int max_tokens = DS_VISUAL_TOKENS_BASE + DS_MAX_LOCAL_CROPS * DS_LOCAL_CROP_TOKENS;
     ctx->enc_output = (float *)malloc(max_tokens * hidden * sizeof(float));
 
@@ -1276,6 +1405,13 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
  * ds_recognize_image() — 从RGB像素识别文字（核心实现）
  * ======================================================================== */
 
+/* ds_load - 加载模型（公共 API 入口）
+ * 【步骤】detect_model_version → calloc ctx → init_config → 打开 safetensors
+ *   分片（mmap 零拷贝）→ load_all_weights → alloc_decoder_buffers → Metal 初始化
+ * 【返回】成功返回 ctx（调用方负责 ds_free）；任一步失败返回 NULL（内部已清理）
+ * 【Metal】可选加速：不可用或设置 DS_NO_METAL 时不视为错误，纯 CPU 运行；
+ *   DS_METAL_MOE / DS_METAL_LM 逐 token getenv 的查询在加载期提前执行
+ *   （hoist），避免 decode 热路径每步 ~24 次 getenv 调用 */
 ds_ctx_t *ds_load(const char *model_dir) {
     if (ds_verbose >= 1)
         fprintf(stderr, "Loading DeepSeek-OCR model from %s\n", model_dir);
@@ -1332,7 +1468,9 @@ ds_ctx_t *ds_load(const char *model_dir) {
         ctx->metal_enabled = 0;
         if (ds_verbose >= 1) fprintf(stderr, "Metal GPU acceleration: disabled by DS_NO_METAL\n");
     } else if (ctx->metal_enabled) {
-        /* Register expert weight blocks with Metal for zero-copy offset access */
+        /* Register expert weight blocks with Metal for zero-copy offset access
+         * r2 去拷贝后 expert_block_bf16 恒为 NULL（见 load_all_weights 尾注），
+         * 此注册循环实际不再触发；保留以备未来恢复连续专家块路径。 */
         for (int l = 0; l < ctx->config.dec_layers; l++) {
             if (ctx->decoder.layers[l].expert_block_bf16) {
                 ds_metal_register_expert_block(ctx->metal_ctx,
@@ -1352,6 +1490,13 @@ ds_ctx_t *ds_load(const char *model_dir) {
     return ctx;
 }
 
+/* ds_free - 释放 ctx 持有的全部资源（幂等：各指针先判空）
+ * 【顺序】Metal 上下文 → 分词器 → safetensors（munmap，编码器/解码器权重
+ *   指针随之失效）→ KV/decode/MoE/RoPE 堆缓冲 → expert 连续块 → ctx 本体
+ * 【为什么权重不单独 free】weight 指针大多直接指向 mmap 区域，关闭
+ *   safetensors 即整体解除映射；F32 预转换副本（lm_head_f32/tok_emb_f32、
+ *   各编码器 LOAD_F32 结果）才是堆内存，其中编码器 F32 权重也由
+ *   safetensors reader 持有，这里不重复释放。 */
 void ds_free(ds_ctx_t *ctx) {
     if (!ctx) return;
 
@@ -1416,12 +1561,20 @@ void ds_free(ds_ctx_t *ctx) {
     free(ctx);
 }
 
+/* ds_set_token_callback - 挂/摘流式 token 回调（cb=NULL 关闭）
+ * 回调在解码循环内逐 token 触发（piece 为 BPE 解码出的 UTF-8 片段）。
+ * 【为什么 CLI 不给 V3/V4 挂】幻觉前缀（如 "[No text detected]"）无法逐
+ *   token 判定，必须等终态后处理；V1/V2 输出干净可边生成边打印。API 用户
+ *   自行给 V3 挂回调时，会经 ds_stream_filter_det 做 det 标签过滤。 */
 void ds_set_token_callback(ds_ctx_t *ctx, ds_token_cb cb, void *userdata) {
     if (!ctx) return;
     ctx->token_cb = cb;
     ctx->token_cb_userdata = userdata;
 }
 
+/* ds_recognize - 从图像文件识别文字（公共 API）
+ * ds_image_load 支持 PNG/JPEG/WebP/BMP/TIFF（stb_image 封装），加载后把
+ * RGB 像素转交 ds_recognize_image；返回 malloc 字符串（调用方 free）。 */
 char *ds_recognize(ds_ctx_t *ctx, const char *image_path) {
     if (!ctx || !image_path) return NULL;
 
@@ -1450,6 +1603,9 @@ char *ds_recognize(ds_ctx_t *ctx, const char *image_path) {
 #define DS_LOOP_PMIN 4         /* 最短周期（避开 1-3 字节的分隔符行误伤） */
 #define DS_LOOP_PMAX 512
 
+/* ds_early_stop_loopy_enabled - 内容循环早停开关（默认开）
+ * static 缓存 getenv 结果只查一次；DS_NO_EARLY_STOP=1 关闭早停
+ * （回归对拍/排查时用，让解码跑满 max_new_tokens）。 */
 static int ds_early_stop_loopy_enabled(void) {
     static int enabled = -1;
     if (enabled < 0)
@@ -1457,7 +1613,17 @@ static int ds_early_stop_loopy_enabled(void) {
     return enabled;
 }
 
-/* ds_output_tail_loopy — 检查输出尾部是否存在周期性内容循环（多尺度后缀） */
+/* ds_output_tail_loopy - 检查输出尾部是否存在字节级周期循环（多尺度后缀）
+ * 【算法】依次取 3072/1536/768/384 字节的尾部窗口（取装得下的最大者），
+ *   剔除数字/空白/[]/,/. 得归一化串 norm；若存在周期 p∈[4, min(512,L/3)]
+ *   使 norm[i]==norm[i+p] 对全部 i 成立（≥3 个完整周期）→ 判定循环。
+ * 【为什么剥数字与括号】循环的原始形态多样：单行重复（World World…）、
+ *   多行周期、坐标逐圈抖动的标签流（剥掉数字后文本才重复）——归一化
+ *   让三者都落入同一检测。
+ * 【为什么多尺度窗口】"真实内容 + 尾部循环"混合时，循环只占尾部一小段，
+ *   小窗口仍能整体落入循环段。全窗逐字节匹配是极强条件，正常文本不可能
+ *   满足——黄金标签 32 份同逻辑扫描零误报。
+ * 【返回】1 = 检测到内容循环。 */
 static int ds_output_tail_loopy(const char *output, size_t out_len) {
     static const size_t windows[] = { 3072, 1536, 768, 384 };
     if (out_len < 256) return 0;
@@ -1493,6 +1659,27 @@ static int ds_output_tail_loopy(const char *output, size_t out_len) {
     return 0;
 }
 
+/* ds_recognize_image - 端到端识别主流程（全引擎核心，公共 API）
+ * 【参数】pixels/width/height/channels: RGB 像素（uint8, HWC 布局）；
+ *         返回 malloc 字符串（调用方 free），失败返回 NULL。
+ * 【五步流水线】
+ *   Step 1 图像→编码（三路分支，输出统一为 [n_encoder_tokens, 1280]）:
+ *     V2: 大图(>768) dynamic_preprocess → N 个 768² 局部 + 1 个 1024² 全局
+ *         并行（SAM→DeepEncoder V2→proj，N+1 workers）；小图仅全局 1024²；
+ *         拼接 [local..., global, view_sep]
+ *     V3/V4: 大图(>640) dynamic_preprocess(640) → N 局部走动态取件池 +
+ *         全局 1024² 独立线程（SAM→CLIP→proj→剥 newline→网格重排→重插
+ *         newline）；小图仅全局；拼接 [local, global, view_sep]
+ *     V1: 单图 1024² → SAM → CLIP（无多裁剪）
+ *   Step 2 prompt 构造（各版本布局见 prompt_construction 段大注释）
+ *   Step 3 KV 缓存清零 + prefill: 一次喂全部 prefix token（批量 sgemm），
+ *         从 prefill logits 取 first_token（V3/V4 冠军为 EOS 时净化）
+ *   Step 4 自回归 decode 主循环: 逐 token 前向 → EOS/warmup 禁用 →
+ *         历史 → BPE 解码 → 权威缓冲 + 流式回调 → 循环早停
+ *   Step 5 终态后处理: strip 空白 → V3/V4 det 标签剥离 → V4 净化/退化
+ *         护栏 → 幻觉前缀截断 → 点阵行/断裂 det 片段/孤立闭合标签清除
+ * 【参考】docs/04-完整推理流程篇.md（全链路）、docs/08-解码策略与后处理篇.md
+ *         （§6-§9 后处理与幻觉防御）、docs/14-V4与DASH注意力篇.md（V4 差异） */
 char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                           int width, int height, int channels) {
     if (!ctx || !pixels) return NULL;
@@ -1542,7 +1729,9 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         /* V2 multi-crop path (DeepEncoder V2, crop_size=768) */
         ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
 
-        /* Fast-path: skip encoding entirely and load from Python reference dump */
+        /* Fast-path: skip encoding entirely and load from Python reference dump
+         * 调试快捷路径（DS_SKIP_ENCODER=1）：直接读 Python 参考投影输出，
+         * 跳过 SAM/编码器计算，用于隔离定位"编码侧 vs 解码侧"的对拍问题。 */
         if (getenv("DS_SKIP_ENCODER")) {
             const char *npy_path = "dump/multicrop/full_proj_output.npy";
             FILE *f = fopen(npy_path, "rb");
@@ -1558,7 +1747,7 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 if (ds_verbose >= 1)
                     fprintf(stderr, "SKIP_ENCODER: loaded %d tokens from %s (no SAM/encoder compute)\n",
                             n_encoder_tokens, npy_path);
-                goto prompt_construction;
+                goto prompt_construction;   /* 调试路径直接跳到 Step 2 prompt 构造 */
             } else {
                 fprintf(stderr, "DS_SKIP_ENCODER: %s not found, falling back to encoding\n", npy_path);
             }
@@ -1571,6 +1760,8 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
          * For larger images, dynamic_preprocess returns N crops (768x768) + 1 thumbnail (1024x1024).
          */
         int n_crops = 0;
+        /* 阈值 768：与 Python 对齐——任一维 >768 才做多裁剪，否则视为小图
+         * 只走全局 1024² 视图（局部裁剪尺寸即 768） */
         int use_crop = (width > 768 || height > 768);
         ds_image_t **crops = NULL;
 
@@ -1620,6 +1811,8 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
         }
 
         if (use_crop && !pil_pixels) {
+            /* 参数: 裁剪 768²、min_num=2、max_num=6（文档 04 早期写的
+             * (768,1,12) 已过时，以代码为准）。返回 N 个 768×768 局部裁剪 */
             crops = ds_dynamic_preprocess(&img, 768, 2, 6, 0, &n_crops);
             if (!crops || n_crops < 1) {
                 fprintf(stderr, "dynamic_preprocess failed\n");
@@ -1864,7 +2057,10 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 goto cleanup_crops;
             }
 
-            /* Concatenate [local, global, view_separator] */
+            /* Concatenate [local, global, view_separator]
+             * 【顺序约定】必须与 Python masked_scatter 的 source
+             * （cat([local_features, global_features, view_sep])）一致——
+             * 下方 V2 prompt 构造按"源序"把 encoder_output 填进图像槽位 */
             int view_sep = 1;
             n_encoder_tokens = local_token_count + n_global_enc_tokens + view_sep;
             encoder_output = (float *)malloc(n_encoder_tokens * hidden * sizeof(float));
@@ -1913,6 +2109,8 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
          * We strip newlines, then re-insert in correct grid layout.
          */
         ds_image_t img = { .pixels = (unsigned char *)pixels, .width = width, .height = height, .channels = channels };
+        /* 阈值 640：官方 infer() 的局部裁剪尺寸 image_size=640——任一维
+         * >640 才做多裁剪；全局视图无论如何都是 1024（见下） */
         int use_crop = (width > 640 || height > 640);
         int lgrid = 10;  /* 640/16/4 */
         float *nl = ctx->vis_tokenizer.image_newline;
@@ -1994,6 +2192,9 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 free(gnl); return NULL;
             }
 
+            /* 在所有满足 tw*th==nc 的网格形态中选最接近原图宽高比 (iar)
+             * 的 (cw,ch)——与 Python dynamic_preprocess 同规则，决定每个
+             * 裁剪在大网格中的行列位置 (cr,cc)，进而决定特征拼接顺序 */
             float iar = (float)width / height;
             int cw = 1, ch = 1; float bd = 1e10f;
             for (int tw = 1; tw <= max_crops_v34; tw++)
@@ -2068,7 +2269,10 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                     break;
                 }
                 int cr = ci / cw, cc = ci % cw;
-                /* Strip newlines: 111 → 100 */
+                /* Strip newlines: 111 → 100
+                 * 每 crop 的 CLIP 输出 111 = 10 行×(10+1) + 末尾 view_sep；
+                 * 每行只取前 10 个特征（跳过行尾 newline），写到大网格的
+                 * (cr*10+lr 行, cc*10 列) 处——view_sep 最后统一加一次 */
                 for (int lr = 0; lr < lgrid; lr++) {
                     int so = lr * (lgrid + 1) * hidden;
                     int dr = cr * lgrid + lr, dc = cc * lgrid;
@@ -2088,7 +2292,11 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 return NULL;
             }
             free(vtasks);
-            /* Insert newlines in local grid */
+            /* Insert newlines in local grid
+             * 【为什么重插】newline 是解码器感知视觉 token 2D 空间布局的
+             * "行分隔符"（每行 lw 个特征 + 1 个 newline，行宽 lw+1=lrw）；
+             * 先剥掉各 crop 自带的、再按合并后大网格的行宽统一插入，
+             * 才能正确表达跨 crop 的行边界（docs/04 §2.4.5） */
             if (nl) {
                 float *lnl = (float *)malloc(n_lnl * hidden * sizeof(float));
                 for (int r = 0; r < lh; r++) {
@@ -2112,8 +2320,12 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                 fprintf(stderr, "V3: Multi-crop: %d local + %d global + 1 sep = %d tokens\n", n_lnl, n_gnl, n_encoder_tokens);
         }
     } else {
-        /* V1 path (no multi-crop) */
-        /* Step 1: Visual tokenizer (SAM) — resize to 1024x1024 */
+        /* V1 path (no multi-crop)
+         * V1 无多裁剪：统一拉伸到 1024×1024——CLIP 需要固定 16×16 空间
+         * 网格与 SAM 特征对齐（docs/04 §2.1） */
+        /* Step 1: Visual tokenizer (SAM) — resize to 1024x1024
+         * ds_visual_tokenizer_forward 完成 SAM 前向，返回视觉 token
+         * （patch_embeds 供调试 dump）；随后 CLIP 直接以其为 patch_embeds */
         int n_visual_tokens;
         float *patch_embeds = NULL;
         double t_sam = ds_time_sec();
@@ -2184,16 +2396,20 @@ char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
 
     /* ── Step 3: 构造解码器输入序列 ──
      * 将编码器输出(视觉token) + prompt文本(token IDs) 拼接为解码器输入
-     * 不同版本有不同的prompt格式和token布局:
+     * 不同版本有不同的prompt格式和token布局（特殊 token ID 见 ds_ocr.h）:
      *
-     * V1: [BOS][img_start][encoder_output(273)][img_end][\nFree OCR.]
-     * V2: [BOS][encoder_output(n_img_tokens)][\nFree OCR.]
-     * V3: [BOS][image_placeholder(128815)×n][\ndocument parsing.]
+     * V1: [BOS(0)][img_start(151655)][视觉token×273][img_end(151656)]["\nFree OCR."×4]
+     * V2: [BOS(0)][图像槽×n_img]["\nFree OCR."×4]      ← 无 img_start/end，
+     *     图像槽按 Python masked_scatter 布局填 encoder_output（见下）
+     * V3: [BOS(0)][占位符(128815)×N]["\ndocument parsing."×4]
+     * V4: [BOS(0)][<PAGE>(128827)][占位符(128815)×N]["Multi page parsing."×4]
      *
-     * 每个token通过 tok_embeddings 查表得到嵌入向量 [hidden=1280]
-     * 图像token位置用编码器输出覆盖嵌入值
+     * 文本 token 通过 tok_embeddings 查表得到嵌入向量 [hidden=1280]
+     * （BF16 左移 16 位即 F32）；图像槽位置用编码器输出整体覆盖
      */
 
+/* prompt_construction 标签：DS_SKIP_ENCODER 调试路径的跳转目标
+ * （编码结果已被参考数据替换，直接进入 prompt 构造） */
 prompt_construction:
     /* Optional: skip SAM+encoder entirely by loading Python's encoder output.
      * DS_LOAD_ENCODER_OUTPUT=dump/py_encoder_output.bin loads [1121, 1280] float32
@@ -2268,6 +2484,10 @@ prompt_construction:
          *   So: global_slots[0:257] ← source[0:257] = local[0:257]
          *       local_slots[0:M]   ← source[257:257+M] = local[257:] + global[0:...]
          */
+        /* 槽位几何按 Python infer() 的参数计算: image_size=640 → 每 crop
+         * 100 个图像槽、全局 16²+1=257 槽。注意 C 编码每 crop 实际产
+         * 144 token（768²）——槽位数与编码输出数不同，下方复制按"源序
+         * 截断"处理（复现 Python masked_scatter 的填充语义，见大注释） */
         int ds_image_size = 640;
         int ds_num_queries = (ds_image_size + 15) / 16 / 4;  /* ceil(640/16/4) = 10 */
         int ds_num_queries_base = (1024 + 15) / 16 / 4;      /* ceil(1024/16/4) = 16 */
@@ -2308,7 +2528,10 @@ prompt_construction:
         memset(input_embeds, 0, prefix_len * hidden * sizeof(float));
         int pos = 0;
 
-        /* Helper: embed a single token ID at current pos and advance */
+        /* Helper: embed a single token ID at current pos and advance
+         * 【为什么左移 16 位】BF16 是 F32 截断低 16 位尾数的存储格式，
+         * BF16→F32 无需乘法/查表——bit pattern 直接左移 16 位补零，
+         * 即得到数值相同的 F32（docs/03 §3.2） */
         #define EMBED_TOKEN(tid) do { \
             if (ctx->decoder.tok_embeddings_bf16 && (tid) >= 0 && (tid) < cfg->vocab_size) { \
                 const uint16_t *_e = ctx->decoder.tok_embeddings_bf16 + (size_t)(tid) * hidden; \
@@ -2487,7 +2710,10 @@ prompt_construction:
         /* 3. Text after image */
         for (int t = 0; t < n_text_after; t++) EMBED_TOKEN_V3(text_after_ids[t]);
 
-        /* V4: 保存 id 序列并初始化 DASH 运行时（page 坐标 + 路由缓冲） */
+        /* V4: 保存 id 序列并初始化 DASH 运行时（page 坐标 + 路由缓冲）。
+         * ds_dash_build_coords 以 seq_ids 构建 page2d (tok,page) 坐标：
+         * <PAGE> 做 1-based 页计数，最后一张图之后的指令文本回"保留桶 0"
+         * ——保证指令与任何真实页 Δpage≥1 不被误判同页（docs/14 §3） */
         if (cfg->model_version == 4) {
             ctx->dash_prompt_ids = (const int *)seq_ids;   /* 在 ctx 释放前保持有效 */
             ctx->dash_prompt_len = prefix_len;
@@ -2597,13 +2823,17 @@ prompt_construction:
      * 使用批量矩阵乘法(sgemm)高效处理整个序列
      * 结果: KV缓存被填满，第一个生成token的logits可用
      *
-     * 为什么prefill而非逐token?
-     *   逐token: 280 tokens × 12层 × ~23ms/step = ~77s（太慢！）
-     *   批量prefill: 一次sgemm处理所有token = ~0.7s（100×加速）
+     * 为什么prefill一次喂全部、decode却逐token?
+     *   prefill 的所有 token 在开始时就已知（无数据依赖），可组成
+     *   [seq, hidden] 矩阵走批量 sgemm，充分利用 BLAS/SIMD（docs/03 §6）；
+     *   decode 的下一个 token 依赖上一步的输出（自回归串行依赖），
+     *   只能逐 token matvec，靠 KV 缓存避免重复计算历史 K/V。
+     *   逐token prefill: 280 tokens × 12层 × ~23ms/step = ~77s（太慢！）
+     *   批量prefill: 一次sgemm处理所有token = ~0.7s（100×加速，docs/05 §3）
      *
      * Python对应: model.generate() 先prefill整个prompt，再自回归decode
      */
-    ctx->kv_cache_len = 0;
+    ctx->kv_cache_len = 0;   /* 每次识别重建缓存（同一 ctx 可连续识别多图/多页） */
 
     float *dec_input = (float *)malloc(hidden * sizeof(float));
 
@@ -2675,12 +2905,13 @@ prompt_construction:
                     if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
                 }
                 first_token = best_id;
-                /* V3 EOS-first fix: suppress EOS and common spurious tokens
-                 * for first token selection. Must be OUTSIDE verbose block!
-                 * V3 model trained with BF16 autocast tends to output EOS
-                 * as top-1 in F32 precision. Suppressing EOS alone picks Ġ(space)
-                 * which leads to "10." loops. Also suppress Ġ and <|/det|>
-                 * so the model picks a meaningful content/detection token. */
+                /* V3/V4 EOS-first fix: F32 精度下 prefill 冠军常是 EOS
+                 * （Python BF16 autocast 训练 vs C F32 推理的 16 位尾数差
+                 * 所致，docs/08 §9.1 症状 A）。只禁 EOS 会选中次优 Ġ
+                 * （id=223，空格前缀）→ EOS↔Ġ 振荡产生 "10." 循环，故
+                 * 成对禁用（docs/08 §4.4）；被逼选出的次优可能先产出一段
+                 * 短英文幻觉，由 Step 5 后处理移除。Must be OUTSIDE verbose
+                 * block —— 此修复对任何 verbosity 都必须生效！ */
                 if ((cfg->model_version == 3 || cfg->model_version == 4) && first_token == 1) { /* EOS */
                     /* V3 model in F32 precision outputs EOS as first token.
                      * Ban EOS + Ġ to avoid "10." loops. The model then picks
@@ -2726,7 +2957,11 @@ prompt_construction:
     /* Store prefill token count for R-SWA (Unlimited-OCR).
      * After prefill, kv_cache_len = number of visual + prompt tokens.
      * During decode, R-SWA keeps these tokens as "reference" and only
-     * attends to reference + last sliding_window_size text tokens. */
+     * attends to reference + last sliding_window_size text tokens.
+     * 【KV 布局】[0, prefill_len) = 参考段（视觉+prompt，全局可见、不参与
+     * 状态转移）；[prefill_len, ...) = 滑动窗段（最近 128 个 decode token，
+     * 新覆盖旧）——KV 缓存总量恒定为 prefill_len + W，长文档内存不随生成
+     * 长度线性增长（docs/05 §6.2） */
     ctx->prefill_token_count = ctx->kv_cache_len;
     if (cfg->sliding_window_size > 0 && ds_verbose >= 1) {
         fprintf(stderr, "R-SWA: prefill_token_count=%d, sliding_window_size=%d\n",
@@ -2804,7 +3039,11 @@ prompt_construction:
              * distribution. (The old post-hoc suppression re-argmaxed over
              * ctx->dec_logits, which the fast path never updates — it was
              * still holding the prefill logits, so the "runner-up" came from
-             * a stale distribution and could repeat every step.) */
+             * a stale distribution and could repeat every step.)
+             * 【机制】dec_argmax_ban 由 ds_decoder_forward 的快速路径并入
+             *   banned[] → 排除式 argmax 跳过（docs/08 §3.3/§4.2）；V3 额外
+             *   伴禁 Ġ(223)：只禁 EOS 会在 "10." 前缀上 EOS↔Ġ 振荡（§4.3），
+             *   注意 Ġ 伴禁仅 V3 生效，V4 的 warmup 只禁 EOS。 */
             ctx->dec_argmax_n_ban = 0;
             if (step < ctx->min_new_tokens) {
                 ctx->dec_argmax_ban[ctx->dec_argmax_n_ban++] = eos_token;
@@ -2848,7 +3087,10 @@ prompt_construction:
             /* Suppress premature EOS: if we haven't generated enough tokens yet,
              * ban EOS and pick the next-best token instead.
              * This matches Python's NoEOSTextStreamer behavior where EOS is
-             * replaced with newline and generation continues. */
+             * replaced with newline and generation continues.
+             * 【定位】事后重选分支——仅全量 logits 路径有效（dec_logits 有
+             * 当前步真值）；快速路径的 warmup 禁用已在循环开头用
+             * dec_argmax_ban 声明（排除式 argmax），两者互为安全网。 */
             if (step < ctx->min_new_tokens && ctx->dec_logits) {
                 float *logits = ctx->dec_logits;
                 /* Ban EOS and Ġ during warmup. V3 model tends to oscillate
@@ -2978,7 +3220,8 @@ prompt_construction:
      * 每次识别归零。 */
     ctx->token_history_len = 0;
 
-    /* Trim trailing whitespace (matching Python .strip()) */
+    /* Trim trailing whitespace (matching Python .strip())
+     * 终态清理第①步（全模型通用，docs/08 §6.3 表） */
     if (output && out_len > 0) {
         while (out_len > 0 && (output[out_len-1] == ' ' || output[out_len-1] == '\n' ||
                                 output[out_len-1] == '\r' || output[out_len-1] == '\t')) {
@@ -2991,18 +3234,25 @@ prompt_construction:
      * and outputs.replace(a_match_other, '') — removes the entire <|det|>...<|/det|> block.
      * Also strips <|ref|>...<|/ref|><|det|>...<|/det|> blocks (ref+det pairs).
      * This removes bounding box coordinates while keeping the descriptive text. */
+    /* 终态层第②步 ds_strip_det_tags（V3/V4，docs/08 §6.3 表）：
+     * 读写双指针原地剥离成对标签、保留不成对碎标签（不猜优于猜错） */
     if (output && out_len > 0 && (cfg->model_version == 3 || cfg->model_version == 4)) {
         if (ds_verbose >= 1)
             fprintf(stderr, "V4DBG raw output (%d bytes): [", out_len);
         if (ds_verbose >= 1) { fwrite(output, 1, out_len < 300 ? out_len : 300, stderr); fprintf(stderr, "]\n"); }
         out_len = ds_strip_det_tags(output, out_len);
         if (cfg->model_version == 4) {
-            /* 退化护栏须在净化前（依赖原始块结构）；默认净化输出，
-             * --raw-layout 时保留原生结构化格式 */
+            /* 退化护栏须在净化前（依赖原始块结构，净化后空块已被丢弃）；
+             * 默认净化输出，--raw-layout 时保留原生结构化格式
+             * （docs/08 §7.3: keep_raw_layout=1 时净化不执行、退化标志
+             * 直接置 0——结构化输出是给下游工具的契约，CLI 不替它自愈） */
             ds_v4_warn_degenerate(output);
             int malformed = 0;
             if (!ctx->keep_raw_layout) {
                 out_len = ds_v4_strip_layout(output, out_len, &malformed);
+                /* 畸形行（有 <BLOCK> 无 <FORK>）→ last_output_degenerate，
+                 * main.c 据此整跑重试一次（命中率 p→p²）；DS_FORCE_RETRY
+                 * 环境变量无条件置位，用于联调自愈链路（docs/08 §8.3） */
                 ctx->last_output_degenerate = (malformed > 0) || getenv("DS_FORCE_RETRY") != NULL;  /* DS_FORCE_RETRY: 自愈链路联调 */
             } else {
                 ctx->last_output_degenerate = 0;
@@ -3015,6 +3265,8 @@ prompt_construction:
          *   "The image contains no text... Therefore... [No text detected]\n<actual OCR>"
          * Strip everything up to and including "[No text detected]" marker.
          * If no marker found, also check for English-only prefix before CJK text. */
+        /* 终态层第④⑤步（docs/08 §6.3 表）：首 token 被迫越过 EOS 时的
+         * 英文幻觉（§9.1 症状 B），以 [No text detected] 标记或短语表截断 */
         if (out_len > 20) {
             /* Skip leading whitespace for pattern matching */
             int start = 0;
@@ -3022,7 +3274,8 @@ prompt_construction:
                 start++;
             const char *marker = "[No text detected]";
             int mlen = 18;
-            /* Search for marker in first 400 chars from start */
+            /* 只在前 400 字符内搜索：幻觉前缀必然紧邻正文开头，全量扫描
+             * 代价高且正文里出现该短语的概率随长度上升（误伤面变大） */
             int search_len = (out_len - start) < 400 ? (out_len - start) : 400;
             int stripped = 0;
             for (int i = start; i + mlen <= start + search_len; i++) {
@@ -3092,6 +3345,8 @@ prompt_construction:
          * grid (same artifact class as the orphaned det closers stripped
          * below, which the pre-fix pipeline opened with). Recognized text
          * never begins with a dot-only line, so drop the run. */
+        /* 终态层第⑥步（docs/08 §6.3 表）：纯点+空白占位行整段剥离；
+         * 全文皆点行（空白页）则清空输出 */
         {
             int p = 0;
             int saw_dot_line = 0;
@@ -3128,6 +3383,10 @@ prompt_construction:
          * in the output is a CLOSER (<|/det|>), the opening <|det|> was lost
          * (the model sometimes emits doubled closers) — drop each such
          * fragment through its closer. Loop handles consecutive leftovers. */
+        /* 终态层第⑦步（docs/08 §6.3 表）：首 det 族 token 是 closer
+         * （opener 丢失/双 closer）→ 连 fragment 一起剥，最多 4 轮
+         * 处理连续残留。注意 opener 在前则不触发（正常 det 对已由
+         * ds_strip_det_tags 处理） */
         {
             int pass = 0;
             while (pass++ < 4) {
@@ -3148,6 +3407,9 @@ prompt_construction:
         /* Strip leading orphaned HTML closing-tag run (e.g. "</td></tr></table>").
          * Same rationale as the streaming suppression: output never begins
          * mid-table, so an opening run of closing tags is structural noise. */
+        /* 终态层第⑧步（docs/08 §6.3 表）：与流式层"孤立闭合标签前缀抑制"
+         * 同一规则的终态兜底——流式过滤与最终清理是双层独立实现，谁先
+         * 命中都无碍（V3/V4 的流式回调可能根本没挂，此步保底） */
         {
             int p = 0;
             while (p < out_len) {
@@ -3182,8 +3444,15 @@ prompt_construction:
     return output;
 }
 
-/* ds_v4_warn_degenerate — V4 退化输出护栏（须在布局净化【前】调用，需原始块结构）：
- * ≥2 个 <FORK> 块且内容全空 → stderr 提示（多为旧构建；stdout 不变）。 */
+/* ds_v4_warn_degenerate - V4 退化输出护栏（全空块检测）
+ * 【算法】统计 <FORK> 块数 forks 与"内容为空"块数 empty（FORK 后紧跟
+ *   结尾/换行/<BLOCK> 均视为空）；forks≥2 且 empty==forks（全部块皆空）
+ *   → stderr 打印重建提示。
+ * 【为什么"全部"且 ≥2】正常版面里空容器块与内容块混着，只有整次生成
+ *   退化才会全空；单块空可能是合法空容器，不告警。
+ * 【为什么在净化前调用】检测依赖原始 <FORK> 块结构——净化会把空块
+ *   丢弃，之后无从判定（docs/08 §8.2）。
+ * 【为什么只写 stderr】stdout 保持不变，保证回归输出可比对。 */
 static void ds_v4_warn_degenerate(const char *t) {
     int forks = 0, empty = 0;
     const char *p = t;
@@ -3200,12 +3469,19 @@ static void ds_v4_warn_degenerate(const char *t) {
                 "若仍复现请附 `git log -1` 与图片反馈。\n", forks);
 }
 
-/* ds_v4_strip_layout — V4 输出净化：剥布局标签、丢空内容块（r3 输出优化）。
- * 行式原地重写（输出 ≤ 输入）：
- *   <PAGE>                     → 删（多页分隔对纯文本无意义）
+/* ds_v4_strip_layout - V4 输出净化：剥布局标签、丢空内容块（r3 输出优化）
+ * 【算法】行式原地重写（读写指针同行内推进，输出恒 ≤ 输入），逐行规则:
+ *   <PAGE>                      → 删（多页分隔对纯文本无意义）
  *   <BLOCK>type[坐标]<FORK>内容 → 只留「内容」（type/LEVEL/坐标丢弃）
- *   <FORK> 后内容为空白的块     → 整行丢弃（空容器块）
- *   其它行（模型偶尔输出的裸文本）→ 原样保留 */
+ *   <FORK> 后内容 trim 后为空   → 整行丢弃（空容器块）
+ *   有 <BLOCK> 无 <FORK> 的行   → 原样保留 + malformed++（畸形行）
+ *   其它行（模型偶尔输出的裸文本）→ 原样保留
+ * 【为什么畸形行只计数不清洗】清洗它需要"猜"模型想输出什么；计数交给
+ *   调用方置 last_output_degenerate 触发整体重试（docs/08 §7.2/§8.3），
+ *   能换来一份从头生成的干净输出，比想当然的修复可靠。
+ * 【参数】malformed_out: 输出畸形行计数；返回净化后新长度。
+ * 【净化只删标签不碰正文】V4 相对 V3 的完整度优势（嵌套子项、长句全量
+ *   转写）原样保留；7 组 V4 黄金标签已按净化后输出重冻。 */
 static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
     char *w = t;
     char *p = t;
@@ -3237,7 +3513,7 @@ static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
     return (int)(w - t);
 }
 
-/* ds_strip_det_tags — V3后处理：去除检测坐标标签
+/* ds_strip_det_tags - V3/V4 后处理：去除检测坐标标签（终态层第②步）
  *
  * V3 (Unlimited-OCR) 输出格式:
  *   "实际文字<|det|>text [bbox]<|/det|>更多文字<|ref|>...<|/ref|><|det|>...<|/det|>..."
@@ -3249,7 +3525,13 @@ static int ds_v4_strip_layout(char *t, int len, int *malformed_out) {
  *   遇到<|ref|>...<|/ref|><|det|>...<|/det|> → 跳过整个ref+det对
  *   其他文本 → 直接复制
  *
+ * 【为什么不猜】不成对的碎标签（有 opener 无 closer、孤立 ref）原样
+ *   保留——"想当然的修复"可能吞掉正文；确定性后处理宁缺勿滥
+ *   （docs/08 §6.4 设计原则 3）。
+ *
  * 后处理: 合并连续多个换行为最多2个
+ *
+ * 【参数/返回】text: 原地修改的缓冲；len: 输入长度；返回清理后新长度。
  *
  * Python对应: outputs.replace(a_match_other, '')
  */
