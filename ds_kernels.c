@@ -1183,6 +1183,10 @@ static void ds_grouped_matvec_worker(int tid, int n_threads, void *arg) {
     }
 }
 
+/* ds_grouped_matvec_bf16 - 分组 BF16 matvec：n_units 个单元（专家/批行）合并
+ * 进一个并行区（MoE prefill Gather-Compute-Scatter 的 gather 侧也复用此入口）
+ * 【形状】out[n_units × rows_per_unit]、W 同布局、每单元 X[unit][in_dim]
+ * 【为什么合并分发】契约与 barrier 开销分析见 ds_kernels.h 顶部长注释。 */
 void ds_grouped_matvec_bf16(float *out, const float *const *X, const uint16_t *const *W,
                              int n_units, int rows_per_unit, int in_dim) {
     /* 实现 = 一个并行区跑完所有单元（契约见 ds_kernels.h 顶部长注释）：
@@ -1571,18 +1575,27 @@ void ds_bf16_to_f32_convert(float *dst, const uint16_t *src, size_t n) {
     ds_bf16_to_f32_buf(dst, src, n);
 }
 
-/* NEON-optimized batch conversion dispatch */
+/* NEON-optimized batch conversion dispatch
+ * 批量 BF16↔F16 转换的编译期双实现：__ARM_NEON 下直连 ds_kernels_neon.c 的
+ * 向量化版本（每轮 8 元素 vshll/vsubn 级流水），否则回落到上方通用转换器
+ * （其内部仍有 64K 阈值的线程池并行）。KV 缓存写入（ds_kv_store_row）和
+ * 编码器预转换都经由此对入口。 */
 #ifdef __ARM_NEON
 extern void ds_bf16_to_f32_neon(float *dst, const uint16_t *src, size_t n);
 extern void ds_f32_to_bf16_neon(uint16_t *dst, const float *src, size_t n);
 
+/* ds_bf16_to_f32_batch - BF16→F32 批量展开（NEON 直连版）
+ * 转换 = 位模式 <<16，无舍入、无误差；dst 容量须 ≥ 4n 字节 */
 void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n) {
     ds_bf16_to_f32_neon(dst, src, n);
 }
+/* ds_f32_to_bf16_batch - F32→BF16 批量压缩（NEON 直连版）
+ * 就近舍入到 BF16（tie 向绝对值增大方向），与下方标量回退逐位一致 */
 void ds_f32_to_bf16_batch(uint16_t *dst, const float *src, size_t n) {
     ds_f32_to_bf16_neon(dst, src, n);
 }
 #else
+/* ds_bf16_to_f32_batch - 标量回退：转发通用转换器（内部按量并行） */
 void ds_bf16_to_f32_batch(float *dst, const uint16_t *src, size_t n) {
     ds_bf16_to_f32_convert(dst, src, n);
 }

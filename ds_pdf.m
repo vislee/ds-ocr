@@ -23,6 +23,14 @@ struct ds_pdf_doc {
     int n_pages;
 };
 
+/* ds_pdf_open - 打开 PDF 文档（CoreGraphics 实现侧）
+ *
+ * 【CF 桥接链】路径 C 字符串 → CFString（文件系统表示）→ CFURL → CGPDFDocument。
+ *   CFStringCreateWithFileSystemRepresentation 而非 NSString，是为了在纯 C 风格
+ *   路径上避免引入 Foundation 依赖——本文件只依赖 CoreGraphics/CoreFoundation。
+ * 【所有权】每个中间对象用完立即 CFRelease；doc 的引用计数移交给 ds_pdf_doc_t，
+ *   由 ds_pdf_close 统一释放。
+ * @return malloc 的文档句柄（调用者 ds_pdf_close），页数 ≤0 或解析失败返回 NULL */
 ds_pdf_doc_t *ds_pdf_open(const char *path) {
     if (!path) return NULL;
 
@@ -52,10 +60,24 @@ ds_pdf_doc_t *ds_pdf_open(const char *path) {
     return d;
 }
 
+/* ds_pdf_page_count - 返回总页数（NULL 安全，主调用方 main.c 用它做循环上界） */
 int ds_pdf_page_count(ds_pdf_doc_t *doc) {
     return doc ? doc->n_pages : 0;
 }
 
+/* ds_pdf_render_page - 渲染一页为 RGB 像素（实现侧）
+ *
+ * 【管线】MediaBox → 计算缩放（2.0×≈144 DPI，长边 ≤2048px 再压回）→
+ *   RGBA 位图上下文（白底）→ DrawPDFPage → 逐行抽包 RGBA→RGB。
+ * 【为什么渲染成 RGBA 再抽 RGB】CoreGraphics 位图上下文不支持 24bpp RGB，
+ *   只能带 alpha 通道渲染；而引擎侧 ds_image_t 约定 3 字节/像素，故最后做
+ *   内存级抽取（每像素跳过第 4 字节）。stride 用 GetBytesPerRow 取——上下文
+ *   可能做行对齐，不能假设等于 w*4。
+ * 【预乘 alpha 说明】kCGImageAlphaPremultipliedLast 表示 RGB 已被 alpha 预乘；
+ *   因先填白底（alpha=1 处不透明），整页像素 alpha 恒为 255，预乘无失真。
+ * 【CTM 顺序】先 Scale 后 Translate（矩阵右乘依次作用），先把页面点阵缩放
+ *   到设备像素，再平移掉 MediaBox 原点——见下方 DrawPDFPage 处的坐标注释。
+ * @return 0 成功（*out_pixels 归调用者 free），-1 失败 */
 int ds_pdf_render_page(ds_pdf_doc_t *d, int page_index,
                        unsigned char **out_pixels, int *out_w, int *out_h) {
     if (!d || page_index < 0 || page_index >= d->n_pages ||
@@ -122,6 +144,9 @@ int ds_pdf_render_page(ds_pdf_doc_t *d, int page_index,
     return 0;
 }
 
+/* ds_pdf_close - 释放 CGPDFDocument 与句柄本身（NULL 安全）
+ * 调用时机见 main.c：渲染完所有页后再关文档，避免 CGPDFDocument 在
+ * CGContextDrawPDFPage 期间被释放。 */
 void ds_pdf_close(ds_pdf_doc_t *doc) {
     if (!doc) return;
     CGPDFDocumentRelease(doc->doc);

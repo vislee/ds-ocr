@@ -184,6 +184,9 @@ static inline void *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
     return (char *)ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * stride * elem;
 }
 
+/* ds_kv_v_layer - 第 layer 层 V 缓存起始地址（row 0），与 ds_kv_k_layer 同构
+ * K/V 分属两块独立大 slab（kv_cache_k / kv_cache_v），各自算层间偏移；
+ * 解码每层都要从头扫 K 与 V，预先把两块基址拿到手可省内层循环的重复偏移计算。 */
 static inline void *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
     int stride = ctx->_kv_row_stride;
     size_t elem = ctx->kv_bf16 ? sizeof(uint16_t) : sizeof(float);

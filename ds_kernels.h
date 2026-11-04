@@ -75,10 +75,15 @@ void ds_linear_nobias(float *y, const float *x, const float *W,
 void ds_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                     const float *b, int seq_len, int in_dim, int out_dim);
 
+/* 同 ds_linear_bf16 但无 bias（Transformer 投影均无 bias）：
+ * y[seq,out] = x[seq,in] @ W_bf16[out,in]^T，选路逻辑与 F32 版一致（见上） */
 void ds_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim);
 
-/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
+/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch
+ * 融合 QKV 三投影为单次并行分发：三段输出折叠进一个全局行号空间按线程均分，
+ * barrier 从 3 次降到 1 次；三块写缓冲互不相交，无锁（实现见 ds_kernels.c
+ * qkv_ds_matvec_worker 注释）。 */
 void ds_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                 const uint16_t *Wq_bf16,
                                 const uint16_t *Wk_bf16,
@@ -241,6 +246,9 @@ void ds_compute_2d_position_embeddings(float *pos_embed, int n_rows, int n_cols,
 /* Compute router gate scores: scores[n_experts] = gate_weight[n_experts, hidden] @ x[hidden] */
 void ds_moe_router(float *scores, const float *x, const float *gate_weight,
                    int hidden, int n_experts);
+/* BF16 权重版路由：gate_weight 以 BF16 mmap 直指针传入，matvec 内逐元素
+ * BF16→F32 展开。为什么单独留 BF16 版：路由分数对权重精度敏感，BF16 存储
+ * + on-the-fly 展开与 Python 侧 BF16 权重的数值路径一致（docs/02 §5） */
 void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weight_bf16,
                           int hidden, int n_experts);
 
