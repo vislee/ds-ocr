@@ -164,6 +164,10 @@ MoE 训练中为了让专家批处理平衡而引入的缓冲系数。<当某专
 **把多个应当顺序执行的数学运算合并到一个循环/kernel 里执行**。<减少中间结果的落盘往返（内存读写），典型如"在线 softmax + 融合 BF16 matvec"。>ds-ocr 在三层（generic/NEON/AVX）上做平台优化并融合算子。
 - 相关章节：03 · 05 · 09
 
+### 分组行并行（Grouped Row-Parallel MatVec）
+**r4 的解码 MoE 优化**：把 top_k 专家的同类投影（gate/up、down）合并为一个并行区，线程池每层只进 3 个大并行区而非 ~19 个微型区，barrier 同步开销降一个数量级。<切分粒度取行对 (2r,2r+1)——行对永不跨线程拆分，保证与串行版逐位一致；V4 解码 45.9→76.4 tok/s。>实现在 `ds_grouped_matvec_bf16()`（ds_moe_decoder.c）。
+- 相关章节：05 · 15
+
 ### FlashAttention
 **IO 感知的精确注意力内核**：分块扫描 K/V、维护 running max/sum（**online softmax**），**永不物化 N² 注意力矩阵**。<GPU 上省的是 HBM 读写，是"把 IO 作为第一性约束"的内核设计思想；CPU 引擎照样借用 online softmax 的数值形式。>ds-ocr 的 `ds_causal_attention_aligned`（ds_kernels.c）内部即 online softmax，完整推导见 13 章 §2。
 - 相关章节：13 · 03 · 10
@@ -182,6 +186,10 @@ MoE 训练中为了让专家批处理平衡而引入的缓冲系数。<当某专
 ### PagedAttention / vLLM
 **vLLM 提出的按页管理 KV Cache**，类似操作系统虚拟内存分页。<解决 KV Cache 碎片化和内存预分配浪费，是 vLLM 高吞吐推理的核心。>
 - 相关章节：03 · 09 · 13
+
+### Stream / REPL（交互模式）
+**`--stream` 启动的交互会话**：模型只加载一次，提示符下每行 `@<文件>` 识别一张图/PDF，`q` 退出。<批量页摊薄加载成本；`--silent` 时提示符/进度走 stderr，stdout 只剩识别文本，可安全重定向。>入口在 main.c；REPL 数据流见 00 章 §6.3。
+- 相关章节：00 · 03
 
 ### Speculative Decoding（投机解码）
 **用一个便宜的小模型草拟多个 token，大模型并行验证**，在结果一致时一次前向产出多个 token，加速自回归。

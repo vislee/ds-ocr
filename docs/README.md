@@ -187,6 +187,9 @@ v0.5→v1.1 的完整优化实录：
 
 ```bash
 bash tools/regress.sh   # 30 组"图片↔正确文本"精度回归（CER 对冻结阈值），红=改坏
+                        # 资产构成：仓库根 4 张基础图 + docs/golden/images 4 张 r2 场景图，
+                        # × 4 模型 = 30 PASS（2 个模型固有退化组合按 tools/exclude.txt 预期 SKIP）；
+                        # 冻结标签在 docs/golden/labels/（30 份），阈值在 tools/thresholds.txt
 make coverage-unit      # 单元测试快跑（~1 分钟，23 用例 / ~350 断言）+ 每文件行覆盖
 make coverage           # 同上 + 四模型 e2e（插桩下较慢，约 1 小时，覆盖更全）
 ./ds_ocr ... --profile  # 各阶段耗时（编码/预填充/解码）
