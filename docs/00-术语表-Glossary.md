@@ -501,7 +501,7 @@ RLHF 中最常用的强化学习算法，用**价值网络（critic）**估计�
 - 相关章节：13 §6.7 · 09 §7
 
 ### KV cache 量化（KV Cache Quantization）
-**对 KV 做 per-token per-head 的 INT8/FP8 量化**，显存减半。<误差可接受的原因：softmax 权重高度集中，被污染的是权重很小的 $j$，影响被二次压制。>本工程 V3/V4 已用 BF16 KV（省一半），INT8/FP8 未实现——先减长度（R-SWA/DASH）再减位宽是更划算的顺序。
+**对 KV 做 per-token per-head 的 INT8/FP8 量化**，显存减半。<误差可接受的原因：softmax 权重高度集中，被污染的是权重很小的 $j$，影响被二次压制。>本工程 V3 已用 BF16 KV（省一半），V1/V2/V4 仍为 F32；INT8/FP8 未实现——先减长度（R-SWA/DASH）再减位宽是更划算的顺序。
 - 相关章节：09 §4.4 · 03 §5.5
 
 ### 算子融合 / CUDA Graph（Kernel Fusion / CUDA Graph）
