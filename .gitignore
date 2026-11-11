@@ -54,3 +54,9 @@ ME1782374049768.png
 1
 docs/intert/
 /test_unit
+
+# Review / diff scratch (agent 临时产物)
+.tmp/
+.tmp_*
+.review/
+.review-tmp/
