@@ -64,7 +64,7 @@
 static __attribute__((unused)) inline float ds_f32_to_bf16_to_f32(float x) {
     uint32_t u;
     memcpy(&u, &x, sizeof(u));
-    u = (u + 0x8000) & 0xFFFF0000u;  /* Round to nearest BF16 */
+    u = (u + 0x8000) & 0xFFFF0000u;  /* 就近舍入（精确半途恒进位 = ties away from zero，非严格 RNE，见 docs/03 §3.7） */
     float r;
     memcpy(&r, &u, sizeof(r));
     return r;

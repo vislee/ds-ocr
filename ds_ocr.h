@@ -447,9 +447,9 @@ typedef struct {
      * conversion, but that reconverted the ENTIRE cache every decode step
      * (O(seq_len) BF16→F32 work per layer), which dominated attention time.
      * F32 storage doubles memory but eliminates all per-step conversion. */
-    void *kv_cache_k;        /* [layers, max_seq, kv_dim] F32 或（V3/V4）BF16 存储 */
-    void *kv_cache_v;        /* BF16 模式省一半驻留与一半解码注意力读流量（r2 任务2） */
-    int kv_bf16;             /* 1 = K/V 以 BF16 存储（仅 V3/V4） */
+    void *kv_cache_k;        /* [layers, max_seq, kv_dim] F32 或（仅 V3）BF16 存储 */
+    void *kv_cache_v;        /* BF16 模式（仅 V3）省一半驻留与一半解码注意力读流量（r2 任务2） */
+    int kv_bf16;             /* 1 = K/V 以 BF16 存储（仅 V3；V4 因 DASH 对 KV 精度敏感保持 F32） */
     float *kv_pf_scratch_k;  /* V3/V4 prefill 批量注意力的整层 F32 展开（懒分配） */
     float *kv_pf_scratch_v;
     int kv_cache_len;        /* 当前已写入缓存的 token 数（= 下一个 K/V 写入槽位） */

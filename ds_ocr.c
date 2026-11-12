@@ -1300,7 +1300,8 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
     /* Each row: kv_dim floats. Align each layer's cache start to 64 bytes.
      * Row stride = kv_dim rounded up to multiple of 16 floats (64 bytes). */
     int kv_row_stride = (kv_dim + 15) & ~15;  /* aligned row stride */
-    /* V3/V4: K/V 以 BF16 存储（r2 任务2 有界实验）——驻留与解码注意力读流量减半 */
+    /* V3: K/V 以 BF16 存储（r2 任务2 有界实验）——驻留与解码注意力读流量减半。
+     * 口径以赋值为准：kv_bf16 = (model_version == 3)，仅 V3 启用。 */
     /* 实验结论: V3 (R-SWA) 8/8 组合 CER 全绿；V4 (DASH) 对 KV 精度敏感
      * （截屏 24.7%/r2_list 9.7% FAIL）→ 收窄为仅 V3 启用，V4 保持 F32。 */
     ctx->kv_bf16 = (cfg->model_version == 3) ? 1 : 0;

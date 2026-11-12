@@ -394,7 +394,8 @@ static inline float ds_fast_expf(float x) {
     return u.f;
 }
 
-/* ── BF16 存储的 K/V 行 × F32 Q 点积（V3/V4 BF16 KV 缓存读取路径）──────
+/* ── BF16 存储的 K/V 行 × F32 Q 点积（V3 的 BF16 KV 缓存读取路径；
+ *    V4 的 KV 为 F32，走普通 F32 点积）──────────────────────────────
  * bf16→f32 展开是精确的（左移 16 位），点积顺序与 F32 存储一致；
  * 数值差异仅来自存入时的 bf16 舍入（任务书 r2 任务 2 授权的有界实验）。 */
 float ds_dot_bf16xf32(const uint16_t *k, const float *q, int n);

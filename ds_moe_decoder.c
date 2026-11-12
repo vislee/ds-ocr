@@ -174,8 +174,9 @@ static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
  * 【为什么】KV 缓存按 [layers][max_seq][kv_row_stride] 三维平铺，每层是一段
  *   连续 slab；单 token decode 每层都要从头扫 K/V，先拿到基址可避免在注意力
  *   内层循环里重复计算层间偏移。
- * 【为什么返回 void*】缓存元素宽度由 ctx->kv_bf16 决定（V1/V2=F32 4B，
- *   V3/V4=BF16 2B），调用方按需转型；行内定位用 ds_kv_k_row（ds_dash.h）。
+ * 【为什么返回 void*】缓存元素宽度由 ctx->kv_bf16 决定（V1/V2/V4=F32 4B，
+ *   V3=BF16 2B；V4 因 DASH 对 KV 精度敏感保持 F32，见 ds_dash.c），
+ *   调用方按需转型；行内定位用 ds_kv_k_row（ds_dash.h）。
  * 【参考】ds_dash.h 同名布局注释；docs/03-推理引擎实战篇 KV 缓存设计。 */
 /* Get pointer to start of K/V cache for a layer (row 0) */
 static inline void *ds_kv_k_layer(ds_ctx_t *ctx, int layer) {
@@ -194,8 +195,10 @@ static inline void *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
 }
 
 /* ds_kv_store_row - 把一个位置（一层）的 K 或 V 行写入缓存
- * 【算法】kv_bf16=0: 直接 memcpy F32（V1/V2 主路径，零转换）；
- *         kv_bf16=1: F32→BF16 批量截断（V3/V4，写入即量化省一半内存）。
+ * 【算法】kv_bf16=0: 直接 memcpy F32（V1/V2/V4 主路径，零转换）；
+ *         kv_bf16=1: F32→BF16 批量截断（仅 V3，写入即量化省一半内存；
+ *         V4 保持 F32——DASH 对 KV 精度敏感，BF16 在 r2 实验中打红，
+ *         与 V3 全绿相反，见 ds_dash.c 的 r2 结论）。
  * 【参数】dst — 目标行地址（ds_kv_k_row/v_row 算出，已含层与位置偏移）
  *         src — 新算出的 K 或 V 向量 [kv_dim]，kv_dim = n_kv_heads*head_dim = 1280
  *         n   — 写入元素数（= kv_dim）
@@ -857,7 +860,7 @@ static void decoder_layer_forward(ds_ctx_t *ctx, const float *x, float *out,
     int cache_offset = ctx->kv_cache_len;                        /* 当前 token 写入的缓存槽位 */
     void *cache_k_row = ds_kv_k_row(ctx, layer_idx, cache_offset);  /* K 行地址 = base + (layer*max_seq+pos)*stride */
     void *cache_v_row = ds_kv_v_row(ctx, layer_idx, cache_offset);
-    ds_kv_store_row(ctx, cache_k_row, k, kv_dim);   /* F32 直存（V1/V2）；BF16 存储（V3/V4，r2 任务2） */
+    ds_kv_store_row(ctx, cache_k_row, k, kv_dim);   /* F32 直存（V1/V2/V4）；BF16 存储（仅 V3，r2 任务2） */
     ds_kv_store_row(ctx, cache_v_row, v, kv_dim);
 
     /* Causal attention — read directly from F32 KV cache (zero conversion).
