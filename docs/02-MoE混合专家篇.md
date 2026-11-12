@@ -144,7 +144,7 @@ void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
 ds_moe_router_bf16(scores, x, layer->gate_weight_bf16, hidden, n_experts);
 ```
 
-> **精度细节**：BF16 的精度只有 F32 的 1/256，但对于路由决策来说，通常足够了。关键是要与训练/推理框架（Python PyTorch）保持一致，否则选出的专家不同，输出会逐渐偏移。
+> **精度细节**：BF16 的尾数只有 7 位（F32 是 23 位），可分辨的最小相对间隔是 F32 的 1/65536（$2^{16}$），但对路由决策来说通常足够了。关键是要与训练/推理框架（Python PyTorch）保持一致，否则选出的专家不同，输出会逐渐偏移。
 
 ### 3.5 逐步手算：4 专家 top-2 的一次完整路由
 
