@@ -73,6 +73,9 @@ tok_pos:  0      0       1..273   1..6   ← 页桶内的 running count
 2. **保留桶 0**：BOS 和"最后一张图之后的指令文本"的 page 回到 0。这样指令与任何真实页的 Δpage ≥ 1，永远不会被误认为"同页"。
 3. **页内 running count**：tok 是"本页桶内第几个 token"（跨不连续区间累计）。官方注释解释了为什么不能用"段内偏移"：页 k 拥有多段不连续区域（prompt 图像段 + 响应正文段），段内重启会让两个不同 token 撞坐标。
 
+> 🗣️ **说人话**：页桶规则给每个 token 发两张工牌："我在哪页"+"我是本页第几号"。三条规则各有分工：`<PAGE>` 是 1-based 翻页铃（遇 marker 加一，第一页是 1 不是 0）；BOS 和收尾指令落进保留桶 0——与任何真实页 Δpage ≥ 1，不会被误认"同页"；页内 tok 是 running count（跨图像段+正文段连续累计）——段内重启会让两个不同 token 撞坐标。所以读 `ds_dash_build_coords()` 就盯这三条，与官方逐条对得上。
+> *边界*：指令文本不计入页内图像计数——pf_cnt 只统计 ≤ last_img 的 token，这个口径是第 5 节状态机递推的种子。
+
 ### 3.2 角度：tok 轴 63 对 + page 轴 1 对
 
 `DeepseekV2IndexerRotary2D`（C 实现 `rope2d_cos_sin_row()`）把 128 维的旋转角拆成：
@@ -85,6 +88,9 @@ tok_pos:  0      0       1..273   1..6   ← 页桶内的 running count
 `page_mod=2` 把 page 折叠成 0/1 交替——**只表达"同页/不同页"**，不表达第几页。配合 tok 轴的页内坐标，"第 3 页第 40 个 token"和"第 7 页第 40 个 token"的 tok 角完全相同、page 角相同（都是奇数页），但它们本来就不需要互相区分——路由（第 4 节）负责页选择。
 
 主分支（Q/K）与路由器（idx_q/idx_k）用**同一套 cos/sin 表**（`ds_dash_rope_row()`；解码侧 Q/K 的旋转入口在 `ds_moe_decoder.c` 的 `ds_rswa_attention_aligned_bf16` 之外的 V4 分支——即 `decoder_layer_forward()` 的 V4 分支），因为 `sparse_index_dim == head_dim == 128`；若两者不等，官方会退回 1D（`_dash_indexer_rope` 的告警分支）。
+
+> 🗣️ **说人话**：128 维转盘拆成 63+1：前 63 对按页内位置转（inv_tok = 10000^(−i/63)，resample 重布频谱），第 64 对只管"同页/跨页"——inv_page = 256^0 = 1，角度即 (page%2)×1.0 rad。base=256 在 j=0 时恒为 1：是给 page_pairs>1 预留的底数，不是分母——多除 256，页判别被抹成 ~0.004 rad（bug ③）。mod 2 折叠后 page 轴只答"同页吗"——页序判断归 DASH 路由（§4）。
+> *边界*：主分支与路由器共用同一套 cos/sin 表的前提是 sparse_index_dim == head_dim == 128；不等时官方退回 1D（告警分支）。
 
 ### 3.3 公式推导：page2d 与一维 RoPE 的对比
 
@@ -137,6 +143,9 @@ KV 序列按 32 个 token 一块分块（nblk = ⌈len/32⌉）
 
 注意力本体：`softmax(QK^T/√128 + m) @ V`，其中掩码 `m`：局部窗=0、选中块=bias、其余=−∞（`biased_attention()` / `_forward_dense`）。BF16 KV 时点积走 `ds_dot_bf16xf32`（bf16 行切片 × f32 Q，展开精确）。
 
+> 🗣️ **说人话**：每个 query 的可见集 = 自家院子 + 快递单上签名的仓库：局部窗 (q−128, q] 永远可见、偏置 0（local=4 × 块 32）；远程块由路由器挑 K=12 个、各带一张 log-prior 偏置；没被点名的块直接 −∞。注意力本体仍是标准 softmax(QKᵀ/√128 + m)·V——DASH 改的是掩码 m 的三个取值，不是注意力数学。所以读 `biased_attention()` 时盯住 m 就够，权重与 softmax 都没被动过。
+> *边界*：`ds_dot_bf16xf32` 这条 BF16 路径是给实验留的——V4 的 KV 实际保持 F32（BF16 实验打红：DASH 对 KV 精度敏感，§7 表）。
+
 ### 4.2 块分数：head_cls 摘要（stage0）
 
 路由器先用两个小投影把每个 token 映射成 128 维索引向量（**输入是层输入残差流，不是 RMSNorm 后的 x_norm**——官方 `_router_qk` 收 `hidden_states`）：
@@ -149,6 +158,9 @@ idx_k = page2drope( GemmaRMS( k_proj(x) ) )
 然后每个块算一个**摘要向量** k_bar：块内 token 对可学习向量 `head_cls` 做 softmax 加权平均（`_block_scores_infer` / C 实现 `block_scores_headcls()`）。k_bar 与 query 无关——**每块算一次，所有 query 复用**（C 实现曾对每个 query 重复计算，实测白烧 ~2.6 GFLOP/层，已修）。
 
 块分数 `z[q,b] = clamp(idx_q · k_bar[b] / √128, ±1e4)`，再套 remote 掩码：`b ≤ q_blk − 4` 的块才是远程候选，否则 z = −1e9（局部窗已被 token 级掩码覆盖，路由只管远处）。
+
+> 🗣️ **说人话**：块分数是"先选代表、再握手"：每块 32 token 对 head_cls 加权平均出摘要 k_bar——与 query 无关、每块一次全场复用（曾逐 query 重算，白烧 ~2.6 GFLOP/层）。query 侧打分 z = clamp(idx_q·k_bar/√128, ±1e4)，套 remote 掩码（b ≤ q_blk−4，其余 −1e9）。即五步链（head_cls → remote 掩码 → top-M=16 → entmax15 → K=12 log-prior）前两步。
+> *边界*：路由输入是层输入残差流（hidden_states），不是 RMSNorm 后的 x_norm——GemmaRMS（(1+w)·x/rms）在路由器内部自己做，喂错输入分数全偏。
 
 ### 4.3 路由选择：top-M → entmax15 → 前 K（vLLM 部署语义）
 
@@ -180,6 +192,9 @@ idx_k = page2drope( GemmaRMS( k_proj(x) ) )
 1. **idx_k 必须按层缓存全量历史**（官方 `past_kv._dash_idx_k[layer]` 追加）——详见 bug ①。
 2. 候选域用 `_uocr_dash_decode_allow` 的页匹配：query 的候选页 `qp = mcum − 1 − pp`（响应正文页 k ↔ 图像页 k），`qp < 0` 或无同页 image 块 → 放开全部 remote。
 3. Q/K 的 page2d 角用**页坐标状态机**（第 5 节）递推出来的 (tok, page)。
+
+> 🗣️ **说人话**：decode 与 prefill 共用同一路由数学，差别是三件行李：① idx_k 按层缓存全量历史（`past_kv._dash_idx_k[layer]` 追加——12 层共用 scratch 即 bug ①）；② 候选域按页匹配：正文第 k 页只找图像第 k 页的块（qp = mcum−1−pp），qp<0 或无同页块就放开全部 remote；③ page2d 角由页坐标状态机（§5）递推。所以"同数学"≠"同状态"——decode 的 idx_k 是追加式历史，prefill 只给种子。
+> *边界*：页匹配假设正文页与图像页一一对齐；多出的 `<PAGE>` 会把 qp 跑负，此时靠 fallback 而非这套对齐（第 5 节边界注记是同一件事）。
 
 ### 4.5 手算算例：16 个 token 走完 DASH 全流程
 
@@ -288,17 +303,26 @@ else:
 - **修复**：`idx_k_hist[n_layers][max_seq×128]`，prefill 拷入、decode 追加，读取按层。
 - **教训**：多模块共用的 scratch 必须问一句"谁在什么时候覆盖它"；跨层状态绝不能共用。
 
+> 🗣️ **说人话**：这个 bug 像"12 个楼层共用一个没标楼层的快递柜"：官方按层缓存路由 K，C 实现让 12 层共用 scratch 且 decode 只写第 0 行——层 L 读到别层历史加垃圾内存。症状"128 token 后才坏"暴露机理：前 128 token 局部窗还能看到图像，窗一耗尽、路由选块成了唯一内容来源。修复就是按层立柜：`idx_k_hist[n_layers][max_seq×128]`。所以"共用 scratch 必须画覆盖时间线"是通用教训（§6.7 第 1 条）。
+> *边界*：大图"开头正确"有误导性——此 bug 在小图/短生成下根本不触发；回归用例必须覆盖"局部窗耗尽后的长生成"，否则它无声潜伏。
+
 ### bug ②：读预算 K=8（应为 12）+ entmax 作用域错误
 
 - **症状**：与 ① 类似的退化，但更早出现。
 - **根因**：把训练路径的 `_remote_topk = topk16 − local4 = 12` 误解成"部署 K=12 里还含 4 个局部"，于是只选 8 个远程；且 entmax 在全部 nblk 上做，而部署语义是 **top-M=16 窗口内 entmax**。两者都让 prior/bias 系统性偏离。
 - **教训**：训练路径与部署路径的**同名参数语义可能不同**，以部署路径（vLLM parity）为准。
 
+> 🗣️ **说人话**：两处错都是"拿训练场规则册打正式比赛"：训练路径的 `_remote_topk = topk16 − local4 = 12` 是"top16−local4"的差值记法，C 实现误解成"部署 K=12 还含 4 个局部"，只选 8 个远程；entmax 也照训练代码在全部 nblk 上做，而部署语义是 top-M=16 窗口内做（窗口内归一化才能与 floor=1e-4 比较）。同名参数、数字巧合、语义不同——所以每个超参都要回部署路径（vLLM parity）核对语义（§6.7 第 2 条）。
+> *边界*：这类 bug 的表面症状与 bug ① 难分（都是退化），定位靠对拍而非看症状——先修 ① 再修 ② 的顺序本身就是对拍流程的产物。
+
 ### bug ③：page 轴角度多除 256
 
 - **症状**：所有多页判别失效，长文档跨页内容张冠李戴。
 - **根因**：`inv_page = 256^(0/1) = 1`，角度应为 `(page%2)·1.0 rad`；实现写成了 `p/256`（见 3.2 节 ⚠️）。
 - **教训**：公式里每个数字都要回到定义——`base^(j/pairs)` 在 j=0 时恒为 1，base 只是给未来 page_pairs>1 预留的。
+
+> 🗣️ **说人话**：公式里每个数字都要回到定义：`inv_page = 256^(0/1) = 1`——j=0 时任何底数的 0 次方都是 1，角度就是 (page%2)×1.0 rad 本身；写成 p/256，把 1 rad 的页判别压成 0.004 rad，同页/跨页再无区别。256 的真身是"未来 page_pairs>1 的底数"，不是分母。所以这条教训的钉子是退化用例：page_pairs=1、单页这类边界输入（`rope2d_cos_sin_row` 的防回归注释，§6.7 第 3 条）。
+> *边界*：症状"所有多页判别失效"很强，但单页/同页场景完全正常——测试用例若没覆盖多页跨页，此 bug 无声潜伏；防回归靠 page_pairs=1 这类退化用例钉住。
 
 ### bug ④：entmax 输出按"排序后位置"写回
 
@@ -312,6 +336,9 @@ else:
 - **根因**：官方 `cand = remote ∧ page候选`——top-M 窗口里的 sentinel（−1e4）槽 `valid=False`，不进 μ、注意力排除。C 实现的 valid 只查了页候选，**没查 remote**——被 sentinel 占据的槽拿到 −3.3 的偏置参与注意力。
 - **修法**：记录 `eff = remote ∧ cand`，valid 查 eff。
 - **教训**：大图（候选 ≥ 12）永远触发不了、小图必现的 bug，用**候选数 < 预算**的测试用例才能抓到。扩充黄金图集的小图就是这么来的。
+
+> 🗣️ **说人话**：候选块不足 12 个时，空槽由哨兵（−1e4）占位：entmax 后 prior≈0 → clamp 到 floor=1e-4 → logp≈−9.2，官方语义 valid=False——不进 μ、注意力侧排除。C 实现的 valid 只查页候选、漏了 remote：哨兵槽拿 −3.3 的偏置混进注意力，小前缀直接输出循环。修复一行：valid 查 eff = remote ∧ cand。所以"大图必过、小图必挂"提示测试集尺寸覆盖有洞——候选数<预算的用例必须进图集（§6.7 第 5 条）。
+> *边界*：这是五个 bug 里唯一"小图必现"的——大图（候选 ≥ 12）永远触发不了，用大图集测试永远抓不到；回归图集补小图正是从这里来的。
 
 ### 6.6 一个方法论收尾
 
