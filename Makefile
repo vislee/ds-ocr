@@ -85,9 +85,11 @@ help:
 # BLAS backend (Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
-# -mmacosx-version-min=13.3: ACCELERATE_NEW_LAPACK routes <Accelerate/Accelerate.h>
-# to the ILP64 cblas_new.h, where cblas_sgemm is annotated API_AVAILABLE(macos(13.3));
-# without an explicit deployment target clang assumes 10.x and warns at every call site.
+# ACCELERATE_NEW_LAPACK routes <Accelerate/Accelerate.h> to the ILP64
+# cblas_new.h, where cblas_sgemm is annotated API_AVAILABLE(macos(13.3)).
+# Declaring the deployment target explicitly keeps -Wunguarded-availability-new
+# quiet (clang otherwise assumes 10.x and warns at every call site) without
+# per-call __builtin_available guards.
 MACOS_MIN = -mmacosx-version-min=13.3
 BLAS_CFLAGS = $(CFLAGS_BASE) $(MACOS_MIN) -DUSE_BLAS -DUSE_APPLE_VISION -DACCELERATE_NEW_LAPACK
 BLAS_LDFLAGS = -lm -lpthread -framework Accelerate -framework ApplicationServices -framework Foundation -framework Vision -framework ImageIO -framework Metal -framework CoreGraphics
@@ -137,7 +139,11 @@ test: clean
 
 # Build test binary with debug + ASAN
 test_debug: clean
-	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) -mmacosx-version-min=13.3 -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
+<<<<<<< HEAD
+	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) $(MACOS_MIN) -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
+=======
+	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) $(MACOS_MIN) -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
+>>>>>>> main
 		LDFLAGS="-lm -lpthread -framework Accelerate -framework ApplicationServices -fsanitize=address"
 	@echo ""
 	./$(TEST_TARGET)
