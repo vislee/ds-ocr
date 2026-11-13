@@ -1428,7 +1428,21 @@ static int alloc_decoder_buffers(ds_ctx_t *ctx) {
  * 【返回】成功返回 ctx（调用方负责 ds_free）；任一步失败返回 NULL（内部已清理）
  * 【Metal】可选加速：不可用或设置 DS_NO_METAL 时不视为错误，纯 CPU 运行；
  *   DS_METAL_MOE / DS_METAL_LM 逐 token getenv 的查询在加载期提前执行
- *   （hoist），避免 decode 热路径每步 ~24 次 getenv 调用 */
+ *   （hoist），避免 decode 热路径每步 ~24 次 getenv 调用
+ *
+ * 【说人话】ds_load 是"开张前的备料"：先看这家店卖什么（detect_model_version
+ *   读 config 判断 V1/V2/V3/V4），再租个店面（calloc ctx），把菜谱定下来
+ *   （init_config 填各版本维度），然后去仓库把食材搬进来（mmap 权重，
+ *   不真搬、只登记），最后把操作台摆好（alloc_decoder_buffers 一次性分配
+ *   所有中间缓冲，decode 时零 malloc）。
+ *   为什么"一次性分配"很重要？decode 每步要跑 12 层、每层十几个算子，
+ *   如果每个算子都 malloc/free，光分配器开销就是毫秒级——比计算本身还贵。
+ *   预分配后每步只是复用同一块内存，指针换来换去（§6.4 的双缓冲）。
+ * 【边界】Metal 是**可选**的：初始化失败或设了 DS_NO_METAL 都不算错误，
+ *   纯 CPU 照跑。所以"加载成功"不代表"GPU 可用"，要看 metal_enabled。
+ *   另外 getenv 在加载期提前查（hoist）是因为 decode 热路径每步要查 ~24 次，
+ *   getenv 内部要遍历环境变量表 + 加锁，24 次能到几十微秒——相对每步
+ *   几毫秒不算多，但白给的开销没必要付。 */
 ds_ctx_t *ds_load(const char *model_dir) {
     if (ds_verbose >= 1)
         fprintf(stderr, "Loading DeepSeek-OCR model from %s\n", model_dir);
@@ -1696,7 +1710,25 @@ static int ds_output_tail_loopy(const char *output, size_t out_len) {
  *   Step 5 终态后处理: strip 空白 → V3/V4 det 标签剥离 → V4 净化/退化
  *         护栏 → 幻觉前缀截断 → 点阵行/断裂 det 片段/孤立闭合标签清除
  * 【参考】docs/04-完整推理流程篇.md（全链路）、docs/08-解码策略与后处理篇.md
- *         （§6-§9 后处理与幻觉防御）、docs/14-V4与DASH注意力篇.md（V4 差异） */
+ *         （§6-§9 后处理与幻觉防御）、docs/14-V4与DASH注意力篇.md（V4 差异）
+ *
+ * 【说人话】整个识别就是"看图 → 写提纲 → 逐字写 → 擦掉涂改"四件事。
+ *   Step 1 看图：大图先切成几块分别看（局部细节），再整张看一遍（全局
+ *   布局），把结果拼成一串"视觉 token"——相当于先做笔记。
+ *   Step 2 写提纲：按模型版本拼一段 prompt（"请把这张图里的文字读出来"），
+ *   把视觉 token 和指令拼在一起。
+ *   Step 3 读提纲：把整段 prompt 一次性喂进去（prefill，批量 sgemm 很快），
+ *   拿到第一个字。
+ *   Step 4 逐字写：每写一个字就把它接在末尾再喂一遍（decode，一次一个
+ *   token），直到写出结束符或达到长度上限。
+ *   Step 5 擦涂改：模型可能写出 `<det>` 标签、重复片段、幻觉前缀，最后
+ *   统一清理一遍。
+ * 【边界】Step 1 的"切块"阈值各版本不同（V2 是 768、V3/V4 是 640），
+ *   写错会让小图也走多裁剪路径，白白多算 N 次编码。Step 3 的 prefill
+ *   必须一次喂完整个 prefix——分多次喂会让 KV 缓存位置错乱。
+ *   Step 4 的"循环早停"是防模型卡在复读里（docs/08 §8），不是正常路径。
+ *   另外 V4 每页开始必须 ds_dash_reset_run 清块路由历史，否则残留会混入
+ *   新页路由，第 14 页起触发循环早停——这是踩过的真实 bug。 */
 char *ds_recognize_image(ds_ctx_t *ctx, const unsigned char *pixels,
                           int width, int height, int channels) {
     if (!ctx || !pixels) return NULL;

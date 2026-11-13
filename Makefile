@@ -139,11 +139,7 @@ test: clean
 
 # Build test binary with debug + ASAN
 test_debug: clean
-<<<<<<< HEAD
 	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) $(MACOS_MIN) -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
-=======
-	$(MAKE) $(TEST_TARGET) CFLAGS="$(DEBUG_CFLAGS) $(MACOS_MIN) -DUSE_BLAS -DACCELERATE_NEW_LAPACK" \
->>>>>>> main
 		LDFLAGS="-lm -lpthread -framework Accelerate -framework ApplicationServices -fsanitize=address"
 	@echo ""
 	./$(TEST_TARGET)

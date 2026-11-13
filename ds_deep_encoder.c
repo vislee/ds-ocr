@@ -1027,7 +1027,19 @@ static void enc_v2_layer_forward(float *out, const float *x,
  * 【参数】visual_tokens: [n_tokens,896]；causal_queries: [n_causal_queries,896]
  *   （checkpoint 的 query_1024/query_768 嵌入表）；out_seq_len: [输出]=n_causal_queries
  * 【返回】[n_causal_queries, 1280]（调用者 free）
- */
+ *
+ * 【说人话】这是"读者 + 记者"的协作。前 256 个 token 是"读者"（视觉 token），
+ *   它们互相自由交流（双向注意力），把图看透；后 256 个 token 是"记者"
+ *   （因果流查询），它们只能按顺序一个个发言，每个记者都能听到前面所有
+ *   读者和记者的内容，然后写一段摘要。
+ *   为什么只取记者那一段？因为读者只是"看过图"，记者才是"把图讲成一段
+ *   可被下游生成模型直接消费的话"。记者的输出天然是因果有序的（第 i 个
+ *   记者只依赖前 i-1 个），正好对接解码器的自回归生成。
+ * 【边界】"读者"和"记者"在同一个序列里，靠注意力掩码区分角色——前段
+ *   双向、后段因果。掩码写错会让记者偷看后面的记者（信息泄漏），或者
+ *   让读者看不到全部视觉信息（压缩不充分），两种都是静默错误。
+ *   另外 256 这个数字是 checkpoint 里 query_1024/query_768 嵌入表的行数，
+ *   不是超参——换模型必须跟着换，写死会越界。 */
 float *ds_encoder_forward_v2(ds_ctx_t *ctx, const float *visual_tokens,
                                int n_tokens, int *out_seq_len,
                                int n_causal_queries, const float *causal_queries) {

@@ -288,7 +288,20 @@ void ds_moe_router_bf16(float *scores, const float *x, const uint16_t *gate_weig
  *   改为"全体 64 专家 softmax 后直接取概率、不再 renorm"，未走本函数；
  *   本函数保留供测试（test_unit/test.c）与未来切换 renorm 语义使用。
  * 【复杂度】O(top_k × n_experts) = 6×64=384 次比较，<1μs，无需堆/partial sort。
- * 【参考】docs/02 §3.2（top-K 伪代码）。 */
+ * 【参考】docs/02 §3.2（top-K 伪代码）。
+ *
+ * 【说人话】top-K 就是"64 个候选人里挑 6 个最能干的"。做法很土：先扫一遍
+ *   找最高分（64 次比较），记下来；再扫一遍找第二高（跳过刚选中的），
+ *   重复 6 次 → 6×64=384 次比较。为什么不排序？因为排序要 O(64 log 64)≈384
+ *   次比较 + 额外内存，而 384 次比较在 3 GHz CPU 上不到 1 微秒——为了省这点
+ *   时间引入堆/partial sort 的复杂度不划算。
+ *   选完再 softmax 归一化，让 6 个权重加起来等于 1（"6 张票凑满 1 票"）。
+ * 【边界】本函数是"先选后归一"的旧语义，解码器真实路径（ds_moe_decoder.c）
+ *   已经改成"先对全部 64 个专家 softmax、再取 top-6、不再 renorm"——因为
+ *   softmax 的分母必须含全部 64 个专家，先选后归一会让权重系统性偏大，
+ *   与 Python 参考实现对不上。本函数保留给测试和未来切换用，别当成解码路径。
+ *   另外 n_experts < top_k 时多余槽位填权重 0，combine 时乘 0 无贡献——
+ *   这是防御分支，正常配置（64 专家 / top-6）不会走到。 */
 void ds_moe_top_k(int *top_indices, float *top_weights, const float *scores,
                   int n_experts, int top_k) {
     /* 选择 top-K 路由专家（n_experts=64, top_k=6）
@@ -777,7 +790,20 @@ int ds_get_num_cpus(void) {
  *   各分片写区间互不相交 → 执行期不持锁；同步开销仅入口广播 + 出口 barrier。
  * 【为什么主线程也干活】避免主线程空转等 barrier；n_threads≤1 时退化为
  *   直接调用 fn(0,1,arg)，完全零同步开销。
- * 【参考】docs/03 §8；docs/05 §10.3（按输出维度切分的"逐位一致"并行原则）。 */
+ * 【参考】docs/03 §8；docs/05 §10.3（按输出维度切分的"逐位一致"并行原则）。
+ *
+ * 【说人话】这就是"工头派活"：工头（主线程）在公告栏贴一张任务单（fn+arg），
+ *   敲一下铃（broadcast），然后自己也抄起工具干活——不站在旁边看。8 个工人
+ *   各自按工号 tid 认领自己那一段（第 tid 段），互不重叠，所以干活时不用
+ *   互相打招呼（无锁）。干完各自在签到本上划一笔（n_done++），最后一个
+ *   划完的人负责叫醒工头（signal）。工头收工前必须确认 8 个人都划了才走
+ *   （出口 barrier），否则下一批活会踩到上一批没干完的数据。
+ *   为什么主线程也要干活？8 个工人 + 1 个监工 = 9 份工资只出 8 份活，浪费。
+ * 【边界】这套"静态切分"要求每段活的工作量大致均匀。如果某段特别重
+ *   （比如 MoE 里某个专家特别慢），快的工人干完只能干等——这时该换
+ *   动态任务队列（work stealing），代价是每次取任务要加锁。本仓库的
+ *   matvec/attention 都是规整的等长行，静态切分正好，所以没上队列。
+ *   另外 n_threads≤1 时直接串行调用，一行同步开销都不付（单核机器/调试）。 */
 void ds_parallel_for(ds_parallel_fn_t fn, void *arg) {
     if (tp.n_threads <= 1) {
         fn(0, 1, arg);
@@ -837,7 +863,20 @@ void ds_copy(float *dst, const float *src, int n) {
  *   CblasTrans 让 BLAS 内部挑最优微内核，用户无需物化转置副本。
  * 【为什么 BLAS 快 5-10×】Accelerate/OpenBLAS 做了 cache 分块 + 寄存器分块
  *   + 指令级并行（docs/03 §4.3）；naive 三重循环仅为无 BLAS 平台保底。
- * 【参考】docs/05 §3（prefill 批量 sgemm，30s→0.93s 的关键）。 */
+ * 【参考】docs/05 §3（prefill 批量 sgemm，30s→0.93s 的关键）、docs/03 §4.3（BLAS 分块）。
+ *
+ * 【说人话】矩阵乘法是"两班人马对表"。朴素写法是：C 的每个格子都要把 A 的
+ *   一整行、B 的一整列读一遍——算 2K 次乘加，却要搬 2K 个数，算术强度只有
+ *   0.25 FLOP/B，CPU 大部分时间在等内存。
+ *   BLAS 的做法是"分块"：把 A 切一块 64×Kc、B 切一块 Kc×64，算 64×64 的
+ *   C 块。这一块里 A 和 B 的数据能塞进 L1 缓存，反复用 64 次——算术强度
+ *   涨到 16 FLOP/B，翻过屋脊点（约 5），从"等内存"变成"算力吃满"。
+ *   这就是为什么 prefill（几百个 token 一起算，M 大）用 BLAS 飞快，而
+ *   decode（M=1，无从分块）用 BLAS 毫无收益——本仓库 decode 走自写 matvec。
+ * 【边界】分块收益依赖矩阵足够大。M=1 时分块退化成原样；M=8（小 batch）
+ *   强度只到 8，仍在屋脊点左侧。所以"用 BLAS 加速 decode"是无效的。
+ *   另外 CblasTrans 让 BLAS 内部挑最优微内核，不需要用户物化转置副本——
+ *   权重天然按"每个输出元素一行"排布（[N,K]），正好匹配。 */
 void ds_matmul_t(float *C, const float *A, const float *B, int M, int K, int N) {
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -1099,7 +1138,21 @@ void ds_expert_forward_f32(float *out, const float *x,
  * 【为什么融合】BF16→F32 在线转换 + 点积 + bias 一趟完成，权重保持 BF16
  *   流式读取——decode 的 matvec 是内存带宽受限（算术强度≈1 FLOP/B），
  *   省下的就是赚到的（docs/03 §4.4、docs/09 §1）。
- * 【首次调用】经 ds_dispatch_ensure_init 惰性完成 CPU 能力探测。 */
+ * 【参考】docs/03 §4.4、docs/09 §1。
+ *
+ * 【说人话】BF16 matvec 是"边拆快递边用"：权重以 BF16 存在内存里（每个数
+ *   2 字节，比 F32 省一半），算的时候现拆现用——读进来立刻展开成 F32 参与
+ *   乘加，不落回内存。为什么不先全部转成 F32 再算？因为 3B 参数转 F32 要
+ *   12 GB，翻倍；而"现拆现用"只需要几个寄存器，内存占用不变。
+ *   为什么"融合"很重要？分开做的话，转换结果得先写回一块 F32 缓冲、再读回来
+ *   做点积，多出 2 倍权重体积的内存流量。decode 的 matvec 本来就是内存带宽
+ *   受限（算术强度≈1 FLOP/B，读一个数只做一次乘加），多一趟往返就是多一倍
+ *   时间——所以融合省的不是"算"，是"搬"。
+ * 【边界】"融合"只在 decode（单 token）时是决定性的。prefill 走 sgemm，
+ *   一次读权重能摊到几百行输出上，算术强度翻几十倍，转换开销被摊薄，
+ *   融不融合差别不大。另外这里经函数指针跳到运行时选定的内核（bfdot /
+ *   vshll+vfma / AVX / generic），首次调用会惰性探测 CPU 能力——所以
+ *   第一次 matvec 比后续慢一点点（微秒级，可忽略）。 */
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
     ds_dispatch_ensure_init();
@@ -1895,7 +1948,22 @@ void ds_layer_norm(float *out, const float *x, const float *weight, const float 
  * 【本实现】hidden=1280，每次 decode 调 2×12+1=25 次（每层输入+post-attn+最终）。
  * 三条 SIMD 路径（AVX-512 / AVX2 / NEON）+ 标量回退，逻辑相同：
  *   第一遍：累加 Σx²      （FMA：乘加同一条指令）
- *   第二遍：x·rms_inv·g   （rms_inv = 1/sqrt(Σx²/n + ε)，先求倒数再乘，除法只做一次） */
+ *   第二遍：x·rms_inv·g   （rms_inv = 1/sqrt(Σx²/n + ε)，先求倒数再乘，除法只做一次）
+ *
+ * 【说人话】RMSNorm 是"音量归一化旋钮"。一段话里有的词喊得震天响（数值大），
+ *   有的词细声细气（数值小），直接送进下一层会让大数淹没小数。RMSNorm 先量
+ *   一下这段话的"平均音量"（均方根 = 各元素平方的平均再开方），然后把整段
+ *   按比例调到标准音量，最后乘一个可学习的"音色旋钮" g 让模型自己决定每个
+ *   维度该放大还是缩小。
+ *   和 LayerNorm 的差别就一句：LayerNorm 还要先把整段话"居中"（减均值），
+ *   RMSNorm 不居中，只调音量。省掉"求均值"这一趟扫描，所以快 10-15%。
+ *   为什么可以不居中？因为下一层的矩阵乘法里本来就有 bias 项，居中这件事
+ *   模型自己会学——省一趟扫描，效果几乎不变。
+ * 【边界】RMSNorm 对"整体偏移"不敏感，所以如果输入存在系统性直流偏置
+ *   （比如某层输出整体偏大），它不会帮你消掉，只能靠后续层自己学。
+ *   另外 ε 不能省：全零向量时 RMS=0，除零会出 NaN/Inf，ε 是兜底。
+ *   数值上先算 1/sqrt 再乘（而不是逐个除），是因为除法延迟远高于乘法，
+ *   1280 个元素能省下 1279 次除法。 */
 void ds_rms_norm(float *out, const float *x, const float *weight,
                    int seq_len, int hidden, float eps) {
     for (int s = 0; s < seq_len; s++) {
@@ -2424,7 +2492,21 @@ static inline void ds_vec_scale_add(float *dst, const float *src, float correcti
  *   （不物化 [seq,seq] 注意力矩阵）。
  * 【参数】Q/K/V: [seq, n_heads*head_dim] 行主序，Q/K/V 同长（无 GQA）；
  *   scale=1/sqrt(head_dim) 由调用方传入。
- * 【参考】docs/01 §9.1；SAM/DeepEncoder 的标准编码路径。 */
+ * 【参考】docs/01 §9.1；SAM/DeepEncoder 的标准编码路径。
+ *
+ * 【说人话】双向注意力就是"开卷考试，所有同学互相抄"：每个 token（学生）
+ *   都能看到全班的答案（所有 token），然后按"谁跟我更相关"加权抄一份。
+ *   "更相关"用点积算——两个向量方向越一致，点积越大，抄得越多。
+ *   除以 sqrt(head_dim) 是"防爆表"：head_dim=128 时点积是 128 项相加，
+ *   量级会涨到 sqrt(128)≈11 倍，不除的话 softmax 会变成"一家独大"（几乎
+ *   全押一个 token），梯度也消失。除以 sqrt(d) 把方差拉回 1，softmax 才有
+ *   正常的"温度"。
+ * 【边界】双向注意力只能用在编码器（看图/看音频），不能用在生成模型——
+ *   生成时后面的 token 还没出生，没法"抄后面的答案"。生成必须用因果掩码
+ *   （ds_causal_attention），每个 token 只能看自己和之前的。
+ *   另外这里的 online softmax 是单遍扫描：不存 [seq,seq] 的注意力矩阵，
+ *   只维护"当前最大值/当前和/当前输出"三个量。seq=4096 时能省 4096²×4B
+ *   = 64 MB 内存，代价是数值结果与"先算全部再归一"的两遍版有 ULP 级差异。 */
 void ds_bidirectional_attention(float *out, const float *Q, const float *K,
                                    const float *V, int seq,
                                    int n_heads, int head_dim, float scale) {
@@ -2481,7 +2563,21 @@ void ds_bidirectional_attention(float *out, const float *Q, const float *K,
  *   GQA 映射：kv_h = h / heads_per_kv——每 heads_per_kv 个 Q 头共享一个 KV 头
  *   （本工程 V2 编码器 14 Q 头/2 KV 头 → heads_per_kv=7）。
  * 【q_offset】prefill 时 = 已缓存的序列前缀长度；decode 单 token 时 = 当前位置。
- * 【参考】docs/01 §9.2（因果掩码）、§6.3（GQA）。 */
+ * 【参考】docs/01 §9.2（因果掩码）、§6.3（GQA）。
+ *
+ * 【说人话】因果注意力是"只能看自己写过的日记"：写第 100 个字时，你只能
+ *   翻前 99 个字，不能偷看第 101 个（它还没写）。这就是 k_end = global_pos+1
+ *   的含义——循环上界随位置增长，天然形成下三角掩码。
+ *   GQA 则是"7 个学生共用一本参考书"：14 个 Q 头（学生）两两分组，每组 7 个
+ *   共用同一份 K/V（参考书）。为什么能共用？因为训练后这 7 个 Q 头学到的
+ *   "该查什么"高度相似，各存一份 K/V 是浪费。省下来的是 KV 缓存——V2 编码器
+ *   从 14×64 降到 2×64，缓存直接缩 7 倍。
+ * 【边界】GQA 只省"存 K/V"和"算 K/V 投影"，不省 QK 点积次数（Q 头数没变），
+ *   所以它是省内存不是省算力。压到 n_kv_heads=1 就是 MQA，缓存最小但质量
+ *   掉得明显（14 个学生抢一本书）；实践中 4-8 个 KV 头是甜点。
+ *   另外 kv_h = h / heads_per_kv 是"连续分组"而非"交错分配"——连续分组让
+ *   同一 KV 头服务的 7 个 Q 头在内存上相邻，k_row/v_row 地址对它们完全一样，
+ *   L1 命中率天然高。交错分配会让 7 个 Q 头跳着访问，缓存行利用率下降。 */
 static void ds_causal_attention_heads(float *out, const float *Q, const float *K,
                                         const float *V, int seq_q, int seq_k,
                                         int n_heads, int n_kv_heads, int head_dim,
@@ -3324,7 +3420,21 @@ void ds_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
  *   尾数仅剩高 7 位，数值上模拟"中间量是 BF16"的 Python 行为）。
  * 【为什么需要】Python 里 BF16×BF16→BF16，中间激活每步都被舍到 BF16；
  *   C 引擎全程 F32 累加，若不舍入，SwiGLU/Down 输出会带 Python 没有的
- *   尾数位，长序列后逐步偏离（见 ds_expert_forward_fused 的 7 步流水线）。 */
+ *   尾数位，长序列后逐步偏离（见 ds_expert_forward_fused 的 7 步流水线）。
+ *
+ * 【说人话】这是"把话说回原来的精度"。Python 那边每算完一步就把结果四舍五入
+ *   到 BF16（只有 7 位尾数，像只保留两位小数的账本）；C 这边全程 F32（23 位
+ *   尾数，像记到小数点后七位）。两边算同一件事，C 会多出 Python 没有的尾数位，
+ *   一步差一点点，几百步后就能看出偏差——所以要在关键节点主动"舍回 BF16"，
+ *   让 C 的数值轨迹和 Python 对齐。
+ *   具体做法是位运算：(u + 0x8000) & 0xFFFF0000。加 0x8000 是"四舍五入"的
+ *   进位技巧（被丢弃的 16 位中点是 0x8000，加上它，超过一半的自然进位），
+ *   掩码则把低 16 位清零——一次加法一次掩码，没有分支、没有浮点运算。
+ * 【边界】这是"模拟 Python 行为"的调试/对齐手段，不是数学上更正确的做法。
+ *   真正的 BF16 硬件指令（BFCVT）用的是严格 RNE（round-to-nearest-even），
+ *   而 +0x8000 在"恰好半途"时恒进位，差半个 ULP——只影响精确半途点，
+ *   工程上可接受。另外这个函数只在 DS_BF16_SIMULATE_PYTHON 打开时调用，
+ *   正常推理路径不付这个开销。 */
 void ds_bf16_truncate_array(float *data, int n) {
 #ifdef __ARM_NEON
     /* NEON bit manipulation: round F32 to BF16 precision and back.

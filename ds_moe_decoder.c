@@ -204,7 +204,24 @@ static inline void *ds_kv_v_layer(ds_ctx_t *ctx, int layer) {
  *         n   — 写入元素数（= kv_dim）
  * 【为什么】写入发生在 RoPE 之后：缓存里存的是"已带位置信息"的 K，
  *   decode 时注意力可直接点积，无需对缓存行再做旋转。
- * 【参考】docs/04-完整推理流程篇 §2（prefill/decode 写缓存时机）。 */
+ * 【参考】docs/04-完整推理流程篇 §2（prefill/decode 写缓存时机）。
+ *
+ * 【说人话】KV 缓存是"把算过的账记在本子上"。每生成一个 token，模型都要
+ *   回头看之前所有 token 的 K/V（注意力要跟它们比对）。如果不记，每生成
+ *   一个新 token 就得把前面全部重算一遍——生成第 1000 个 token 要重算 999 次，
+ *   总开销是 O(n²)。记下来之后，每步只算"新 token 的 K/V"再追加到本子末尾，
+ *   总开销降到 O(n)。
+ *   这个函数就是"往本子上写一行"：算出新 token 的 K 或 V（1280 个数），
+ *   写到第 pos 页第 layer 行。V3 会顺手把 F32 压成 BF16（省一半内存），
+ *   其他版本直接 memcpy。
+ * 【边界】缓存里存的是"已经过 RoPE 旋转"的 K——因为位置信息一旦旋转进去
+ *   就固定了，decode 时直接点积即可，不用对缓存行再转一次。这也意味着
+ *   缓存不能跨位置复用（同一个 token 在不同位置 K 不同）。
+ *   另外 V4 必须保持 F32：DASH 的块路由对 KV 精度敏感，BF16 在 r2 实验里
+ *   打红（V3 全绿），所以 kv_bf16 只在 version==3 时置 1。
+ *   容量 ≠ 长度：kv_cache_max 是预分配容量（4096/8192），kv_cache_len 是
+ *   实际写入位置数。注意力只能扫 [0, len)，扫到容量末尾会读到 calloc 的零，
+ *   那些零会让 softmax 把概率分给"不存在的 token"。 */
 /* Store F32 K/V directly into the aligned F32 KV cache */
 static inline void ds_kv_store_row(ds_ctx_t *ctx, void *dst, const float *src, int n) {
     if (ctx->kv_bf16) {
@@ -244,8 +261,20 @@ static inline void ds_kv_store_row(ds_ctx_t *ctx, void *dst, const float *src, i
  *
  * 为什么 Layer 0 用 Dense 而不是 MoE？
  * 第一个 transformer 层处理"原始"输入特征，需要全参数来提取通用特征。
- * 后续层(MoE)在通用特征基础上做专业化分工（路由到不同专家）。*/
-
+ * 后续层(MoE)在通用特征基础上做专业化分工（路由到不同专家）。
+ *
+ * 【说人话】SwiGLU 是"两道门 + 一个闸"。x 同时过两道门：gate 门决定"这个
+ *   特征该放多少"，up 门决定"这个特征本身值多少"。gate 门先过 SiLU 激活
+ *   （负数压到接近 0，正数原样通过，相当于"开关"），再和 up 门逐元素相乘
+ *   ——只有"开关打开"的特征才被放行。最后 down 投影把 6848 维压回 1280 维。
+ *   为什么用两道门而不是一道？因为单门（ReLU FFN）只能"开或关"，双门能
+ *   表达"开多大"——gate 提供连续的开关系数，表达能力更强，这是 LLaMA/
+ *   DeepSeek 全系用 SwiGLU 的原因。
+ * 【边界】6848 这个中间维度是 1280 的 5.35 倍，不是整数倍——这是按"总参数
+ *   预算"反推出来的（FFN 参数量 ≈ 3×hidden×intermediate），不是拍脑袋。
+ *   另外这里的 BF16 truncation 只在 DS_BF16_SIMULATE_PYTHON 打开时执行：
+ *   Python 的 autocast 会把中间量舍到 BF16，C 全程 F32 会多出尾数位，
+ *   长序列后偏离——所以对齐调试时要开，正常推理不用付这个开销。 */
 static void dense_ffn_forward(float *output, const float *x,
                                ds_dec_layer_t *layer, ds_config_t *cfg,
                                float *gate_buf, float *up_buf, float *swiglu_buf) {
@@ -348,7 +377,21 @@ static void mlp_forward(float *output, const float *x, ds_dec_layer_t *layer,
  * 【维度】x/output: [1280]；每专家 gate/up: [896,1280]、down: [1280,896]；
  *         共享专家两份拼一起算: [1792,1280]/[1280,1792]
  * 【参考】docs/02-MoE混合专家篇 §9 完整追踪；docs/05-性能优化实战篇（优化历程）。
- */
+ *
+ * 【说人话】MoE 层是"公司里 64 个专家，每个问题只叫 6 个"。路由器（gate）
+ *   先给 64 个专家各打一个分（一次 [64,1280] 的小矩阵乘），softmax 变成
+ *   概率，然后挑分数最高的 6 个（无放回，不重复叫人）。这 6 个专家各自
+ *   算一份答案，按分数加权求和——分数高的专家话语权大。
+ *   另外还有 2 个"共享专家"永远在场（不管什么问题都参与），相当于公司里的
+ *   通用部门，负责兜住所有问题都需要的常识。
+ *   为什么省？64 个专家全叫要读 4.8 GB 权重，只叫 6+2 个只要读 606 MB——
+ *   decode 每步的时间基本就是"读权重的时间"，所以少读 8 倍就是快 8 倍。
+ * 【边界】这个"省"只在单请求 decode 时成立。batch decode 时不同 token 会
+ *   路由到不同专家，一个 batch 里可能凑齐全部 64 个——此时"稀疏"失效，
+ *   MoE 反而比同等激活参数的 Dense 更慢（要读全部专家）。这是 MoE 服务端
+ *   部署的核心难题（专家并行 / All-to-All 通信）。
+ *   另外路由必须用 BF16 权重（不是 F32）：排名相近的两个专家在 F32/BF16 下
+ *   次序可能交换，一旦换路输出就系统性偏离 Python 参考实现。 */
 static void moe_forward(float *output, const float *x, ds_dec_layer_t *layer,
                          ds_config_t *cfg, ds_ctx_t *ctx,
                          float *expert_gate_buf, float *expert_up_buf,

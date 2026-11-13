@@ -329,7 +329,19 @@ static int parse_header(safetensors_file_t *sf) {
  *
  * @param path  safetensors文件路径
  * @return      成功返回safetensors_file_t指针（调用者需safetensors_close释放），失败返回NULL
- */
+ *
+ * 【说人话】打开 safetensors 文件就像"拿到一本带目录的书，但不把书搬回家"。
+ *   前 8 字节是目录的长度，目录（JSON）里写着"第 3 章从第 1024 字节开始、
+ *   共 512 页"这类信息。mmap 相当于"在图书馆登记一下，说我要看这本书"——
+ *   书还在书架上（内核 page cache），你手上只有一张借阅卡（虚拟地址）。
+ *   真正翻到某一页时才去取（缺页中断），没翻到的页一个字节都不占内存。
+ *   这就是为什么 6 GB 的模型能"秒开"：打开时只读了 8 字节 + 几十 KB 目录。
+ * 【边界】"零拷贝"不等于"零开销"，只是把开销从"拷贝"换成了"缺页"。
+ *   3B 参数 BF16 = 6.2 GB ÷ 4 KB = 151 万页，全冷时每页一次缺页中断，
+ *   量级是秒级（实际被内核 readahead 大幅摊薄）。所以冷启动和热启动
+ *   差一个数量级——热启动时页还在 page cache 里，只需重建页表。
+ *   另外 MAP_PRIVATE 是只读语义：真去写会 SIGSEGV；映射期间文件被截断
+ *   或删除，重新缺页会 SIGBUS。 */
 safetensors_file_t *safetensors_open(const char *path) {
     /* 第1步: 以只读方式打开文件，获取文件描述符 */
     int fd = open(path, O_RDONLY);
@@ -651,7 +663,18 @@ const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
  * 从 page cache 廉价重入（无磁盘 I/O），正确性不受影响。
  * DS_NO_MADVISE=1 可关闭（调试对照用）。
  * 【与 docs/09 §5.5 冷/热态的关系】madvise 只影响 RSS 常驻，不影响跑分——
- * 热态基准测的是内存带宽，被访问的页会自然回到常驻集。 */
+ * 热态基准测的是内存带宽，被访问的页会自然回到常驻集。
+ *
+ * 【说人话】这是"把借来的书还回书架"。加载阶段每个 tensor 都被摸过一遍
+ *   （校验、预转换），6 GB 的源页因此全部变成常驻内存（RSS）。但真正跑
+ *   decode 时，MoE 只碰 6/64 个专家——大部分页其实用不上了，却还占着物理
+ *   内存。MADV_DONTNEED 就是告诉内核："这些页我暂时不用了，先收回去"。
+ *   注意它丢的是**页表项**，不是数据——数据还在 page cache 里，下次碰到
+ *   会重新缺页、瞬间拉回（无磁盘 I/O）。所以它只降 RSS，不影响跑分。
+ * 【边界】只对 MAP_PRIVATE 的**干净**文件页安全。如果映射期间文件被截断
+ *   或删除，重新缺页会直接 SIGBUS（不是段错误，是总线错误，更难查）。
+ *   另外它不减少 VIRT（虚拟地址空间），只减少 RSS——`ps` 里看 VSZ 不变、
+ *   RSS 掉下来，这是正常的。DS_NO_MADVISE=1 可关闭，用于对照 RSS/性能。 */
 void multi_safetensors_madvise_unused(multi_safetensors_t *ms) {
     if (!ms) return;
     if (getenv("DS_NO_MADVISE")) return;   /* 环境变量开关：调试对照 RSS/性能时禁用本优化 */
