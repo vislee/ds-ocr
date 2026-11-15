@@ -60,3 +60,6 @@ docs/intert/
 .tmp_*
 .review/
 .review-tmp/
+
+# Generated ebook artifacts (build via tools/build_ebook.sh)
+docs/ebook/
