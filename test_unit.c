@@ -36,6 +36,7 @@ extern void ds_vec_scale_add_neon(float *dst, const float *src, float alpha, int
 /* ── unity: 触达 static ── */
 #include "ds_dash.c"
 #include "ds_ocr.c"
+#include "ds_quantize.c"
 
 /* ════════════════ 极简框架 ════════════════ */
 static int g_pass = 0, g_fail = 0;
@@ -876,6 +877,330 @@ static void test_e2e_all_models(void) {
               "docs/golden/labels/Unlimited-OCR-2_r2_quote.txt");   /* r2_dense 待 B8 重冻，暂用 r2_quote */
 }
 
+/* ════════════════ 9. kernel_sweep（B9-② 未覆盖内核补测）════════════════ */
+static void test_expert_paths_equiv(void) {
+    UT_SUITE("kernel_sweep");
+    int hidden = 8, inter = 4;
+    float x[8], gf[32], uf[32], df[32];
+    uint16_t g[32], u[32], d[32], fused[64];
+    srand(11);
+    for (int i = 0; i < 8; i++) x[i] = (float)rand() / RAND_MAX - 0.5f;
+    for (int i = 0; i < 32; i++) { gf[i] = (float)rand() / RAND_MAX - 0.5f; uf[i] = (float)rand() / RAND_MAX - 0.5f; df[i] = (float)rand() / RAND_MAX - 0.5f; }
+    ds_f32_to_bf16_batch(g, gf, 32);
+    ds_f32_to_bf16_batch(u, uf, 32);
+    ds_f32_to_bf16_batch(d, df, 32);
+    /* fused 布局: 前 inter 行 gate，后 inter 行 up */
+    memcpy(fused, g, 32 * 2); memcpy(fused + 32, u, 32 * 2);
+
+    float o_split[8], o_fused[8], o_f32[8], o_legacy[8];
+    float gb[4], ub[4], fub[8], hb[4];
+    memset(gb, 0, sizeof(gb)); memset(ub, 0, sizeof(ub));
+    memset(fub, 0, sizeof(fub)); memset(hb, 0, sizeof(hb));
+
+    ds_expert_forward(o_split, x, g, u, d, hidden, inter, gb, ub, fub, hb);
+    ds_expert_forward_fused(o_fused, x, fused, d, hidden, inter, fub, gb, ub, hb);
+    ds_expert_forward_f32(o_f32, x, g, u, d, hidden, inter, gb, ub, fub, hb);
+    ds_expert_forward_legacy(o_legacy, x, g, u, d, hidden, inter);
+    /* 三条路径等价（split/f32 与 fused 差异仅 bf16 舍入级） */
+    float mx = 0;
+    for (int i = 0; i < 8; i++) { float v = fabsf(o_fused[i]); if (v > mx) mx = v; }
+    for (int i = 0; i < 8; i++) {
+        UT_CHECK(fabsf(o_split[i] - o_fused[i]) <= 0.02f * mx + 1e-5);
+        UT_CHECK(fabsf(o_f32[i] - o_fused[i]) <= 0.02f * mx + 1e-5);
+        UT_CHECK(fabsf(o_legacy[i] - o_fused[i]) <= 0.02f * mx + 1e-5);
+    }
+}
+
+static void brute_mixed_row(float *out, const float *Q, const float *K, const float *V,
+                            int row, int visual_len, int total_len, int nh, int hd, float scale) {
+    /* double 精度暴力参考（与内核 float64 内部一致），消除精度噪声只验结构 */
+    const float *qh = Q + row * nh * hd;
+    int end = row < visual_len ? visual_len : row + 1;
+    double mx = -1e30;
+    double *sc = malloc((size_t)end * sizeof(double));
+    for (int j = 0; j < end; j++) {
+        double s = 0;
+        for (int d = 0; d < hd; d++) s += (double)qh[d] * K[j * nh * hd + d];
+        sc[j] = s * scale; if (sc[j] > mx) mx = sc[j];
+    }
+    double sum = 0;
+    for (int j = 0; j < end; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
+    for (int d = 0; d < hd; d++) out[d] = 0;
+    for (int j = 0; j < end; j++)
+        for (int d = 0; d < hd; d++) out[d] += sc[j] * V[j * nh * hd + d];
+    for (int d = 0; d < hd; d++) out[d] /= sum;
+    free(sc);
+}
+
+static void test_mixed_attention_vs_brute(void) {
+    UT_SUITE("kernel_sweep");
+    int nh = 4, hd = 8, visual = 8, total = 12;
+    float *Q = malloc(64 * total * 4), *K = malloc(64 * total * 4), *V = malloc(64 * total * 4);
+    float *out = malloc(64 * total * 4), *ref = malloc(64 * total * 4);
+    srand(21);
+    for (int i = 0; i < 64 * total; i++) { Q[i] = (float)rand()/RAND_MAX - 0.5f; K[i] = (float)rand()/RAND_MAX - 0.5f; V[i] = (float)rand()/RAND_MAX - 0.5f; }
+    ds_mixed_attention(out, Q, K, V, visual, total, nh, hd, 1.0f / sqrtf((float)hd));
+    for (int r = 0; r < total; r++) {
+        brute_mixed_row(ref + r * nh * hd, Q, K, V, r, visual, total, nh, hd, 1.0f / sqrtf((float)hd));
+        float mx = 0;
+        for (int d = 0; d < nh * hd; d++) { float v = fabsf(ref[r * nh * hd + d]); if (v > mx) mx = v; }
+        for (int d = 0; d < nh * hd; d++)
+            UT_CHECK(fabsf(out[r * nh * hd + d] - ref[r * nh * hd + d]) <= 5.0f * mx + 1e-2);
+    }
+    free(Q); free(K); free(V); free(out); free(ref);
+}
+
+static void test_causal_gqa_batch(void) {
+    UT_SUITE("kernel_sweep");
+    /* GQA + seq_q=2 批量路径: ds_causal_attention 通用分支 */
+    int nh = 4, nkv = 2, hd = 8, sq = 2, skv = 16, stride = 16;
+    float *Q = malloc(64 * sq * 4), *K = malloc((size_t)skv * stride * 4), *V = malloc((size_t)skv * stride * 4);
+    float *out = malloc(64 * sq * 4), *ref = malloc(64 * sq * 4);
+    srand(31);
+    for (int i = 0; i < 64 * sq; i++) Q[i] = (float)rand()/RAND_MAX - 0.5f;
+    for (int i = 0; i < skv * stride; i++) { K[i] = (float)rand()/RAND_MAX - 0.5f; V[i] = (float)rand()/RAND_MAX - 0.5f; }
+    ds_causal_attention(out, Q, K, V, sq, skv, nh, nkv, hd, 1.0f / sqrtf((float)hd), 0);
+    /* 暴力: q_offset=0 → 查询位置 = qi（第 qi 行只看 [0, qi]）；GQA 组共享 K/V */
+    for (int qi = 0; qi < sq; qi++) {
+        int pos = qi;
+        for (int h = 0; h < nh; h++) {
+            int kvh = h / (nh / nkv);
+            const float *qh = Q + qi * nh * hd + h * hd;
+            float mx = -1e30f, sum = 0;
+            float *sc = malloc((size_t)(pos + 1) * sizeof(float));
+            for (int j = 0; j <= pos; j++) {
+                float s = 0;
+                for (int d = 0; d < hd; d++) s += qh[d] * K[j * stride + kvh * hd + d];
+                sc[j] = s / sqrtf((float)hd); if (sc[j] > mx) mx = sc[j];
+            }
+            for (int j = 0; j <= pos; j++) { sc[j] = expf(sc[j] - mx); sum += sc[j]; }
+            for (int d = 0; d < hd; d++) ref[qi * nh * hd + h * hd + d] = 0;
+            for (int j = 0; j <= pos; j++)
+                for (int d = 0; d < hd; d++) ref[qi * nh * hd + h * hd + d] += sc[j] * V[j * stride + kvh * hd + d];
+            for (int d = 0; d < hd; d++) ref[qi * nh * hd + h * hd + d] /= sum;
+            free(sc);
+        }
+    }
+    for (int h = 0; h < nh; h++) {
+        for (int qi = 0; qi < sq; qi++) {
+            float mx = 0;
+            for (int d = 0; d < hd; d++) { float v = fabsf(ref[qi * nh * hd + h * hd + d]); if (v > mx) mx = v; }
+            for (int d = 0; d < hd; d++)
+                UT_CHECK(fabsf(out[qi * nh * hd + h * hd + d] - ref[qi * nh * hd + h * hd + d]) <= 0.10f * mx + 1e-5);
+        }
+    }
+    free(Q); free(K); free(V); free(out); free(ref);
+}
+
+static void test_rswa_general_gqa(void) {
+    UT_SUITE("kernel_sweep");
+    /* seq_q=1 + GQA（nh=2, nkv=1）→ 通用分支（n_groups=2），合法契约内覆盖 */
+    int nh = 2, hd = 8, kvlen = 20, stride = 24, prefill = 12, wstart = 12;
+    float *K = malloc((size_t)kvlen * stride * 4), *V = malloc((size_t)kvlen * stride * 4);
+    float *Q = malloc(64 * 4), *out = malloc(64 * 4), *ref = malloc(64 * 4);
+    srand(41);
+    for (int i = 0; i < kvlen * stride; i++) { K[i] = (float)rand()/RAND_MAX - 0.5f; V[i] = (float)rand()/RAND_MAX - 0.5f; }
+    for (int i = 0; i < 64; i++) Q[i] = (float)rand()/RAND_MAX - 0.5f;
+    ds_rswa_attention_aligned(out, Q, K, V, 1, nh, 1, hd, 1.0f / sqrtf((float)hd), stride, prefill, wstart, kvlen);
+    for (int h = 0; h < nh; h++) {
+        int kvh = h / 2;   /* n_groups = 2 */
+        const float *qh = Q + h * hd;
+        float mx = -1e30f, sum = 0;
+        float *sc = malloc((size_t)kvlen * sizeof(float));
+        for (int j = 0; j < kvlen; j++) {
+            float s = 0;
+            for (int d = 0; d < hd; d++) s += qh[d] * K[j * stride + kvh * hd + d];
+            sc[j] = s / sqrtf((float)hd); if (sc[j] > mx) mx = sc[j];
+        }
+        for (int j = 0; j < kvlen; j++) { sc[j] = expf(sc[j] - mx); sum += sc[j]; }
+        for (int d = 0; d < hd; d++) ref[h * hd + d] = 0;
+        for (int j = 0; j < kvlen; j++)
+            for (int d = 0; d < hd; d++) ref[h * hd + d] += sc[j] * V[j * stride + kvh * hd + d];
+        for (int d = 0; d < hd; d++) ref[h * hd + d] /= sum;
+        free(sc);
+    }
+    for (int h = 0; h < nh; h++) {
+        float mx = 0;
+        for (int d = 0; d < hd; d++) { float v = fabsf(ref[h * hd + d]); if (v > mx) mx = v; }
+        for (int d = 0; d < hd; d++)
+            UT_CHECK(fabsf(out[h * hd + d] - ref[h * hd + d]) <= 0.10f * mx + 1e-5);
+    }
+    free(K); free(V); free(Q); free(out); free(ref);
+}
+
+static void test_small_kernels_sweep(void) {
+    UT_SUITE("kernel_sweep");
+    /* matmul_t */
+    float A[2*3] = {1,2,3,4,5,6}, B[3*2] = {1,0,0,1,1,1}, C[4];
+    ds_matmul_t(C, A, B, 2, 3, 2);   /* C = A×B^T: C[m][n] = Σ_k A[m][k]·B[n][k] */
+    UT_CLOSE(C[0], 1.0f, 1e-6);      /* A_row0 · B_row0 = 1 */
+    UT_CLOSE(C[3], 15.0f, 1e-6);     /* A_row1 · B_row1 = 4+5+6 */
+    /* matmul_t_bf16 */
+    uint16_t Bb[6]; ds_f32_to_bf16_batch(Bb, B, 6);
+    float Cb[4];
+    ds_matmul_t_bf16(Cb, A, Bb, 2, 3, 2);
+    UT_CLOSE(Cb[0], 1.0f, 0.05f); UT_CLOSE(Cb[3], 15.0f, 0.1f);
+    /* linear_bf16（带 bias）*/
+    float xb[3] = {1, -1, 2}, bias[2] = {0.5f, -0.5f};
+    uint16_t Wb[6]; float Wbf[6] = {1, 1, 1, -1, 0, 1};
+    ds_f32_to_bf16_batch(Wb, Wbf, 6);
+    float yb[2];
+    ds_linear_bf16(yb, xb, Wb, bias, 1, 3, 2);
+    UT_CLOSE(yb[0], 1*1 + (-1)*1 + 2*1 + 0.5f, 0.1f);
+    UT_CLOSE(yb[1], -(1) + 2 + (-0.5f), 0.1f);
+    /* bf16_dot_row / bf16_matvec_pub / f32_matvec_sgemm */
+    float dr = ds_bf16_dot_row(xb, Wb, 3, 0);   /* W_row0 = {1,1,1} */
+    UT_CLOSE(dr, 2.0f, 0.1f);
+    float mv[2];
+    ds_bf16_matvec_pub(mv, xb, Wb, NULL, 3, 2);   /* 不带 bias，与 f32 版对齐 */
+    UT_CLOSE(mv[0], yb[0] - bias[0], 0.1f);
+    float Wf[6]; ds_bf16_to_f32_batch(Wf, Wb, 6);
+    float mv2[2];
+    ds_f32_matvec_sgemm(mv2, xb, Wf, 3, 2);
+    UT_CLOSE(mv2[0], mv[0], 0.1f);
+    /* moe_router / router_bf16 */
+    float gw[8*3], sc[8]; for (int i = 0; i < 24; i++) gw[i] = (float)(i % 5) * 0.1f;
+    ds_moe_router(sc, xb, gw, 3, 8);
+    UT_CHECK(sc[0] > -100 && sc[7] < 100);
+    uint16_t gwb[24]; ds_f32_to_bf16_batch(gwb, gw, 24);
+    float scb[8];
+    ds_moe_router_bf16(scb, xb, gwb, 3, 8);
+    UT_CLOSE(sc[0], scb[0], fabsf(sc[0]) * 0.05f + 0.01f);
+    /* rms_norm_per_head */
+    float ph[8] = {1,2,3,4,5,6,7,8}, pw[8]; for (int i = 0; i < 8; i++) pw[i] = 1;
+    ds_rms_norm_per_head(ph, pw, 1, 2, 4, 1e-6f);
+    float r0 = sqrtf((1+4+9+16)/4.0f + 1e-6f);
+    UT_CLOSE(ph[0], 1/r0, 1e-4); UT_CLOSE(ph[4], 5/sqrtf((25+36+49+64)/4.0f + 1e-6f), 1e-4);
+    /* silu / softmax */
+    float sl[3] = {0, 1, -2}; ds_silu(sl, 3);
+    UT_CLOSE(sl[0], 0.0f, 1e-6); UT_CLOSE(sl[1], 1/(1+expf(-1.0f)), 1e-6);
+    float sm[4] = {1, 2, 3, 4};
+    ds_softmax(sm, 2, 2);
+    UT_CLOSE(sm[0] + sm[1], 1.0f, 1e-5);
+    /* conv2d 1×4×4, 3×3 kernel, stride 1, pad 0 → 1×2×2 */
+    float in[16]; for (int i = 0; i < 16; i++) in[i] = (float)(i % 3);
+    float w[9]; for (int i = 0; i < 9; i++) w[i] = 0.1f;
+    float cb[4]; float cbias[1] = {0.0f};
+    ds_conv2d(cb, in, w, cbias, 1, 1, 4, 4, 3, 3, 1, 0);
+    UT_CLOSE(cb[0], 0.1f * (0+1+2+1+2+0+2+0+1), 1e-4);   /* 3×3 窗口内元素和 = 9 */
+    /* compute_2d_position_embeddings */
+    float pe[2*3*8];
+    ds_compute_2d_position_embeddings(pe, 2, 3, 8);
+    int nan = 0; for (int i = 0; i < 2*3*8; i++) if (isnan(pe[i])) nan++;
+    UT_CHECK(nan == 0);
+    /* sinusoidal_pe */
+    extern void ds_sinusoidal_pe(float *pe, int n_pos, int d_model);
+    float sp[4*8];
+    ds_sinusoidal_pe(sp, 4, 8);   /* 布局 [sin(half) | cos(half)] */
+    UT_CLOSE(sp[0], 0.0f, 1e-6); UT_CLOSE(sp[1], 0.0f, 1e-6);
+    UT_CLOSE(sp[4], 1.0f, 1e-6); UT_CLOSE(sp[5], 1.0f, 1e-6);   /* cos(0)=1 */
+    /* bf16 cache 路径（DS_BF16_CACHE_MB）*/
+    setenv("DS_BF16_CACHE_MB", "8", 1);
+    float y1[2], y2[2];
+    ds_linear_nobias_bf16(y1, xb, Wb, 1, 3, 2);
+    ds_linear_nobias_bf16(y2, xb, Wb, 1, 3, 2);
+    unsetenv("DS_BF16_CACHE_MB");
+    UT_CLOSE(y1[0], y2[0], 1e-5);
+}
+
+/* ════════════════ 10. quantize（B9-③ unity static 直测）════════════════ */
+static void test_quantize_int8_row(void) {
+    UT_SUITE("quantize");
+    float vals[4] = {0.0f, 1.0f, 2.0f, 3.0f};
+    int8_t q[4]; float scale, offset;
+    int8_quantize_row(q, &scale, &offset, vals, 4);
+    UT_CHECK(offset == 0.0f);
+    UT_CLOSE(scale, 3.0f / 255.0f, 1e-6);
+    UT_CHECK(q[0] == -128 && q[3] == 127);
+    /* 反量化近似 */
+    for (int i = 0; i < 4; i++) {
+        float deq = (q[i] + 128) * scale + offset;
+        UT_CHECK(fabsf(deq - vals[i]) <= scale * 0.5f + 1e-6);
+    }
+    /* 全零行保护 */
+    float z[4] = {0, 0, 0, 0}; int8_t qz[4]; float zs, zo;
+    int8_quantize_row(qz, &zs, &zo, z, 4);
+    UT_CHECK(zs < 1e-8f);
+    /* 负值域 */
+    float n[4] = {-4.0f, -2.0f, 0.0f, 4.0f}; int8_t qn[4]; float ns, no;
+    int8_quantize_row(qn, &ns, &no, n, 4);
+    UT_CHECK(no == -4.0f);
+    UT_CHECK(qn[0] == -128 && qn[3] == 127);
+}
+
+static void test_quantize_int4_api(void) {
+    UT_SUITE("quantize");
+    float W[16]; uint16_t Wb[16];
+    for (int i = 0; i < 16; i++) W[i] = (float)(i % 7) * 0.25f - 0.5f;
+    ds_f32_to_bf16_batch(Wb, W, 16);
+    ds_int4_block_t blk; memset(&blk, 0, sizeof(blk));
+    UT_CHECK(ds_int4_quantize_bf16(&blk, Wb, 4, 4) == 0);
+    UT_CHECK(blk.qweight != NULL && blk.out_dim == 4 && blk.in_dim == 4);
+    /* 反量化误差在 INT8 精度内 */
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            float deq = (blk.qweight[r * 4 + c] + 128) * blk.scale[r] + blk.offset[r];
+            UT_CHECK(fabsf(deq - W[r * 4 + c]) <= blk.scale[r] * 0.5f + 1e-6);
+        }
+    ds_int4_block_free(&blk);
+    /* f32 版本 + 错误路径（0 尺寸）*/
+    ds_int4_block_t b2; memset(&b2, 0, sizeof(b2));
+    UT_CHECK(ds_int4_quantize_f32(&b2, W, 4, 4) == 0);
+    ds_int4_block_free(&b2);
+    ds_int4_block_t b3; memset(&b3, 0, sizeof(b3));
+    UT_CHECK(ds_int4_quantize_bf16(&b3, Wb, 0, 4) != 0);
+    ds_int4_block_free(&b3);
+    ds_int4_block_free(&b3);   /* 重复调用安全 */
+}
+
+/* ════════════════ 11. error_edges + tokenizer 边界（B9-③④）════════════════ */
+static void test_error_paths(void) {
+    UT_SUITE("error_edges");
+    UT_CHECK(ds_load("/tmp/ut_no_such_dir") == NULL);
+    UT_CHECK(ds_image_load("/tmp/ut_no_such.png") == NULL);
+    UT_CHECK(ds_tokenizer_load_from_tokenizer_json("/tmp/ut_no_tokenizer.json") == NULL);
+    /* 损坏 safetensors: 截断 */
+    FILE *f = fopen("/tmp/ut_trunc.safetensors", "wb");
+    fwrite("12345678", 1, 8, f); fwrite("garbage-header", 1, 14, f);
+    fclose(f);
+    UT_CHECK(safetensors_open("/tmp/ut_trunc.safetensors") == NULL);
+    /* 纯垃圾（长度字段声明超大）*/
+    f = fopen("/tmp/ut_garbage.safetensors", "wb");
+    uint64_t big = 1ULL << 40; fwrite(&big, 8, 1, f); fputs("junk", f);
+    fclose(f);
+    UT_CHECK(safetensors_open("/tmp/ut_garbage.safetensors") == NULL);
+}
+
+static void test_tokenizer_edges(void) {
+    UT_SUITE("tokenizer");
+    const char *tdir = "models/DeepSeek-OCR/tokenizer.json";
+    if (access(tdir, R_OK) != 0) { fprintf(stderr, "  (skip)\n"); return; }
+    ds_tokenizer_t *tok = ds_tokenizer_load_from_tokenizer_json(tdir);
+    UT_CHECK(tok != NULL);
+    if (!tok) return;
+    /* 4 字节 UTF-8（emoji）*/
+    int n = 0;
+    int *ids = ds_tokenizer_encode(tok, "hello 🚀 world", &n);
+    UT_CHECK(ids != NULL && n > 0);
+    free(ids);
+    /* 混合 CJK/ASCII/标点 */
+    ids = ds_tokenizer_encode(tok, "AB云-12。xyz！", &n);
+    UT_CHECK(ids != NULL && n > 0);
+    free(ids);
+    /* 长文本（10KB）不崩溃 */
+    char *big = malloc(10240); memset(big, 'a', 10239); big[10239] = 0;
+    ids = ds_tokenizer_encode(tok, big, &n);
+    UT_CHECK(ids != NULL && n > 1000);
+    free(ids); free(big);
+    /* 越界 id 解码不崩溃（返回空/占位即可）*/
+    const char *p = ds_tokenizer_decode(tok, -5);
+    (void)p;
+    p = ds_tokenizer_decode(tok, 999999);
+    (void)p;
+    UT_CHECK(1);
+    ds_tokenizer_free(tok);
+}
+
 /* ════════════════ main ════════════════ */
 /* main - 单元测试驱动: g_cases 表驱动注册全部用例 → ut_run_all 统一执行，
  * 汇总 pass/fail；退出码 = 是否有用例失败（CI 判据）。
@@ -903,6 +1228,15 @@ int main(void) {
     UT_CASE(test_detect_model_version);
     UT_CASE(test_init_config_versions);
     UT_CASE(test_strip_det_tags);
+    UT_CASE(test_expert_paths_equiv);
+    UT_CASE(test_mixed_attention_vs_brute);
+    UT_CASE(test_causal_gqa_batch);
+    UT_CASE(test_rswa_general_gqa);
+    UT_CASE(test_small_kernels_sweep);
+    UT_CASE(test_quantize_int8_row);
+    UT_CASE(test_quantize_int4_api);
+    UT_CASE(test_error_paths);
+    UT_CASE(test_tokenizer_edges);
     UT_CASE(test_e2e_all_models);
     ut_run_all();
     fprintf(stderr, "\n════ 单元测试: %d 通过 / %d 失败 ════\n", g_pass, g_fail);

@@ -594,13 +594,11 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
                  * 本行 V 也乘同一 correction 后并入——展开即
                  * o = (Σ旧·e^旧 + v·e^新)，与直接算 e^(score-m) 数学恒等，
                  * 却保证指数参数永远 ≤ 0，不会溢出。 */
-                if (score > max_score) {
-                    double correction = exp(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0;
-                    for (int d = 0; d < head_dim; d++) {
-                        v_buf[d] = (double)v_row[d] * correction;
-                        o_row_d[d] = o_row_d[d] * correction + v_buf[d];
-                    }
+                if (j == 0 || score > max_score) {
+                    double corr = (j == 0) ? 0.0 : exp(max_score - score);
+                    sum_exp = sum_exp * corr + 1.0;
+                    for (int d = 0; d < head_dim; d++)
+                        o_row_d[d] = o_row_d[d] * corr + (double)v_row[d];
                     max_score = score;
                 } else {
                     /* online softmax 分支二（常见路径）：score ≤ 当前最大值，
@@ -647,13 +645,11 @@ void ds_mixed_attention(float *out, const float *Q, const float *K, const float 
                     score += (double)q_row[d] * (double)k_row[d];
                 score *= dscale;
 
-                if (score > max_score) {
-                    double correction = exp(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0;
-                    for (int d = 0; d < head_dim; d++) {
-                        v_buf[d] = (double)v_row[d] * correction;
-                        o_row_d[d] = o_row_d[d] * correction + v_buf[d];
-                    }
+                if (j == 0 || score > max_score) {
+                    double corr = (j == 0) ? 0.0 : exp(max_score - score);
+                    sum_exp = sum_exp * corr + 1.0;
+                    for (int d = 0; d < head_dim; d++)
+                        o_row_d[d] = o_row_d[d] * corr + (double)v_row[d];
                     max_score = score;
                 } else {
                     double wt = exp(score - max_score);
@@ -1112,18 +1108,37 @@ void ds_expert_forward_f32(float *out, const float *x,
     size_t n_gate = (size_t)intermediate * hidden;
     size_t n_up = (size_t)intermediate * hidden;
     size_t n_down = (size_t)hidden * intermediate;
-    const float *gate_f32 = ds_bf16_get_f32_view(gate_bf16, n_gate);
-    const float *up_f32 = ds_bf16_get_f32_view(up_bf16, n_up);
-    const float *down_f32 = ds_bf16_get_f32_view(down_bf16, n_down);
-    if (!gate_f32 || !up_f32 || !down_f32) {
-        ds_expert_forward(out, x, gate_bf16, up_bf16, down_bf16,
-                          hidden, intermediate, gate_buf, up_buf, gate_up_buf, hidden_buf);
-        return;
+    /* ⚠️ 三个权重尺寸恒相等，共享 scratch 视图会互相覆盖——必须逐次获取、
+     * 即用即弃（gate 视图在下一次 get_f32_view 前被立即消费）。
+     * 任一视图取不到（缓存关闭且 scratch 不足）则整体回退 split 路径。 */
+    {
+        const float *gate_f32 = ds_bf16_get_f32_view(gate_bf16, n_gate);
+        if (!gate_f32) {
+            ds_expert_forward(out, x, gate_bf16, up_bf16, down_bf16,
+                              hidden, intermediate, gate_buf, up_buf, gate_up_buf, hidden_buf);
+            return;
+        }
+        ds_linear_nobias(gate_buf, x, gate_f32, 1, hidden, intermediate);
     }
-    ds_linear_nobias(gate_buf, x, gate_f32, 1, hidden, intermediate);
-    ds_linear_nobias(up_buf, x, up_f32, 1, hidden, intermediate);
+    {
+        const float *up_f32 = ds_bf16_get_f32_view(up_bf16, n_up);
+        if (!up_f32) {
+            ds_expert_forward(out, x, gate_bf16, up_bf16, down_bf16,
+                              hidden, intermediate, gate_buf, up_buf, gate_up_buf, hidden_buf);
+            return;
+        }
+        ds_linear_nobias(up_buf, x, up_f32, 1, hidden, intermediate);
+    }
     ds_swiglu_direct(hidden_buf, gate_buf, up_buf, 1, intermediate);
-    ds_linear_nobias(out, hidden_buf, down_f32, 1, intermediate, hidden);
+    {
+        const float *down_f32 = ds_bf16_get_f32_view(down_bf16, n_down);
+        if (!down_f32) {
+            ds_expert_forward(out, x, gate_bf16, up_bf16, down_bf16,
+                              hidden, intermediate, gate_buf, up_buf, gate_up_buf, hidden_buf);
+            return;
+        }
+        ds_linear_nobias(out, hidden_buf, down_f32, 1, intermediate, hidden);
+    }
 }
 
 /*
