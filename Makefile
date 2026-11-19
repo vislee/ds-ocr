@@ -236,7 +236,7 @@ test.o: test.c ds_ocr.h ds_kernels.h ds_safetensors.h ds_tokenizer.h ds_image.h
 COV_FLAGS = --coverage
 UNIT_SRCS = ds_kernels.c ds_kernels_generic.c ds_kernels_neon.c ds_kernels_avx.c \
             ds_image.c ds_visual_tokenizer.c ds_deep_encoder.c ds_moe_decoder.c \
-            ds_tokenizer.c ds_safetensors.c ds_quantize.c
+            ds_tokenizer.c ds_safetensors.c
 
 test_unit: test_unit.c ds_dash.c ds_ocr.c $(UNIT_SRCS) ds_metal.m ds_kernels.h ds_ocr.h ds_dash.h
 	$(CC) $(CFLAGS) $(COV_FLAGS) -fobjc-arc -c -o ds_metal_ut.o ds_metal.m
