@@ -290,14 +290,23 @@ static inline float ds_bicuberp_aa(const unsigned char *src, int src_w, int src_
 /* ds_image_resize - 高质量重采样缩放（拉伸模式，不保纵横比）
  * 用于 dynamic_preprocess 第③步：整图 resize 到 (cols·size, rows·size)
  * ——目标尺寸本来就是按原图比例选的，拉伸量可忽略。
- * 实现是 PIL 风格抗锯齿双三次（bicubic）插值，不是双线性：优先走
- * CoreGraphics（输出与 PIL 的 BICUBIC 一致），失败才退回内置
- * ds_bicuberp_aa 逐像素计算；"源坐标 = 目标坐标 × 缩放比"的映射不变。 */
+ * 实现：默认 CoreGraphics kCGInterpolationHigh（类 Lanczos，速度优先；
+ * r2_dense 对照实验中输出稳定性最好）。DS_RESIZE_PIL=1 切换到内置
+ * PIL 风格抗锯齿双三次（ds_bicuberp_aa，Keys a=-0.5 核 + Pillow≥7 中心
+ * 映射 + 下采样展宽，与 Pillow BICUBIC max 差 14/255）——更贴近训练
+ * 分布但实测会触发 V3 个别图的生成轨迹漂移，作实验开关保留；
+ * CG 任一环失败同样落到该内置实现。 */
 ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_height) {
     if (!img || !img->pixels) return NULL;
 
 #if defined(__APPLE__) && defined(USE_APPLE_VISION)
-    /* Use CoreGraphics for high-quality resize matching PIL bicubic.
+    /* 【默认 CG：实测准确率优先】r2_dense 对照实验：CG resize 输出干净命中
+     * 冻结基线；内置 PIL 风格双三次（像素层与 PIL max 仅差 14/255、更贴近
+     * 训练分布）反而触发 V3 重复退化（同行 4 连发）——该模型对输入数值
+     * 分布敏感，插值核差异落在生成轨迹的 near-tie 区。维持 CG 默认，
+     * PIL 风格实现保留为 DS_RESIZE_PIL=1 实验开关 + CG 失败时的 fallback。 */
+    if (!getenv("DS_RESIZE_PIL")) {
+    /* Use CoreGraphics for high-quality resize (Lanczos-like, NOT PIL-identical).
      * 整条 CG 链路层层嵌套 if：任一环失败就落到函数尾部的内置实现。 */
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     if (cs) {
@@ -361,9 +370,10 @@ ds_image_t *ds_image_resize(const ds_image_t *img, int target_width, int target_
         }
         CGColorSpaceRelease(cs);
     }
+    }   /* DS_RESIZE_PIL=1 或 CG 失败：走下方内置 PIL 风格双三次 */
     /* CG failed, fall through to custom bicubic */
 #endif
-    /* Fallback: custom bicubic (less accurate vs PIL)
+    /* Fallback: custom bicubic (PIL-style Keys a=-0.5, antialias widening)
      * 输出缓冲：HWC 布局，每像素3字节 */
     unsigned char *out = (unsigned char *)malloc(target_width * target_height * 3);
     if (!out) return NULL;
